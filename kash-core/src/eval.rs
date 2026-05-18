@@ -927,6 +927,12 @@ impl Evaluator {
         fields: &mut Vec<String>,
         split_ifs: Option<&str>,
     ) -> Result<()> {
+        // A preceding `"$@"` with empty positionals may have popped
+        // the in-progress field — re-seed it so this segment has
+        // somewhere to write.
+        if fields.is_empty() {
+            fields.push(String::new());
+        }
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '`' {
@@ -952,6 +958,15 @@ impl Evaluator {
                 fields.last_mut().expect("fields invariant").push('$');
                 continue;
             };
+            // `$@` / `$*` are special: they expand to multiple fields
+            // in the splittable path and can't be flattened to a
+            // single `value` string. Handle them up front and `continue`
+            // past the per-value aggregator below.
+            if next == '@' || next == '*' {
+                chars.next();
+                self.expand_at_or_star_into_fields(next == '@', split_ifs, fields);
+                continue;
+            }
             let value = if next == '(' {
                 chars.next();
                 if chars.peek() == Some(&'(') {
@@ -1026,6 +1041,82 @@ impl Evaluator {
             }
         }
         Ok(())
+    }
+
+    /// Expand `$@` / `$*` straight into a `fields` accumulator. The
+    /// quoted-vs-unquoted distinction reaches us through
+    /// `split_ifs`: `Some` means we're inside a `Bare` segment (or
+    /// equivalent), `None` means we're inside a `DoubleQuoted` one.
+    ///
+    /// Rules implemented (POSIX):
+    ///
+    /// - `$@`, *quoted* (`"$@"`): each positional is its own
+    ///   field. The first positional is folded into the field
+    ///   already in progress; the rest start fresh fields. No
+    ///   internal splitting.
+    /// - `$@`, *unquoted*: same multi-field shape, plus each value
+    ///   is subjected to IFS field splitting.
+    /// - `$*`, *quoted* (`"$*"`): all positionals are joined with
+    ///   the first character of `IFS` (space when `IFS` is unset)
+    ///   into a single field.
+    /// - `$*`, *unquoted*: the joined string then gets the standard
+    ///   IFS split treatment.
+    ///
+    /// `expand_dollar` (the single-string path) collapses both forms
+    /// to the joined-by-first-IFS-char string; the multi-field
+    /// semantics only fire here.
+    fn expand_at_or_star_into_fields(
+        &self,
+        is_at: bool,
+        split_ifs: Option<&str>,
+        fields: &mut Vec<String>,
+    ) {
+        if is_at {
+            // $@ — one field per positional (in the quoted form);
+            // splittable in the unquoted form.
+            let mut iter = self.positionals.iter();
+            let Some(first) = iter.next() else {
+                // POSIX: empty "$@" contributes no field at all.
+                // Drop the in-progress empty field so the surrounding
+                // word ends up with one fewer slot. If the slot
+                // already has content from earlier text the pop is
+                // skipped — leave that field as-is.
+                if fields.last().map(|s| s.is_empty()).unwrap_or(false)
+                    && fields.len() == 1
+                {
+                    fields.pop();
+                }
+                return;
+            };
+            match split_ifs {
+                Some(ifs) => append_split(first, ifs, fields),
+                None => fields
+                    .last_mut()
+                    .expect("fields invariant")
+                    .push_str(first),
+            }
+            for p in iter {
+                fields.push(String::new());
+                match split_ifs {
+                    Some(ifs) => append_split(p, ifs, fields),
+                    None => fields
+                        .last_mut()
+                        .expect("fields invariant")
+                        .push_str(p),
+                }
+            }
+        } else {
+            // $* — join with first char of IFS.
+            let sep = first_ifs_char(&self.lookup_ifs());
+            let joined = self.positionals.join(&sep);
+            match split_ifs {
+                Some(ifs) => append_split(&joined, ifs, fields),
+                None => fields
+                    .last_mut()
+                    .expect("fields invariant")
+                    .push_str(&joined),
+            }
+        }
     }
 
     /// Current value of `IFS`. Falls back to the POSIX default
@@ -1148,6 +1239,13 @@ impl Evaluator {
                 // Process ID — stable PID source needs `std::process::id`.
                 // The skeleton emits a placeholder.
                 out.push('0');
+            } else if next == '@' || next == '*' {
+                // In a single-string context (no field splitting),
+                // both `$@` and `$*` collapse to the IFS-joined
+                // positionals. Field-splitting contexts override.
+                chars.next();
+                let sep = first_ifs_char(&self.lookup_ifs());
+                out.push_str(&self.positionals.join(&sep));
             } else if next.is_ascii_digit() {
                 chars.next();
                 let n = next.to_digit(10).expect("ascii digit") as usize;
@@ -3033,6 +3131,20 @@ fn read_backtick_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) ->
     ))
 }
 
+/// Return the first character of `ifs` as an owned string, or an
+/// empty string when `IFS` is empty. POSIX uses this as the join
+/// separator for `"$*"`.
+fn first_ifs_char(ifs: &str) -> String {
+    match ifs.chars().next() {
+        Some(c) => {
+            let mut s = String::new();
+            s.push(c);
+            s
+        }
+        None => String::new(),
+    }
+}
+
 /// Append `value` to `fields`, splitting on IFS bytes. Matches the
 /// POSIX rule "unquoted expansion results undergo field splitting"
 /// with a minimal-but-correct-for-the-common-case implementation:
@@ -4420,6 +4532,84 @@ mod tests {
             "N=3; while [ $N -gt 0 ]; do echo $N; N=$((N - 1)); done",
         );
         assert_eq!(out, "3\n2\n1\n");
+    }
+
+    // ===== $@ / $* quoting semantics =====
+
+    fn run_with_args(src: &str, args: &[&str]) -> (Outcome, String, Evaluator) {
+        let prog = parse(src).expect("parse");
+        let mut ev = Evaluator::new();
+        ev.positionals = args.iter().map(|s| (*s).into()).collect();
+        let outcome = ev.eval_program(&prog).expect("eval");
+        let out = ev.take_output();
+        (outcome, out, ev)
+    }
+
+    #[test]
+    fn unquoted_dollar_at_splits_into_fields() {
+        let (_, out, _) = run_with_args(
+            "for x in $@; do echo $x; done",
+            &["one", "two three", "four"],
+        );
+        // "two three" gets IFS-split → "two" and "three".
+        assert_eq!(out, "one\ntwo\nthree\nfour\n");
+    }
+
+    #[test]
+    fn quoted_dollar_at_preserves_each_positional() {
+        let (_, out, _) = run_with_args(
+            "for x in \"$@\"; do echo $x; done",
+            &["one", "two three", "four"],
+        );
+        // Quoted "$@" keeps each positional intact.
+        assert_eq!(out, "one\ntwo three\nfour\n");
+    }
+
+    #[test]
+    fn quoted_dollar_star_joins_with_first_ifs_char() {
+        let (_, out, _) = run_with_args(
+            "for x in \"$*\"; do echo $x; done",
+            &["one", "two", "three"],
+        );
+        // "$*" is a single field made from joining positionals with
+        // the first character of IFS (default ' ').
+        assert_eq!(out, "one two three\n");
+    }
+
+    #[test]
+    fn custom_ifs_changes_dollar_star_join() {
+        // `echo $x` would IFS-split the iteration variable again, so
+        // quote it to see the unsplit joined string from "$*".
+        let (_, out, _) = run_with_args(
+            "IFS=,; for x in \"$*\"; do echo \"$x\"; done",
+            &["a", "b", "c"],
+        );
+        assert_eq!(out, "a,b,c\n");
+    }
+
+    #[test]
+    fn dollar_at_inside_concatenated_word() {
+        let (_, out, _) = run_with_args(
+            "for x in \"prefix $@ suffix\"; do echo $x; done",
+            &["a", "b", "c"],
+        );
+        // POSIX: first positional folds into the prefix, last folds
+        // into the suffix, middle ones are their own fields.
+        assert_eq!(out, "prefix a\nb\nc suffix\n");
+    }
+
+    #[test]
+    fn empty_quoted_dollar_at_emits_nothing() {
+        let (_, out, _) = run_with_args("echo before \"$@\" after", &[]);
+        // Empty positionals → "$@" expands to no fields at all, so
+        // echo sees just "before" and "after".
+        assert_eq!(out, "before after\n");
+    }
+
+    #[test]
+    fn dollar_hash_reflects_argc() {
+        let (_, out, _) = run_with_args("echo $#", &["a", "b", "c"]);
+        assert_eq!(out, "3\n");
     }
 
     // ===== arithmetic extensions =====
