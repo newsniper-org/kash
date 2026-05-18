@@ -1,0 +1,22 @@
+[package]
+name = "kash-core"
+description = "Core shell engine for the kash project (parser, evaluator, mode system, builtins)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# `std` implies `alloc`, plus full standard-library functionality (filesystem,
+# environment, threads, signals, terminal IO). This is what production shells
+# need; it's the default.
+default = ["std"]
+std = ["alloc"]
+# `alloc` enables heap-allocated containers (Vec/String/Box/etc.) without
+# requiring the rest of the standard library. Intermediate tier between `std`
+# and pure no_std.
+alloc = []
+
+[dependencies]
+kash-macros = { path = "../kash-macros", default-features = false }
