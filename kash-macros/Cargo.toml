@@ -1,0 +1,17 @@
+[package]
+name = "kash-macros"
+description = "Shared declarative macros for the kash shell project (ifstd!, etc.)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Pass-through features so this crate's doc-tests can exercise both branches
+# of `ifstd!`/`ifalloc!`. Production crates that use these macros declare
+# their own `std` / `alloc` features; the macro expands a `cfg(feature = ...)`
+# attribute that is evaluated in the invoking crate's context.
+default = ["std"]
+std = ["alloc"]
+alloc = []
