@@ -2106,9 +2106,21 @@ fn is_valid_param_name(s: &str) -> bool {
     chars.all(is_name_continue)
 }
 
-/// Minimal POSIX glob: `?` matches one char, `*` matches any run of
-/// chars, `[abc]` / `[!abc]` / `[a-z]` are character classes. Anything
-/// that doesn't look like a glob metacharacter matches literally.
+/// POSIX glob match. Recognises:
+///
+/// - `*` — any (possibly empty) byte run,
+/// - `?` — exactly one byte,
+/// - `\X` — literal `X` (any meta-character can be escaped this way),
+/// - `[abc]` / `[a-z]` / `[!abc]` (and `[^abc]`) — character class,
+/// - `[[:alpha:]]` and the other POSIX character classes inside `[]`:
+///   `alpha`, `digit`, `alnum`, `upper`, `lower`, `space`, `xdigit`,
+///   `cntrl`, `print`, `punct`, `graph`, `blank`.
+///
+/// `*` / `?` / `[` lose their special meaning when prefixed with `\\`
+/// in the pattern. The matcher operates byte-by-byte so any pattern
+/// containing only ASCII meta-characters works correctly on UTF-8
+/// input; non-ASCII patterns inside `[…]` are still byte-level which
+/// is good enough for the cases ksh93 / bash also handle.
 fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
 }
@@ -2118,6 +2130,13 @@ fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
     match (p0, s0) {
         (None, None) => true,
         (None, _) => false,
+        (Some(b'\\'), _) if pat.len() > 1 => {
+            // `\X` — the next pattern byte matches itself literally.
+            match s0 {
+                Some(c) if c == pat[1] => glob_match_bytes(&pat[2..], &s[1..]),
+                _ => false,
+            }
+        }
         (Some(b'*'), _) => {
             for i in 0..=s.len() {
                 if glob_match_bytes(&pat[1..], &s[i..]) {
@@ -2128,38 +2147,122 @@ fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
         }
         (Some(b'?'), Some(_)) => glob_match_bytes(&pat[1..], &s[1..]),
         (Some(b'['), Some(c)) => {
-            let Some(close) = pat[1..].iter().position(|&b| b == b']') else {
+            let Some((class_end, _)) = find_class_close(pat) else {
                 // Unclosed `[` — match literally.
-                return p0 == s0 && glob_match_bytes(&pat[1..], &s[1..]);
+                return s0 == Some(b'[') && glob_match_bytes(&pat[1..], &s[1..]);
             };
-            let class = &pat[1..1 + close];
+            let class = &pat[1..class_end];
             let (negate, class) =
                 if let Some(rest) = class.strip_prefix(b"!").or_else(|| class.strip_prefix(b"^")) {
                     (true, rest)
                 } else {
                     (false, class)
                 };
-            let mut hit = false;
-            let mut i = 0;
-            while i < class.len() {
-                if i + 2 < class.len() && class[i + 1] == b'-' {
-                    if c >= class[i] && c <= class[i + 2] {
-                        hit = true;
-                    }
-                    i += 3;
-                } else {
-                    if class[i] == c {
-                        hit = true;
-                    }
-                    i += 1;
-                }
-            }
+            let hit = class_matches(class, c);
             if hit == negate {
                 return false;
             }
-            glob_match_bytes(&pat[2 + close..], &s[1..])
+            glob_match_bytes(&pat[class_end + 1..], &s[1..])
         }
         (Some(p), Some(c)) if p == c => glob_match_bytes(&pat[1..], &s[1..]),
+        _ => false,
+    }
+}
+
+/// Find the position of the `]` that closes a character class
+/// starting at `pat[0] == '['`. Handles `[[:name:]…]` correctly by
+/// scanning past nested `[:...:]` POSIX classes (which contain `]`
+/// inside `:]`). A leading `]` immediately after `[` (or after `[!`/
+/// `[^`) is treated as a literal `]` member, per POSIX.
+fn find_class_close(pat: &[u8]) -> Option<(usize, ())> {
+    if pat.first() != Some(&b'[') {
+        return None;
+    }
+    let mut i = 1;
+    // Skip a leading `!` / `^` (negation marker).
+    if matches!(pat.get(i), Some(b'!' | b'^')) {
+        i += 1;
+    }
+    // Allow `]` as the very first class member.
+    if pat.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < pat.len() {
+        match pat[i] {
+            b']' => return Some((i, ())),
+            b'[' if pat.get(i + 1) == Some(&b':') => {
+                // Skip a `[:name:]` POSIX class.
+                let mut j = i + 2;
+                while j + 1 < pat.len() {
+                    if pat[j] == b':' && pat[j + 1] == b']' {
+                        i = j + 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                if i < j + 2 {
+                    // Unterminated `[:` — bail out, treat outer `[` as
+                    // literal upstream.
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// True iff `c` matches the body of a character class
+/// (between `[` and `]`, with the leading negation already stripped).
+fn class_matches(class: &[u8], c: u8) -> bool {
+    let mut i = 0;
+    while i < class.len() {
+        // `[:name:]` form.
+        if class[i] == b'[' && class.get(i + 1) == Some(&b':') {
+            let start = i + 2;
+            if let Some(off) = class[start..]
+                .windows(2)
+                .position(|w| w == b":]")
+            {
+                let name = &class[start..start + off];
+                if posix_class_matches(name, c) {
+                    return true;
+                }
+                i = start + off + 2;
+                continue;
+            }
+            // Unterminated `[:` — treat the `[` as literal.
+        }
+        // `X-Y` range.
+        if i + 2 < class.len() && class[i + 1] == b'-' && class[i + 2] != b']' {
+            if c >= class[i] && c <= class[i + 2] {
+                return true;
+            }
+            i += 3;
+            continue;
+        }
+        if class[i] == c {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn posix_class_matches(name: &[u8], c: u8) -> bool {
+    match name {
+        b"alpha" => c.is_ascii_alphabetic(),
+        b"digit" => c.is_ascii_digit(),
+        b"alnum" => c.is_ascii_alphanumeric(),
+        b"upper" => c.is_ascii_uppercase(),
+        b"lower" => c.is_ascii_lowercase(),
+        b"space" => c.is_ascii_whitespace(),
+        b"xdigit" => c.is_ascii_hexdigit(),
+        b"cntrl" => c.is_ascii_control(),
+        b"print" => (0x20..=0x7e).contains(&c),
+        b"punct" => c.is_ascii_punctuation(),
+        b"graph" => c.is_ascii_graphic(),
+        b"blank" => c == b' ' || c == b'\t',
         _ => false,
     }
 }
@@ -2512,6 +2615,69 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== glob enhancements =====
+
+    #[test]
+    fn glob_backslash_escapes_meta() {
+        // `\*` matches a literal `*`.
+        let (_, out, _) = run("X='*'; case $X in '\\*') echo lit;; *) echo other;; esac");
+        assert_eq!(out, "lit\n");
+        // And the literal star does NOT match a non-star.
+        let (_, out, _) = run("X=abc; case $X in '\\*') echo lit;; *) echo other;; esac");
+        assert_eq!(out, "other\n");
+    }
+
+    #[test]
+    fn glob_posix_class_alpha() {
+        let (_, out, _) = run("X=q; case $X in [[:alpha:]]) echo letter;; esac");
+        assert_eq!(out, "letter\n");
+    }
+
+    #[test]
+    fn glob_posix_class_digit() {
+        let (_, out, _) = run("X=5; case $X in [[:digit:]]) echo digit;; esac");
+        assert_eq!(out, "digit\n");
+        let (_, out, _) = run("X=q; case $X in [[:digit:]]) echo digit;; *) echo other;; esac");
+        assert_eq!(out, "other\n");
+    }
+
+    #[test]
+    fn glob_posix_class_combined_with_literals() {
+        // `[[:alpha:]0]` matches letter or `0`.
+        let (_, out, _) = run("X=0; case $X in [[:alpha:]0]) echo hit;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=a; case $X in [[:alpha:]0]) echo hit;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=9; case $X in [[:alpha:]0]) echo hit;; *) echo nope;; esac");
+        assert_eq!(out, "nope\n");
+    }
+
+    #[test]
+    fn glob_negated_class_with_posix() {
+        let (_, out, _) = run("X=q; case $X in [![:digit:]]) echo not_digit;; esac");
+        assert_eq!(out, "not_digit\n");
+    }
+
+    #[test]
+    fn glob_xdigit_class() {
+        for ch in ["0", "9", "a", "f", "A", "F"] {
+            let src = alloc::format!(
+                "X={ch}; case $X in [[:xdigit:]]) echo hex;; *) echo no;; esac"
+            );
+            let (_, out, _) = run(&src);
+            assert_eq!(out, "hex\n", "ch = {ch}");
+        }
+        let (_, out, _) = run("X=g; case $X in [[:xdigit:]]) echo hex;; *) echo no;; esac");
+        assert_eq!(out, "no\n");
+    }
+
+    #[test]
+    fn glob_leading_close_bracket_in_class() {
+        // `[]abc]` includes `]` as a member (POSIX rule).
+        let (_, out, _) = run("X=']'; case $X in []abc]) echo hit;; esac");
+        assert_eq!(out, "hit\n");
     }
 
     // ===== here-doc / here-string =====
