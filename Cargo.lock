@@ -17,3 +17,7 @@ version = "0.1.0-posix2024-pre"
 [[package]]
 name = "kash-macros"
 version = "0.1.0-posix2024-pre"
+
+[[package]]
+name = "lightnht"
+version = "0.1.0-posix2024-pre"

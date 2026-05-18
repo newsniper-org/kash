@@ -4,6 +4,7 @@ members = [
     "kash-core",
     "kash-gadt",
     "kash-macros",
+    "lightnht",
 ]
 # `kash-line-editor` is a submodule with its own `[workspace]` (because it
 # tracks upstream rustyline and embeds the rustyline-derive subcrate). Kash

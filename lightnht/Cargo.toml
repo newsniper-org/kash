@@ -1,0 +1,14 @@
+[package]
+name = "lightnht"
+description = "Light Nested Hash Table — a collision-resolution-through-nesting hash map / set."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Same `no_std + alloc` posture as the rest of the kash workspace.
+default = ["alloc"]
+alloc = []
+std = ["alloc"]
