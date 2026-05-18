@@ -3209,6 +3209,29 @@ ifstd!({
         ) -> Result<std::fs::File> {
             use crate::ast::RedirectKind;
             use std::fs::OpenOptions;
+            // Capability gate: every file-touching redirect must
+            // pass the venv's fs-* checks. `Input` only needs
+            // read; output / append paths need write *and* create
+            // (they may create the file if it doesn't exist).
+            let needed: &[crate::capability::Capability] = match kind {
+                RedirectKind::Input => &[crate::capability::Capability::FsRead],
+                RedirectKind::Output
+                | RedirectKind::OutputBoth
+                | RedirectKind::Append
+                | RedirectKind::AppendBoth => &[
+                    crate::capability::Capability::FsWrite,
+                    crate::capability::Capability::FsCreate,
+                ],
+                _ => &[],
+            };
+            for c in needed {
+                if !self.is_capability_allowed(*c) {
+                    return Err(KashError::CapabilityDenied(alloc::format!(
+                        "opening `{path}`: this venv revoked `{}`",
+                        c.as_str()
+                    )));
+                }
+            }
             let result = match kind {
                 RedirectKind::Output | RedirectKind::OutputBoth => OpenOptions::new()
                     .write(true)
@@ -7127,6 +7150,65 @@ mod tests {
             assert!(out.ends_with("done\n"));
             // No second `in-venv` line.
             assert_eq!(out.matches("in-venv").count(), 1, "out: {out}");
+        }
+
+        #[test]
+        fn venv_revoking_fs_write_blocks_output_redirect() {
+            let tmp = std::env::temp_dir().join("kash-venv-fs.txt");
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "venv tight {{ capabilities {{ profile basic }} body {{ echo data >{path}; }} }}\n"
+            );
+            // `basic` profile has fs-read + exec-spawn but *not*
+            // fs-write — so `>file` must fail.
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert_eq!(err.exit_code(), 126);
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("fs-write"), "got: {msg}");
+            // And no file got created (the open call failed before
+            // any data was written).
+            assert!(!tmp.exists(), "file should not exist");
+        }
+
+        #[test]
+        fn venv_revoking_fs_read_blocks_input_redirect() {
+            // Write a file we then can't read from inside a tight
+            // venv. Profile `none` strips fs-read.
+            let tmp = std::env::temp_dir().join("kash-venv-fs-read.txt");
+            std::fs::write(&tmp, "secret\n").unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "venv tight {{ capabilities {{ profile none }} body {{ cat <{path}; }} }}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert_eq!(err.exit_code(), 126);
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("fs-read"), "got: {msg}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn venv_dev_profile_allows_output_redirect() {
+            // `dev` profile has fs-write + fs-create — output
+            // redirect should succeed.
+            let tmp = std::env::temp_dir().join("kash-venv-dev-write.txt");
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "venv proj {{ capabilities {{ profile dev; + exec-spawn; allow-cmd /bin/echo }} body {{ /bin/echo data >{path}; }} }}\n"
+            );
+            if !have("/bin/echo") {
+                return;
+            }
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let contents = std::fs::read_to_string(&tmp).unwrap();
+            assert_eq!(contents, "data\n");
+            let _ = std::fs::remove_file(&tmp);
         }
 
         #[test]
