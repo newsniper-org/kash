@@ -185,6 +185,12 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// (each function carries the namespace path it was *defined* in
     /// so callers see the lexical view inside the body).
     namespace_path: Vec<String>,
+    /// Mode-restoration stack, one entry per active function call.
+    /// `Some(saved_mode)` means "restore this on exit"; `None` means
+    /// "an unbounded `mode` declaration inside this function has
+    /// asked the change to propagate to the caller — don't restore".
+    /// Locked by `project_shell_mode_syntax.md`.
+    function_mode_save: Vec<Option<Mode<B>>>,
     /// Typeclass registry: typeclass name → default methods. Filled
     /// at `typeclass NAME { … }` declaration time.
     typeclasses: alloc::collections::BTreeMap<String, TypeclassEntry>,
@@ -239,6 +245,7 @@ impl<B: MapBackend> Evaluator<B> {
             positionals_stack: Vec::new(),
             functions: <B::Map<String, FunctionEntry> as Default>::default(),
             namespace_path: Vec::new(),
+            function_mode_save: Vec::new(),
             typeclasses: alloc::collections::BTreeMap::new(),
             instances: alloc::collections::BTreeMap::new(),
             aliases: <B::Map<String, String> as Default>::default(),
@@ -1253,6 +1260,12 @@ impl<B: MapBackend> Evaluator<B> {
             &mut self.namespace_path,
             entry.defining_namespace.clone(),
         );
+        // Push a mode-save entry. By default the caller's mode is
+        // restored on exit; an *unbounded* `mode` declaration inside
+        // the body clears this entry so the change propagates back
+        // up. `mode -L` and the block form work entirely off the
+        // entry's saved value.
+        self.function_mode_save.push(Some(self.mode.clone()));
         // Push a function frame. `static_scope = true` for ksh93
         // `function NAME`-form functions: assignments inside that
         // form's body default to local, matching the locked
@@ -1273,6 +1286,13 @@ impl<B: MapBackend> Evaluator<B> {
         }
         let result = self.eval_compound(&entry.body);
         self.scope.pop();
+        // Restore mode if the function asked us to. A `None` slot
+        // means an unbounded `mode` declaration inside the body
+        // wanted the change to propagate; leave `self.mode` as it
+        // is in that case.
+        if let Some(Some(saved_mode)) = self.function_mode_save.pop() {
+            self.mode = saved_mode;
+        }
         self.namespace_path = saved_ns;
         let restored = self.positionals_stack.pop().expect("we just pushed");
         self.positionals = restored;
@@ -1428,7 +1448,8 @@ impl<B: MapBackend> Evaluator<B> {
         }
     }
 
-    /// Apply a `mode` declaration. Parses the spec, runs the
+    /// Apply a `mode` declaration. Parses the spec, gates against
+    /// strict modes (which disable the keyword entirely), runs the
     /// modifier-monotonicity check against the current mode, then
     /// installs the new mode according to the form.
     fn eval_mode_decl(
@@ -1436,10 +1457,18 @@ impl<B: MapBackend> Evaluator<B> {
         spec: &str,
         form: &crate::ast::ModeForm,
     ) -> Result<Outcome> {
-        let new_mode = Mode::<B>::parse(spec).map_err(|e| match e {
-            KashError::Mode(m) => KashError::Mode(m),
-            other => other,
-        })?;
+        // Strict modes disable the keyword — escape isn't allowed
+        // from within them (per `project_shell_mode_syntax.md`).
+        match self.mode.base {
+            crate::mode::BaseMode::PosixStrict | crate::mode::BaseMode::Ksh93uStrict => {
+                return Err(KashError::Mode(alloc::format!(
+                    "`mode` declarations are not allowed inside `{}`; to switch modes, set the outer scope's mode instead",
+                    self.mode
+                )));
+            }
+            _ => {}
+        }
+        let new_mode = Mode::<B>::parse(spec)?;
         if !new_mode.modifiers_satisfy(&self.mode) {
             return Err(KashError::Mode(alloc::format!(
                 "mode `{spec}` would drop a modifier active in the enclosing mode `{}`; modifiers may only be added by an inner declaration",
@@ -1453,14 +1482,24 @@ impl<B: MapBackend> Evaluator<B> {
                 self.mode = saved;
                 result
             }
-            crate::ast::ModeForm::Unbounded | crate::ast::ModeForm::Lexical => {
-                // Scope-bound auto-restore (the Lexical form) is
-                // wired alongside function / namespace frame
-                // capture in a later stage. For now both forms set
-                // the active mode and leave it set; that's correct
-                // at file scope (the common case) and merely less
-                // strict elsewhere.
+            crate::ast::ModeForm::Lexical => {
+                // Scope-bound: the change lasts until the enclosing
+                // function frame pops. At file scope (no function
+                // frame), it persists for the rest of the file —
+                // identical to the unbounded form there.
                 self.mode = new_mode;
+                Ok(Outcome::Status(0))
+            }
+            crate::ast::ModeForm::Unbounded => {
+                // Unbounded: change persists past the enclosing
+                // function frame, propagating to the caller. We
+                // signal that by clearing the topmost mode-save
+                // slot (if any) so the function-exit restore is a
+                // no-op.
+                self.mode = new_mode;
+                if let Some(slot) = self.function_mode_save.last_mut() {
+                    *slot = None;
+                }
                 Ok(Outcome::Status(0))
             }
         }
@@ -6618,11 +6657,65 @@ mod tests {
     }
 
     #[test]
-    fn mode_dash_l_form_parses() {
-        // `mode -L` is parser-only at this stage; just confirm it
-        // doesn't error and the mode value is reflected.
+    fn mode_dash_l_form_at_top_level_persists_for_rest_of_file() {
+        // At file scope there's no enclosing function frame to
+        // pop, so `-L` just installs the mode for the remainder.
         let (_, out, _) = run("mode -L default-secure\necho ${.sh.mode}\n");
         assert_eq!(out, "default-secure\n");
+    }
+
+    #[test]
+    fn mode_dash_l_inside_function_auto_restores_on_return() {
+        // `-L` inside a function is scope-bound: the change is
+        // visible inside the body, but the caller's mode is
+        // restored on return.
+        let (_, out, _) = run(
+            "function f { mode -L default-secure; echo inside=${.sh.mode}; }\n\
+             f\n\
+             echo outside=${.sh.mode}\n",
+        );
+        assert_eq!(out, "inside=default-secure\noutside=default\n");
+    }
+
+    #[test]
+    fn mode_block_inside_function_restores_at_block_end() {
+        let (_, out, _) = run(
+            "function f {\n\
+                 echo a=${.sh.mode}\n\
+                 mode default-secure { echo b=${.sh.mode}; }\n\
+                 echo c=${.sh.mode}\n\
+             }\n\
+             f\n\
+             echo d=${.sh.mode}\n",
+        );
+        assert_eq!(
+            out,
+            "a=default\nb=default-secure\nc=default\nd=default\n"
+        );
+    }
+
+    #[test]
+    fn mode_unbounded_inside_function_propagates_to_caller() {
+        // Unbounded mode change inside a function must survive
+        // the return — that's the whole point of the form.
+        let (_, out, _) = run(
+            "function f { mode default-secure; }\n\
+             f\n\
+             echo ${.sh.mode}\n",
+        );
+        assert_eq!(out, "default-secure\n");
+    }
+
+    #[test]
+    fn mode_strict_disables_mode_keyword() {
+        // Once we're in a strict mode the keyword itself is
+        // disabled — no escape from inside.
+        let src = "mode posix-strict\nmode default\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("strict") || msg.contains("not allowed"), "got: {msg}");
     }
 
     #[test]
