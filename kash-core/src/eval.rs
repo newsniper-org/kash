@@ -128,14 +128,33 @@ struct InstanceEntry {
     methods: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
 }
 
-/// One `use namespace …` import in effect. The wildcard form
-/// (source-only, no alias) is what stage 3 ships; alias / single-
-/// symbol / brace forms land in follow-ups.
+/// One `use …` import in effect.
 #[derive(Clone, Debug)]
-struct ImportEntry {
-    /// Namespace path the import is *sourcing* from, each entry a
-    /// single bare segment with no leading `.`.
-    source: Vec<String>,
+enum ImportEntry {
+    /// `use namespace foo[.bar]` — all `.foo.bar.*` symbols visible
+    /// at bare-name lookups (excluding `_`-prefixed names).
+    Wildcard {
+        /// Source namespace path (no leading `.`).
+        source: Vec<String>,
+    },
+    /// `use namespace foo as u` — references of the shape
+    /// `.u.<name>` resolve as `.foo.<name>`.
+    Aliased {
+        /// Source namespace path (no leading `.`).
+        source: Vec<String>,
+        /// Alias the source is exposed under (single bare segment).
+        alias: String,
+    },
+    /// `use .foo.bar.x` — binds the single symbol `x` (or its alias
+    /// if `use .foo.bar.x as y` was used) into the bare-name space.
+    Symbol {
+        /// Path to the symbol's home namespace.
+        source_path: Vec<String>,
+        /// Symbol's name in its home namespace.
+        source_name: String,
+        /// Bare name to bind to. `None` means use `source_name`.
+        alias: Option<String>,
+    },
 }
 
 /// One registered function. Stored owned so the call site doesn't
@@ -344,11 +363,16 @@ impl<B: MapBackend> Evaluator<B> {
     /// name we should look up (the bare name as written, or a
     /// path-prefixed one). Mirrors `resolve_function_name`: the
     /// walked path goes inside-out so an inner namespace shadows an
-    /// outer one, then `use namespace` imports are consulted in
-    /// declaration order. Returns `None` only when nothing matches.
+    /// outer one, then `use …` imports are consulted in declaration
+    /// order. Returns `None` only when nothing matches.
     fn resolve_var_name(&self, name: &str) -> Option<String> {
         if self.scope.get(name).is_some() {
             return Some(name.to_string());
+        }
+        if let Some(rewritten) = self.rewrite_via_alias_import(name)
+            && self.scope.get(&rewritten).is_some()
+        {
+            return Some(rewritten);
         }
         if name.starts_with('.') {
             return None;
@@ -359,17 +383,67 @@ impl<B: MapBackend> Evaluator<B> {
                 return Some(candidate);
             }
         }
-        // `use namespace foo` imports. Underscore-prefixed names are
-        // excluded from wildcard imports (Python `__all__`-style
-        // privacy convention).
-        if !name.starts_with('_')
-            && let Some(frame) = self.imports.last()
-        {
+        // Wildcard / symbol imports. Underscore-prefixed names are
+        // excluded from *wildcard* imports (Python `__all__`-style
+        // privacy convention); they remain reachable via the
+        // explicit `use .foo._name` single-symbol form.
+        if let Some(frame) = self.imports.last() {
             for entry in frame {
-                let candidate = build_qualified_name(&entry.source, name);
-                if self.scope.get(&candidate).is_some() {
-                    return Some(candidate);
+                match entry {
+                    ImportEntry::Wildcard { source } => {
+                        if name.starts_with('_') {
+                            continue;
+                        }
+                        let candidate = build_qualified_name(source, name);
+                        if self.scope.get(&candidate).is_some() {
+                            return Some(candidate);
+                        }
+                    }
+                    ImportEntry::Symbol {
+                        source_path,
+                        source_name,
+                        alias,
+                    } => {
+                        let bound = alias.as_deref().unwrap_or(source_name);
+                        if name == bound {
+                            let candidate = build_qualified_name(source_path, source_name);
+                            if self.scope.get(&candidate).is_some() {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                    ImportEntry::Aliased { .. } => {}
                 }
+            }
+        }
+        None
+    }
+
+    /// If `name` is a dotted absolute reference whose first segment
+    /// matches an `Aliased` import's alias, rewrite it to the
+    /// import's source path. Otherwise return `None`. Doesn't check
+    /// the resulting binding exists; callers must.
+    fn rewrite_via_alias_import(&self, name: &str) -> Option<String> {
+        let rest = name.strip_prefix('.')?;
+        let (first, tail) = match rest.find('.') {
+            Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+            None => (rest, None),
+        };
+        let frame = self.imports.last()?;
+        for entry in frame {
+            if let ImportEntry::Aliased { source, alias } = entry
+                && first == alias
+            {
+                let mut out = String::new();
+                for seg in source {
+                    out.push('.');
+                    out.push_str(seg);
+                }
+                if let Some(tail) = tail {
+                    out.push('.');
+                    out.push_str(tail);
+                }
+                return Some(out);
             }
         }
         None
@@ -392,6 +466,11 @@ impl<B: MapBackend> Evaluator<B> {
         if self.functions.contains_key(name) {
             return Some(name.to_string());
         }
+        if let Some(rewritten) = self.rewrite_via_alias_import(name)
+            && self.functions.contains_key(&rewritten)
+        {
+            return Some(rewritten);
+        }
         if name.starts_with('.') {
             return None;
         }
@@ -401,15 +480,33 @@ impl<B: MapBackend> Evaluator<B> {
                 return Some(candidate);
             }
         }
-        // `use namespace foo` imports — skip names starting with
-        // `_` (private-by-convention).
-        if !name.starts_with('_')
-            && let Some(frame) = self.imports.last()
-        {
+        if let Some(frame) = self.imports.last() {
             for entry in frame {
-                let candidate = build_qualified_name(&entry.source, name);
-                if self.functions.contains_key(&candidate) {
-                    return Some(candidate);
+                match entry {
+                    ImportEntry::Wildcard { source } => {
+                        if name.starts_with('_') {
+                            continue;
+                        }
+                        let candidate = build_qualified_name(source, name);
+                        if self.functions.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
+                    }
+                    ImportEntry::Symbol {
+                        source_path,
+                        source_name,
+                        alias,
+                    } => {
+                        let bound = alias.as_deref().unwrap_or(source_name);
+                        if name == bound {
+                            let candidate =
+                                build_qualified_name(source_path, source_name);
+                            if self.functions.contains_key(&candidate) {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                    ImportEntry::Aliased { .. } => {}
                 }
             }
         }
@@ -1074,42 +1171,23 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(Outcome::Status(0))
     }
 
-    /// `use namespace PATH` — install a wildcard namespace import
-    /// into the current function frame. Subsequent bare lookups
-    /// inside this frame consult the import after exhausting the
-    /// regular `namespace_path` walk. The import is dropped when
-    /// the frame pops.
+    /// `use …` — install an import into the current function frame.
+    /// Four surface forms are accepted:
     ///
-    /// Stage-3 surface area is the wildcard form only; aliasing
-    /// (`use namespace foo as u`), single-symbol (`use .foo.x`),
-    /// and brace (`use .foo.{a,b}`) forms land in follow-ups.
+    /// * `use namespace PATH` — wildcard import.
+    /// * `use namespace PATH as ALIAS` — aliased namespace.
+    ///   References of shape `.<ALIAS>.<name>` rewrite to
+    ///   `.<PATH>.<name>` before lookup.
+    /// * `use .PATH.NAME` — single-symbol import; binds the bare
+    ///   name to the absolute path.
+    /// * `use .PATH.NAME as ALIAS` — single symbol bound to `ALIAS`.
     fn builtin_use(&mut self, args: &[String]) -> Result<Outcome> {
-        if args.first().map(alloc::string::String::as_str) != Some("namespace") {
-            return Err(KashError::Runtime(
-                "use: only `use namespace PATH` is supported at this stage".into(),
-            ));
-        }
-        if args.len() != 2 {
-            return Err(KashError::Runtime(
-                "use namespace: expected exactly one PATH argument".into(),
-            ));
-        }
-        let raw = &args[1];
-        let stripped = raw.strip_prefix('.').unwrap_or(raw);
-        let source: Vec<String> = stripped
-            .split('.')
-            .map(alloc::string::String::from)
-            .collect();
-        if source.iter().any(|s| s.is_empty()) {
-            return Err(KashError::Runtime(alloc::format!(
-                "use namespace: malformed path `{raw}`"
-            )));
-        }
+        let parsed = parse_use_args(args)?;
         let frame = self
             .imports
             .last_mut()
             .expect("root imports frame always present");
-        frame.push(ImportEntry { source });
+        frame.push(parsed);
         Ok(Outcome::Status(0))
     }
 
@@ -4665,6 +4743,80 @@ fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
 }
 
+/// Parse the args to `use`. Accepts the four documented forms and
+/// emits a single [`ImportEntry`].
+fn parse_use_args(args: &[String]) -> Result<ImportEntry> {
+    fn split_path(raw: &str) -> Result<Vec<String>> {
+        let stripped = raw.strip_prefix('.').unwrap_or(raw);
+        let segs: Vec<String> = stripped
+            .split('.')
+            .map(alloc::string::String::from)
+            .collect();
+        if segs.iter().any(|s| s.is_empty()) {
+            return Err(KashError::Runtime(alloc::format!(
+                "use: malformed path `{raw}`"
+            )));
+        }
+        Ok(segs)
+    }
+
+    let strs: Vec<&str> = args.iter().map(alloc::string::String::as_str).collect();
+    match strs.as_slice() {
+        ["namespace", path] => Ok(ImportEntry::Wildcard {
+            source: split_path(path)?,
+        }),
+        ["namespace", path, "as", alias] => {
+            if alias.contains('.') {
+                return Err(KashError::Runtime(alloc::format!(
+                    "use namespace … as: alias `{alias}` must be a bare identifier"
+                )));
+            }
+            Ok(ImportEntry::Aliased {
+                source: split_path(path)?,
+                alias: alloc::string::String::from(*alias),
+            })
+        }
+        [absolute] if absolute.starts_with('.') => {
+            let segs = split_path(absolute)?;
+            if segs.len() < 2 {
+                return Err(KashError::Runtime(alloc::format!(
+                    "use: `{absolute}` needs at least one path segment before the symbol name"
+                )));
+            }
+            let source_name = segs.last().unwrap().clone();
+            let source_path = segs[..segs.len() - 1].to_vec();
+            Ok(ImportEntry::Symbol {
+                source_path,
+                source_name,
+                alias: None,
+            })
+        }
+        [absolute, "as", alias] if absolute.starts_with('.') => {
+            let segs = split_path(absolute)?;
+            if segs.len() < 2 {
+                return Err(KashError::Runtime(alloc::format!(
+                    "use: `{absolute}` needs at least one path segment before the symbol name"
+                )));
+            }
+            if alias.contains('.') {
+                return Err(KashError::Runtime(alloc::format!(
+                    "use: alias `{alias}` must be a bare identifier"
+                )));
+            }
+            let source_name = segs.last().unwrap().clone();
+            let source_path = segs[..segs.len() - 1].to_vec();
+            Ok(ImportEntry::Symbol {
+                source_path,
+                source_name,
+                alias: Some(alloc::string::String::from(*alias)),
+            })
+        }
+        _ => Err(KashError::Runtime(
+            "use: expected one of `use namespace PATH [as ALIAS]` or `use .PATH.NAME [as ALIAS]`".into(),
+        )),
+    }
+}
+
 /// Build `.<seg1>.<seg2>…<name>` for a namespace-qualified lookup.
 fn build_qualified_name(segments: &[String], name: &str) -> String {
     let mut out = String::with_capacity(
@@ -6871,6 +7023,58 @@ mod tests {
              show\n",
         );
         assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn use_namespace_alias_form() {
+        // `use namespace utils as u` makes `.u.X` an alias for `.utils.X`.
+        let (_, out, _) = run(
+            "namespace utils { hi() { echo hi-from-utils; }; }\n\
+             show() { use namespace utils as u; .u.hi; }\n\
+             show\n",
+        );
+        assert_eq!(out, "hi-from-utils\n");
+    }
+
+    #[test]
+    fn use_single_symbol_form() {
+        let (_, out, _) = run(
+            "namespace utils { hi() { echo hi-1; }; bye() { echo bye-1; }; }\n\
+             show() { use .utils.hi; hi; }\n\
+             show\n",
+        );
+        assert_eq!(out, "hi-1\n");
+    }
+
+    #[test]
+    fn use_single_symbol_as_alias() {
+        let (_, out, _) = run(
+            "namespace utils { hi() { echo hi-2; }; }\n\
+             show() { use .utils.hi as greet; greet; }\n\
+             show\n",
+        );
+        assert_eq!(out, "hi-2\n");
+    }
+
+    #[test]
+    fn use_single_symbol_reaches_underscore_name() {
+        // Single-symbol form is explicit, so `_helper` is allowed.
+        let (_, out, _) = run(
+            "namespace utils { _helper() { echo helper-explicit; }; }\n\
+             show() { use .utils._helper; _helper; }\n\
+             show\n",
+        );
+        assert_eq!(out, "helper-explicit\n");
+    }
+
+    #[test]
+    fn use_namespace_as_alias_rejects_dotted_alias() {
+        let src = "namespace utils { :; }\n\
+                   show() { use namespace utils as a.b; }\n\
+                   show\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
     }
 
     #[test]
