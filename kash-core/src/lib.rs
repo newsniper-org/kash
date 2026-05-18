@@ -36,13 +36,13 @@ extern crate alloc;
 
 use kash_macros::ifstd;
 
+pub mod ast;
 pub mod error;
+pub mod lexer;
 pub mod mode;
+pub mod parser;
 pub mod value;
-mod ast;
 mod eval;
-mod lexer;
-mod parser;
 mod scope;
 
 /// Semantic version of this crate, as in `Cargo.toml`.
