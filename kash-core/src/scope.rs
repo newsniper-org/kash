@@ -21,6 +21,7 @@
 //! `Scope<B>` are generic over the backend, with [`BTreeBackend`] as
 //! the default so external callers don't have to spell the parameter.
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -29,17 +30,97 @@ use crate::collections::{BTreeBackend, MapBackend, MapStorage};
 use crate::error::{KashError, Result};
 use crate::value::Value;
 
-/// One variable binding. The value travels with its `readonly`
-/// attribute so the assignment guards can short-circuit on a single
-/// map lookup.
+/// One variable binding. The value travels with its full `typeset`
+/// attribute set so assignment guards and read-side transformations
+/// can short-circuit on a single map lookup.
 #[derive(Clone, Debug, Default)]
 pub struct Binding {
     /// The bound value.
     pub value: Value,
-    /// `readonly` attribute (POSIX `readonly`, ksh93 `typeset -r`).
-    /// Set bindings refuse further mutation; `local` of the same name
-    /// in an inner frame still works (it creates a *new* binding).
+    /// `typeset`-style attribute set.
+    pub attrs: AttrSet,
+}
+
+impl Binding {
+    /// True if this binding is `readonly`-attributed. Short-hand for
+    /// `b.attrs.readonly` so existing call sites stay terse.
+    #[inline]
+    #[must_use]
+    pub fn readonly(&self) -> bool {
+        self.attrs.readonly
+    }
+}
+
+/// `typeset`-style attribute set. Variant fields cover the ksh93
+/// surface we ship in this commit; the rest of the ksh93 surface
+/// (`-n` nameref, `-T` user-defined types) is named but inactive in
+/// [`AttrSet::pending_nameref`] / [`AttrSet::pending_typedef`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttrSet {
+    /// `-r` — readonly. Further mutation is refused.
     pub readonly: bool,
+    /// `-x` — exported. Surfaces in the environment of an external
+    /// command spawned through this scope.
+    pub export: bool,
+    /// `-i` — integer. Assigned strings are evaluated as arithmetic
+    /// before being stored.
+    pub integer: bool,
+    /// `-l` — lower-case. Stored value is folded to lower case.
+    pub lowercase: bool,
+    /// `-u` — upper-case. Stored value is folded to upper case.
+    pub uppercase: bool,
+    /// `-a` — indexed array. The binding's [`Value`] should be
+    /// `Value::Array` (assignments coerce if needed).
+    pub indexed: bool,
+    /// `-A` — associative array. The binding's [`Value`] should be
+    /// `Value::AssocArray`.
+    pub assoc: bool,
+    /// `-n` — nameref. Holds the target variable name; lookups are
+    /// transparently routed there. **Not yet wired** in the
+    /// evaluator (parser / `typeset` accept it; storage is just a
+    /// string).
+    pub pending_nameref: Option<String>,
+    /// `-T` — user-defined type. Holds the type's name. **Not yet
+    /// wired**; reserved for the typeclass / OOP integration.
+    pub pending_typedef: Option<String>,
+}
+
+impl AttrSet {
+    /// Merge `other`'s set bits into `self`. Attribute setters are
+    /// idempotent and additive; clearing happens via `+letter`-form
+    /// builtin args, which take a separate code path.
+    #[inline]
+    pub fn merge(&mut self, other: &AttrSet) {
+        self.readonly |= other.readonly;
+        self.export |= other.export;
+        self.integer |= other.integer;
+        self.lowercase |= other.lowercase;
+        self.uppercase |= other.uppercase;
+        self.indexed |= other.indexed;
+        self.assoc |= other.assoc;
+        if other.pending_nameref.is_some() {
+            self.pending_nameref = other.pending_nameref.clone();
+        }
+        if other.pending_typedef.is_some() {
+            self.pending_typedef = other.pending_typedef.clone();
+        }
+    }
+
+    /// Transform `value` according to whatever read/write
+    /// projections this attribute set asks for: `-l` lower-cases,
+    /// `-u` upper-cases, `-i` runs the string through arithmetic
+    /// evaluation. The order is `integer → case`, matching ksh93's
+    /// store-time semantics.
+    #[must_use]
+    pub fn project_on_store(&self, value: String) -> String {
+        if self.uppercase {
+            value.to_uppercase()
+        } else if self.lowercase {
+            value.to_lowercase()
+        } else {
+            value
+        }
+    }
 }
 
 /// One stack frame's bindings + scope-discipline flags. Generic over
@@ -186,11 +267,12 @@ impl<B: MapBackend> Scope<B> {
     }
 
     /// Plain variable assignment, with the scope-resolution policy
-    /// described in the module docs.
+    /// described in the module docs. Attributes on an existing
+    /// binding are preserved.
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
         for frame in &self.frames {
             if let Some(b) = frame.bindings.get(name)
-                && b.readonly
+                && b.readonly()
             {
                 return Err(KashError::Readonly(name.into()));
             }
@@ -200,36 +282,36 @@ impl<B: MapBackend> Scope<B> {
             && top.static_scope
         {
             let top = self.frames.last_mut().expect("just checked");
-            top.bindings.insert(
-                name.to_string(),
-                Binding {
-                    value,
-                    readonly: false,
-                },
-            );
+            Self::write_or_create(top, name, value);
             return Ok(());
         }
         for i in (0..self.frames.len()).rev() {
             if self.frames[i].bindings.contains_key(name) {
-                self.frames[i].bindings.insert(
-                    name.to_string(),
-                    Binding {
-                        value,
-                        readonly: false,
-                    },
-                );
+                Self::write_or_create(&mut self.frames[i], name, value);
                 return Ok(());
             }
         }
         let root = self.frames.first_mut().expect("at least one frame");
-        root.bindings.insert(
-            name.to_string(),
-            Binding {
-                value,
-                readonly: false,
-            },
-        );
+        Self::write_or_create(root, name, value);
         Ok(())
+    }
+
+    /// Helper for `assign` / `assign_local`: if the binding already
+    /// exists, project `value` through the binding's attributes and
+    /// overwrite it; otherwise insert a fresh binding with the
+    /// default attribute set.
+    fn write_or_create(frame: &mut Frame<B>, name: &str, value: Value) {
+        if let Some(b) = frame.bindings.get_mut(name) {
+            b.value = project_value(&b.attrs, value);
+        } else {
+            frame.bindings.insert(
+                name.to_string(),
+                Binding {
+                    value,
+                    attrs: AttrSet::default(),
+                },
+            );
+        }
     }
 
     /// `local NAME[=VALUE]` — bind `name` in the topmost (function)
@@ -237,17 +319,11 @@ impl<B: MapBackend> Scope<B> {
     pub fn assign_local(&mut self, name: &str, value: Value) -> Result<()> {
         let top = self.frames.last_mut().expect("at least one frame");
         if let Some(b) = top.bindings.get(name)
-            && b.readonly
+            && b.readonly()
         {
             return Err(KashError::Readonly(name.into()));
         }
-        top.bindings.insert(
-            name.to_string(),
-            Binding {
-                value,
-                readonly: false,
-            },
-        );
+        Self::write_or_create(top, name, value);
         Ok(())
     }
 
@@ -255,13 +331,13 @@ impl<B: MapBackend> Scope<B> {
     pub fn mark_readonly(&mut self, name: &str, value: Option<Value>) -> Result<()> {
         for i in (0..self.frames.len()).rev() {
             if let Some(b) = self.frames[i].bindings.get_mut(name) {
-                if b.readonly && value.is_some() {
+                if b.readonly() && value.is_some() {
                     return Err(KashError::Readonly(name.into()));
                 }
                 if let Some(v) = value {
-                    b.value = v;
+                    b.value = project_value(&b.attrs, v);
                 }
-                b.readonly = true;
+                b.attrs.readonly = true;
                 return Ok(());
             }
         }
@@ -270,10 +346,67 @@ impl<B: MapBackend> Scope<B> {
             name.to_string(),
             Binding {
                 value: value.unwrap_or_default(),
-                readonly: true,
+                attrs: AttrSet {
+                    readonly: true,
+                    ..AttrSet::default()
+                },
             },
         );
         Ok(())
+    }
+
+    /// Apply a `typeset`-style attribute set to `name`. Creates the
+    /// binding with the default value (`Empty`) if it doesn't exist.
+    /// Attributes are *added* to whatever was already there — the
+    /// `+letter` clearing form takes a different code path.
+    pub fn apply_attrs(&mut self, name: &str, attrs: &AttrSet) -> Result<()> {
+        // Pick the topmost frame as the binding's home if it's new.
+        let top = self.frames.last_mut().expect("at least one frame");
+        if let Some(b) = top.bindings.get_mut(name) {
+            b.attrs.merge(attrs);
+            return Ok(());
+        }
+        // Walk down the stack looking for an existing binding.
+        for i in (0..self.frames.len() - 1).rev() {
+            if let Some(b) = self.frames[i].bindings.get_mut(name) {
+                b.attrs.merge(attrs);
+                return Ok(());
+            }
+        }
+        // Brand new — install on the top frame with these attrs and an
+        // empty / appropriately-shaped value.
+        let value = initial_value_for(attrs);
+        let top = self.frames.last_mut().expect("at least one frame");
+        top.bindings.insert(
+            name.to_string(),
+            Binding {
+                value,
+                attrs: attrs.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Get the binding (including attrs) for `name`. Walks the stack
+    /// top → bottom like `get`.
+    #[must_use]
+    pub fn get_binding(&self, name: &str) -> Option<&Binding> {
+        for frame in self.frames.iter().rev() {
+            if let Some(b) = frame.bindings.get(name) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    /// Mutable variant of [`Self::get_binding`].
+    pub fn get_binding_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        for i in (0..self.frames.len()).rev() {
+            if self.frames[i].bindings.contains_key(name) {
+                return self.frames[i].bindings.get_mut(name);
+            }
+        }
+        None
     }
 
     /// Remove the nearest binding of `name`. Returns `true` if a
@@ -281,7 +414,7 @@ impl<B: MapBackend> Scope<B> {
     pub fn unset(&mut self, name: &str) -> bool {
         for i in (0..self.frames.len()).rev() {
             if let Some(b) = self.frames[i].bindings.get(name) {
-                if b.readonly {
+                if b.readonly() {
                     return false;
                 }
                 self.frames[i].bindings.remove(name);
@@ -298,12 +431,47 @@ impl<B: MapBackend> Scope<B> {
     pub fn is_readonly(&self, name: &str) -> bool {
         for frame in &self.frames {
             if let Some(b) = frame.bindings.get(name)
-                && b.readonly
+                && b.readonly()
             {
                 return true;
             }
         }
         false
+    }
+
+    /// Iterate every reachable binding as `(name, &Binding)`, walking
+    /// the stack bottom-to-top so newer (shadowing) bindings appear
+    /// later. Used by `typeset -p` and the export-environment builder.
+    pub fn all_bindings(&self) -> impl Iterator<Item = (&String, &Binding)> + '_ {
+        self.frames
+            .iter()
+            .flat_map(|f| f.bindings.iter())
+    }
+}
+
+/// Decide a starting value for a brand-new binding stamped only with
+/// attributes (`typeset -a foo`, `typeset -A foo`, …). Indexed and
+/// associative shapes need the right `Value` variant pre-installed so
+/// later `arr[i]=...` assignments don't have to re-shape.
+fn initial_value_for(attrs: &AttrSet) -> Value {
+    if attrs.indexed {
+        Value::Array(Vec::new())
+    } else if attrs.assoc {
+        Value::AssocArray(BTreeMap::new())
+    } else {
+        Value::Empty
+    }
+}
+
+/// Apply the attribute-aware projections that should run on every
+/// store: `-l` lower-cases, `-u` upper-cases, `-i` runs the value
+/// through arithmetic evaluation (TODO: wired up in the evaluator,
+/// not here). Array values pass through unchanged in this commit —
+/// per-element transformations land in a follow-up.
+fn project_value(attrs: &AttrSet, value: Value) -> Value {
+    match value {
+        Value::Scalar(s) => Value::Scalar(attrs.project_on_store(s)),
+        other => other,
     }
 }
 

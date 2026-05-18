@@ -1276,12 +1276,22 @@ fn is_valid_function_name(s: &str) -> bool {
 /// [`split_assignment`].
 fn looks_like_assignment(s: &str) -> bool {
     let Some(eq) = s.find('=') else { return false };
-    is_valid_identifier(&s[..eq])
+    let lhs = &s[..eq];
+    // Two shapes accepted: `NAME=` or `NAME[SUBSCRIPT]=`.
+    if let Some(open) = lhs.find('[') {
+        if !lhs.ends_with(']') {
+            return false;
+        }
+        is_valid_identifier(&lhs[..open])
+    } else {
+        is_valid_identifier(lhs)
+    }
 }
 
-/// Split a parsed [`Word`] (which is known to begin with `NAME=…`)
-/// into a name and a value [`Word`]. Returns `Err(word)` if the word's
-/// first segment doesn't have the assignment shape.
+/// Split a parsed [`Word`] (which is known to begin with `NAME=…` or
+/// `NAME[SUBSCRIPT]=…`) into a name, an optional subscript, and a
+/// value [`Word`]. Returns `Err(word)` if the first segment doesn't
+/// have the assignment shape.
 fn split_assignment(word: Word) -> core::result::Result<Assignment, Word> {
     let first = match &word.segments[0] {
         WordSegment::Bare(s) => s.clone(),
@@ -1290,10 +1300,23 @@ fn split_assignment(word: Word) -> core::result::Result<Assignment, Word> {
     let Some(eq) = first.find('=') else {
         return Err(word);
     };
-    let name = first[..eq].to_string();
-    if !is_valid_identifier(&name) {
-        return Err(word);
-    }
+    let lhs = &first[..eq];
+    let (name, subscript_text): (String, Option<String>) = if let Some(open) = lhs.find('[') {
+        if !lhs.ends_with(']') {
+            return Err(word);
+        }
+        let n = &lhs[..open];
+        let s = &lhs[open + 1..lhs.len() - 1];
+        if !is_valid_identifier(n) {
+            return Err(word);
+        }
+        (n.to_string(), Some(s.to_string()))
+    } else {
+        if !is_valid_identifier(lhs) {
+            return Err(word);
+        }
+        (lhs.to_string(), None)
+    };
     let value_first_text = &first[eq + 1..];
     let mut value_segments = Vec::new();
     if !value_first_text.is_empty() {
@@ -1306,13 +1329,23 @@ fn split_assignment(word: Word) -> core::result::Result<Assignment, Word> {
         // `NAME=` form — explicit empty value.
         value_segments.push(WordSegment::Bare(String::new()));
     }
-    let value_start = word.span.start + name.len() + 1; // `=` is one byte
+    let prefix_len = match &subscript_text {
+        Some(s) => name.len() + s.len() + 2 + 1, // name + [...] + `=`
+        None => name.len() + 1,
+    };
+    let value_start = word.span.start + prefix_len;
     let value = Word {
         segments: value_segments,
         span: Span::new(value_start, word.span.end),
     };
+    let subscript = subscript_text.map(|s| Word {
+        segments: alloc::vec![WordSegment::Bare(s)],
+        // approximate; we don't track the bracket positions precisely
+        span: word.span,
+    });
     Ok(Assignment {
         name,
+        subscript,
         value,
         span: word.span,
     })

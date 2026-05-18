@@ -6,18 +6,18 @@
 //! user-defined-type instances. Includes the `${(t)var}` type-introspection
 //! tag and the typeclass-dispatch hooks.
 //!
-//! Scope of this commit: only the scalar shape is wired up so the
-//! evaluator skeleton can read and write variables. The other shapes
-//! exist as enum variants for forward-compatibility but the evaluator
-//! never produces them yet.
+//! Scope of this commit: scalar, indexed array (`-a`), associative
+//! array (`-A`). Compound, nameref (`-n`), and user-defined types
+//! (`-T`) still exist only as enum-variant placeholders / future work.
 
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// Runtime value held by a variable binding.
 ///
 /// The variant set is `#[non_exhaustive]` so we can add compound /
-/// associative-array / typed-numeric shapes without a SemVer break.
+/// nameref / typed-numeric shapes without a SemVer break.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Value {
@@ -30,6 +30,8 @@ pub enum Value {
     Scalar(String),
     /// Indexed array — a flat list of element strings.
     Array(Vec<String>),
+    /// Associative array — string key → string value.
+    AssocArray(BTreeMap<String, String>),
 }
 
 impl Value {
@@ -41,7 +43,9 @@ impl Value {
     }
 
     /// Render the value to a single string for `"$var"`-style scalar
-    /// contexts. Arrays render their first element (POSIX rule).
+    /// contexts. Arrays render their element at index `0` (POSIX);
+    /// associative arrays render their first inserted value (the
+    /// only key without a numeric index that ksh93 / bash agree on).
     #[inline]
     #[must_use]
     pub fn to_scalar_string(&self) -> String {
@@ -49,6 +53,7 @@ impl Value {
             Self::Empty => String::new(),
             Self::Scalar(s) => s.clone(),
             Self::Array(a) => a.first().cloned().unwrap_or_default(),
+            Self::AssocArray(m) => m.values().next().cloned().unwrap_or_default(),
         }
     }
 
@@ -61,6 +66,7 @@ impl Value {
             Self::Empty => true,
             Self::Scalar(s) => s.is_empty(),
             Self::Array(a) => a.is_empty(),
+            Self::AssocArray(m) => m.is_empty(),
         }
     }
 }
@@ -101,5 +107,15 @@ mod tests {
     fn array_scalar_context_picks_first() {
         let v = Value::Array(alloc::vec!["a".into(), "b".into()]);
         assert_eq!(v.to_scalar_string(), "a");
+    }
+
+    #[test]
+    fn assoc_array_scalar_context_picks_first_inserted() {
+        let mut m = BTreeMap::new();
+        m.insert("a".into(), "alpha".into());
+        m.insert("b".into(), "beta".into());
+        let v = Value::AssocArray(m);
+        // BTreeMap iterates by key order, so "a" wins.
+        assert_eq!(v.to_scalar_string(), "alpha");
     }
 }

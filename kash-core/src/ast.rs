@@ -107,15 +107,19 @@ pub struct Redirect {
     pub span: Span,
 }
 
-/// `KEY=VALUE` prefix on a [`SimpleCommand`]. Reserved for the
-/// follow-up commit that wires up assignment parsing.
+/// `KEY=VALUE` (or `KEY[SUBSCRIPT]=VALUE`) prefix on a
+/// [`SimpleCommand`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assignment {
     /// Variable name.
     pub name: String,
+    /// Optional subscript — `Some(word)` for `name[word]=value`
+    /// (indexed or associative array element), `None` for the bare
+    /// `name=value` form.
+    pub subscript: Option<Word>,
     /// Right-hand side expression as a word.
     pub value: Word,
-    /// Source span covering `name=value`.
+    /// Source span covering `name[subscript]=value`.
     pub span: Span,
 }
 

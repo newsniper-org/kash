@@ -27,8 +27,9 @@ use crate::ast::{
 use crate::collections::{BTreeBackend, MapBackend, MapStorage, SetStorage};
 use crate::error::{KashError, Result};
 use crate::mode::Mode;
-use crate::scope::Scope;
+use crate::scope::{AttrSet, Scope};
 use crate::value::Value;
+use alloc::collections::BTreeMap;
 use kash_macros::ifstd;
 
 /// Result of evaluating a statement / command — either a normal exit
@@ -374,7 +375,26 @@ impl<B: MapBackend> Evaluator<B> {
         // we just persist them, and revisit when external exec lands.
         for a in &cmd.assignments {
             let value = self.expand_word(&a.value)?;
-            self.scope.assign(&a.name, Value::Scalar(value))?;
+            // Respect the `-i` attribute on the existing binding (if
+            // any): the right-hand side is evaluated as arithmetic
+            // before being stored.
+            let integer = self
+                .scope
+                .get_binding(&a.name)
+                .map(|b| b.attrs.integer)
+                .unwrap_or(false);
+            let value = if integer {
+                let n = self.eval_arith(&value)?;
+                alloc::format!("{n}")
+            } else {
+                value
+            };
+            if let Some(sub) = &a.subscript {
+                let idx = self.expand_word(sub)?;
+                self.assign_array_element(&a.name, &idx, value)?;
+            } else {
+                self.scope.assign(&a.name, Value::Scalar(value))?;
+            }
         }
         if cmd.words.is_empty() {
             if !cmd.redirects.is_empty() {
@@ -475,6 +495,8 @@ impl<B: MapBackend> Evaluator<B> {
             "trap" => self.builtin_trap(&argv[1..]),
             "alias" => self.builtin_alias(&argv[1..]),
             "unalias" => self.builtin_unalias(&argv[1..]),
+            "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
+            "export" => self.builtin_export(&argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -756,6 +778,179 @@ impl<B: MapBackend> Evaluator<B> {
             }
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `typeset` / `declare` builtin. Parses leading `-…` /  `+…`
+    /// option clusters into an [`AttrSet`], then either:
+    ///
+    /// - with no further args, prints the (filtered) listing of
+    ///   bindings, one `typeset … NAME=VALUE` line each, in
+    ///   sorted-by-name order;
+    /// - otherwise applies the attribute set to each `NAME` /
+    ///   `NAME=VALUE` operand and, if a value is given, stores it
+    ///   through `Scope::assign_local` when inside a function frame
+    ///   or `Scope::assign` at top level.
+    fn builtin_typeset(&mut self, args: &[String]) -> Result<Outcome> {
+        let mut attrs = AttrSet::default();
+        let mut print_mode = false;
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if let Some(rest) = a.strip_prefix('-') {
+                if rest.is_empty() {
+                    i += 1;
+                    break;
+                }
+                for c in rest.chars() {
+                    match c {
+                        'r' => attrs.readonly = true,
+                        'x' => attrs.export = true,
+                        'i' => attrs.integer = true,
+                        'l' => attrs.lowercase = true,
+                        'u' => attrs.uppercase = true,
+                        'a' => attrs.indexed = true,
+                        'A' => attrs.assoc = true,
+                        'p' => print_mode = true,
+                        other => {
+                            return Err(KashError::Runtime(alloc::format!(
+                                "typeset: unknown flag `-{other}`"
+                            )));
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        let has_operands = i < args.len();
+        if print_mode || !has_operands {
+            self.print_typeset_listing(&attrs);
+            return Ok(Outcome::Status(0));
+        }
+
+        let in_func = self.scope.in_function();
+        while i < args.len() {
+            let arg = &args[i];
+            if let Some(eq) = arg.find('=') {
+                let (name, rest) = arg.split_at(eq);
+                if !is_identifier(name) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "typeset: `{name}` is not a valid identifier"
+                    )));
+                }
+                let raw_value = rest[1..].to_string();
+                self.scope.apply_attrs(name, &attrs)?;
+                let value = self.coerce_for_attrs(&attrs, raw_value)?;
+                if in_func {
+                    self.scope.assign_local(name, Value::Scalar(value))?;
+                } else {
+                    self.scope.assign(name, Value::Scalar(value))?;
+                }
+            } else {
+                if !is_identifier(arg) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "typeset: `{arg}` is not a valid identifier"
+                    )));
+                }
+                self.scope.apply_attrs(arg, &attrs)?;
+            }
+            i += 1;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// `export [NAME[=VAL] …]` — short-hand for `typeset -x`.
+    /// `export` with no args lists the currently-exported bindings.
+    fn builtin_export(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.is_empty() {
+            let filter = AttrSet {
+                export: true,
+                ..AttrSet::default()
+            };
+            self.print_typeset_listing(&filter);
+            return Ok(Outcome::Status(0));
+        }
+        let export_attrs = AttrSet {
+            export: true,
+            ..AttrSet::default()
+        };
+        for arg in args {
+            if let Some(eq) = arg.find('=') {
+                let (name, rest) = arg.split_at(eq);
+                if !is_identifier(name) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "export: `{name}` is not a valid identifier"
+                    )));
+                }
+                self.scope.apply_attrs(name, &export_attrs)?;
+                let value = rest[1..].to_string();
+                self.scope.assign(name, Value::Scalar(value))?;
+            } else {
+                if !is_identifier(arg) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "export: `{arg}` is not a valid identifier"
+                    )));
+                }
+                self.scope.apply_attrs(arg, &export_attrs)?;
+            }
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// Apply the attribute-aware coercion that runs before a value
+    /// goes through `scope.assign*`: `-i` runs the string through
+    /// arithmetic, `-l` / `-u` fold case. Errors propagate (e.g.
+    /// bad arithmetic).
+    fn coerce_for_attrs(
+        &mut self,
+        attrs: &AttrSet,
+        value: String,
+    ) -> Result<String> {
+        let value = if attrs.integer {
+            let n = self.eval_arith(&value)?;
+            alloc::format!("{n}")
+        } else {
+            value
+        };
+        let value = if attrs.uppercase {
+            value.to_uppercase()
+        } else if attrs.lowercase {
+            value.to_lowercase()
+        } else {
+            value
+        };
+        Ok(value)
+    }
+
+    /// `typeset` listing. Walks every binding, filters by the
+    /// (possibly empty) attribute mask, and emits one canonical
+    /// `typeset -<flags> NAME=VALUE` line each in sorted-by-name
+    /// order. `[]` / `()` array forms follow the ksh93 shape.
+    fn print_typeset_listing(&mut self, filter: &AttrSet) {
+        // Collect (name, attrs, value) snapshots so we don't fight
+        // the borrow checker while pushing into `self.output`.
+        let mut entries: alloc::vec::Vec<(String, AttrSet, Value)> = self
+            .scope
+            .all_bindings()
+            .map(|(n, b)| (n.clone(), b.attrs.clone(), b.value.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        for (name, attrs, value) in entries {
+            if !attrs_match_filter(&attrs, filter) {
+                continue;
+            }
+            let flags = format_attrs(&attrs);
+            let rendered = format_value_for_listing(&value);
+            self.output
+                .push_str(&alloc::format!("typeset{flags} {name}={rendered}\n"));
+        }
     }
 
     fn builtin_readonly(&mut self, args: &[String]) -> Result<Outcome> {
@@ -1440,12 +1635,26 @@ impl<B: MapBackend> Evaluator<B> {
     /// - `${NAME?WORD}` / `${NAME:?WORD}` — error if unset/null
     /// - `${NAME+WORD}` / `${NAME:+WORD}` — alternate
     fn expand_braced(&mut self, body: &str) -> Result<String> {
-        // `${#NAME}` — length form. Has to be checked before the
-        // operator-split because `#` here is *not* a modifier-op.
+        // `${#NAME[subscript]}` / `${#NAME[@]}` — length forms. Have
+        // to be checked before the operator-split because `#` here
+        // is *not* a modifier-op.
         if let Some(rest) = body.strip_prefix('#') {
             if rest.is_empty() {
                 // `${#}` — argc.
                 return Ok(self.positionals.len().to_string());
+            }
+            // `${#NAME[@]}` / `${#NAME[*]}` — element count.
+            if let Some((name, sub)) = split_subscripted(rest) {
+                if sub == "@" || sub == "*" {
+                    let n = self
+                        .lookup_all_elements(name)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    return Ok(n.to_string());
+                }
+                // `${#NAME[i]}` — length of that element.
+                let elem = self.lookup_indexed(name, sub).unwrap_or_default();
+                return Ok(elem.chars().count().to_string());
             }
             if !is_valid_param_name(rest) {
                 return Err(KashError::Parse(format!(
@@ -1457,6 +1666,24 @@ impl<B: MapBackend> Evaluator<B> {
                 None => 0,
             };
             return Ok(len.to_string());
+        }
+
+        // `${NAME[subscript]}` / `${NAME[@]}` / `${NAME[*]}` —
+        // subscripted forms. Recognised *before* the bare-name
+        // parser since `[` isn't a valid identifier byte.
+        if let Some((name, sub)) = split_subscripted(body) {
+            if sub == "@" || sub == "*" {
+                let elems = self
+                    .lookup_all_elements(name)
+                    .unwrap_or_default();
+                // In a single-string expansion context both `@` and
+                // `*` collapse to the IFS-joined form (the multi-
+                // field side is handled separately in
+                // expand_into_fields for splittable contexts).
+                let sep = first_ifs_char(&self.lookup_ifs());
+                return Ok(elems.join(&sep));
+            }
+            return Ok(self.lookup_indexed(name, sub).unwrap_or_default());
         }
 
         // Find the parameter name (run of identifier bytes). The first
@@ -1561,6 +1788,105 @@ impl<B: MapBackend> Evaluator<B> {
         }
     }
 
+    /// Assign `value` into the `name[idx]` slot. The binding is
+    /// created on first touch (defaulting to an indexed array) and
+    /// re-shaped if the existing attributes ask for one form but the
+    /// stored value is the other. `name[idx]=` on a readonly binding
+    /// fails with `KashError::Readonly`.
+    fn assign_array_element(
+        &mut self,
+        name: &str,
+        idx: &str,
+        value: String,
+    ) -> Result<()> {
+        let existing = self
+            .scope
+            .get_binding(name)
+            .map(|b| (b.attrs.clone(), matches!(b.value, Value::AssocArray(_))));
+        let (is_assoc, is_readonly) = match &existing {
+            Some((attrs, current_is_assoc)) => {
+                (attrs.assoc || *current_is_assoc, attrs.readonly)
+            }
+            None => (false, false),
+        };
+        if is_readonly {
+            return Err(KashError::Readonly(name.into()));
+        }
+        if existing.is_none() {
+            let mut attrs = AttrSet::default();
+            if is_assoc {
+                attrs.assoc = true;
+            } else {
+                attrs.indexed = true;
+            }
+            self.scope.apply_attrs(name, &attrs)?;
+        }
+        let b = self
+            .scope
+            .get_binding_mut(name)
+            .expect("just installed");
+        if is_assoc {
+            match &mut b.value {
+                Value::AssocArray(m) => {
+                    m.insert(idx.to_string(), value);
+                }
+                _ => {
+                    let mut m = BTreeMap::new();
+                    m.insert(idx.to_string(), value);
+                    b.value = Value::AssocArray(m);
+                }
+            }
+        } else {
+            let i: usize = idx.parse().map_err(|_| {
+                KashError::Runtime(alloc::format!(
+                    "array index `{idx}` is not a non-negative integer"
+                ))
+            })?;
+            match &mut b.value {
+                Value::Array(v) => {
+                    if v.len() <= i {
+                        v.resize(i + 1, String::new());
+                    }
+                    v[i] = value;
+                }
+                _ => {
+                    let mut v = alloc::vec::Vec::new();
+                    v.resize(i + 1, String::new());
+                    v[i] = value;
+                    b.value = Value::Array(v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Look up `name[idx]`. Returns `None` if the binding is unset,
+    /// the index is out-of-range, or the value isn't array-shaped.
+    fn lookup_indexed(&self, name: &str, idx: &str) -> Option<String> {
+        let b = self.scope.get_binding(name)?;
+        match &b.value {
+            Value::Array(v) => {
+                let i: usize = idx.parse().ok()?;
+                v.get(i).cloned()
+            }
+            Value::AssocArray(m) => m.get(idx).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Render `name[@]` / `name[*]` as a list of strings. For
+    /// indexed arrays the order is index ascending; for associative
+    /// arrays the order is `BTreeMap` (sorted by key).
+    fn lookup_all_elements(&self, name: &str) -> Option<alloc::vec::Vec<String>> {
+        let b = self.scope.get_binding(name)?;
+        match &b.value {
+            Value::Array(v) => Some(v.clone()),
+            Value::AssocArray(m) => Some(m.values().cloned().collect()),
+            Value::Scalar(s) => Some(alloc::vec![s.clone()]),
+            Value::Empty => Some(alloc::vec::Vec::new()),
+        }
+    }
+
     /// Like [`lookup_param`](Self::lookup_param) but never triggers
     /// `nounset`. Used by modifier forms (`${VAR:-…}`, `${VAR:+…}`,
     /// …) that explicitly handle the unset case themselves.
@@ -1651,6 +1977,20 @@ impl<B: MapBackend> Default for Evaluator<B> {
 
 ifstd!({
     impl<B: crate::collections::MapBackend> Evaluator<B> {
+        /// Walk the scope stack and push every binding flagged with
+        /// `attrs.export` into `cmd`'s environment, using the
+        /// binding's scalar form. Called before every `spawn` on
+        /// the external-exec / pipeline / redirect-bearing paths so
+        /// the child sees the same exported set that interactive
+        /// shells do.
+        fn apply_exported_env(&self, cmd: &mut std::process::Command) {
+            for (name, b) in self.scope.all_bindings() {
+                if b.attrs.export {
+                    cmd.env(name, b.value.to_scalar_string());
+                }
+            }
+        }
+
         /// Open the files named by a list of redirects without
         /// running any command. Used for the POSIX no-command form
         /// (`> file` truncates, `< file` opens-and-discards, …).
@@ -1890,6 +2230,7 @@ ifstd!({
                 // we write to after spawn.
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
+                self.apply_exported_env(&mut c);
                 let needs_inline_write = in_inline.is_some();
                 if let Some(f) = in_file {
                     c.stdin(Stdio::from(f));
@@ -2011,6 +2352,8 @@ ifstd!({
                 "trap" => self.builtin_trap(&argv[1..]),
                 "alias" => self.builtin_alias(&argv[1..]),
                 "unalias" => self.builtin_unalias(&argv[1..]),
+                "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
+                "export" => self.builtin_export(&argv[1..]),
                 other => Err(KashError::Runtime(alloc::format!(
                     "internal: dispatch_builtin called for `{other}`"
                 ))),
@@ -2025,6 +2368,7 @@ ifstd!({
             use std::process::{Command, Stdio};
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]);
+            self.apply_exported_env(&mut cmd);
             cmd.stdin(Stdio::inherit());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::inherit());
@@ -2105,6 +2449,7 @@ ifstd!({
             for (i, argv) in argvs.iter().enumerate() {
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
+                self.apply_exported_env(&mut cmd);
                 if i == 0 {
                     cmd.stdin(Stdio::inherit());
                 } else {
@@ -2203,6 +2548,9 @@ fn is_builtin_name(name: &str) -> bool {
             | "trap"
             | "alias"
             | "unalias"
+            | "typeset"
+            | "declare"
+            | "export"
     )
 }
 
@@ -3356,6 +3704,95 @@ fn word_has_quoted_segment(w: &Word) -> bool {
                 | WordSegment::AnsiC(_)
         )
     })
+}
+
+/// True iff every attribute set in `filter` is also set in `attrs`.
+/// An empty `filter` matches everything.
+fn attrs_match_filter(attrs: &AttrSet, filter: &AttrSet) -> bool {
+    (!filter.readonly || attrs.readonly)
+        && (!filter.export || attrs.export)
+        && (!filter.integer || attrs.integer)
+        && (!filter.lowercase || attrs.lowercase)
+        && (!filter.uppercase || attrs.uppercase)
+        && (!filter.indexed || attrs.indexed)
+        && (!filter.assoc || attrs.assoc)
+}
+
+/// Render an `AttrSet` as a flag cluster (`" -ix"`, etc.). Empty
+/// returns an empty string.
+fn format_attrs(attrs: &AttrSet) -> String {
+    let mut out = String::new();
+    if attrs.readonly {
+        out.push_str(" -r");
+    }
+    if attrs.export {
+        out.push_str(" -x");
+    }
+    if attrs.integer {
+        out.push_str(" -i");
+    }
+    if attrs.lowercase {
+        out.push_str(" -l");
+    }
+    if attrs.uppercase {
+        out.push_str(" -u");
+    }
+    if attrs.indexed {
+        out.push_str(" -a");
+    }
+    if attrs.assoc {
+        out.push_str(" -A");
+    }
+    out
+}
+
+/// `typeset -p`-style rendering of a value. Single-quotes scalars,
+/// `([idx]='val' ...)` for arrays.
+fn format_value_for_listing(v: &Value) -> String {
+    match v {
+        Value::Empty => "''".into(),
+        Value::Scalar(s) => alloc::format!("'{s}'"),
+        Value::Array(v) => {
+            let mut s = String::from("(");
+            for (i, elem) in v.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&alloc::format!("[{i}]='{elem}'"));
+            }
+            s.push(')');
+            s
+        }
+        Value::AssocArray(m) => {
+            let mut s = String::from("(");
+            let mut first = true;
+            for (k, v) in m {
+                if !first {
+                    s.push(' ');
+                }
+                first = false;
+                s.push_str(&alloc::format!("[{k}]='{v}'"));
+            }
+            s.push(')');
+            s
+        }
+    }
+}
+
+/// Split a `${...}` body into `(name, subscript)` if it has the
+/// `NAME[SUBSCRIPT]` shape, otherwise return `None`. Used to spot
+/// `${arr[i]}` / `${arr[@]}` / `${#arr[@]}` inside `expand_braced`.
+fn split_subscripted(body: &str) -> Option<(&str, &str)> {
+    let open = body.find('[')?;
+    if !body.ends_with(']') {
+        return None;
+    }
+    let name = &body[..open];
+    let sub = &body[open + 1..body.len() - 1];
+    if !is_identifier(name) {
+        return None;
+    }
+    Some((name, sub))
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -4874,6 +5311,116 @@ mod tests {
     fn dollar_hash_reflects_argc() {
         let (_, out, _) = run_with_args("echo $#", &["a", "b", "c"]);
         assert_eq!(out, "3\n");
+    }
+
+    // ===== arrays + typeset =====
+
+    #[test]
+    fn indexed_array_assign_and_lookup() {
+        let (_, out, _) = run("arr[0]=alpha; arr[1]=beta; arr[2]=gamma; echo ${arr[0]} ${arr[1]} ${arr[2]}");
+        assert_eq!(out, "alpha beta gamma\n");
+    }
+
+    #[test]
+    fn indexed_array_length_with_hash_at() {
+        let (_, out, _) = run("arr[0]=a; arr[1]=b; arr[2]=c; echo ${#arr[@]}");
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn indexed_array_sparse_fills_with_empty() {
+        let (_, out, _) = run("arr[3]=x; echo [${arr[0]}][${arr[1]}][${arr[2]}][${arr[3]}]");
+        assert_eq!(out, "[][][][x]\n");
+    }
+
+    #[test]
+    fn assoc_array_assign_and_lookup() {
+        let (_, out, _) = run("typeset -A m; m[foo]=hello; m[bar]=world; echo ${m[foo]} ${m[bar]}");
+        assert_eq!(out, "hello world\n");
+    }
+
+    #[test]
+    fn assoc_array_length_with_hash_at() {
+        let (_, out, _) = run("typeset -A m; m[a]=1; m[b]=2; m[c]=3; echo ${#m[@]}");
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn array_at_star_joined_in_scalar_context() {
+        let (_, out, _) = run("arr[0]=a; arr[1]=b; arr[2]=c; echo ${arr[*]}");
+        assert_eq!(out, "a b c\n");
+    }
+
+    #[test]
+    fn typeset_integer_evaluates_arithmetic_on_store() {
+        let (_, _, ev) = run("typeset -i n; n=2+3");
+        assert_eq!(ev.scope().get("n").unwrap().to_scalar_string(), "5");
+    }
+
+    #[test]
+    fn typeset_uppercase_folds_on_store() {
+        let (_, _, ev) = run("typeset -u X=hello");
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "HELLO");
+    }
+
+    #[test]
+    fn typeset_lowercase_folds_on_store() {
+        let (_, _, ev) = run("typeset -l X=HELLO");
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "hello");
+    }
+
+    #[test]
+    fn typeset_readonly_locks_binding() {
+        let prog = parse("typeset -r X=fixed; X=other").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(matches!(err, KashError::Readonly(_)));
+    }
+
+    #[test]
+    fn typeset_indexed_declaration_then_subscript_assign() {
+        let (_, out, _) = run("typeset -a arr; arr[0]=x; arr[2]=z; echo ${arr[0]}[${arr[2]}]");
+        assert_eq!(out, "x[z]\n");
+    }
+
+    #[test]
+    fn typeset_dash_p_lists_bindings() {
+        let (_, out, _) = run("X=hi; typeset -p");
+        assert!(out.contains("typeset X='hi'"), "got: {out:?}");
+    }
+
+    #[test]
+    fn export_marks_binding_for_env() {
+        let (_, _, ev) = run("export FOO=bar");
+        let b = ev.scope().get_binding("FOO").unwrap();
+        assert!(b.attrs.export);
+        assert_eq!(b.value.to_scalar_string(), "bar");
+    }
+
+    #[test]
+    fn export_then_typeset_listing_shows_x() {
+        let (_, out, _) = run("export FOO=bar; typeset -p");
+        assert!(out.contains("typeset -x FOO='bar'"), "got: {out:?}");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn exported_env_reaches_external_command() {
+        use std::path::Path;
+        if !Path::new("/usr/bin/env").exists() && !Path::new("/bin/env").exists() {
+            return;
+        }
+        let envprog = if Path::new("/usr/bin/env").exists() {
+            "/usr/bin/env"
+        } else {
+            "/bin/env"
+        };
+        let src = alloc::format!("export KASH_BENCH_X=alpha; {envprog}");
+        let prog = parse(&src).unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let out = ev.take_output();
+        assert!(out.contains("KASH_BENCH_X=alpha"), "got: {out:?}");
     }
 
     // ===== arithmetic extensions =====
