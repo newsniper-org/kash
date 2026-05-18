@@ -229,7 +229,7 @@ impl Evaluator {
         // we just persist them, and revisit when external exec lands.
         for a in &cmd.assignments {
             let value = self.expand_word(&a.value)?;
-            self.scope.set(a.name.clone(), Value::Scalar(value));
+            self.scope.assign(&a.name, Value::Scalar(value))?;
         }
         if cmd.words.is_empty() {
             if !cmd.redirects.is_empty() {
@@ -279,6 +279,8 @@ impl Evaluator {
             "set" => self.builtin_set(&argv[1..]),
             "unset" => self.builtin_unset(&argv[1..]),
             "shift" => self.builtin_shift(&argv[1..]),
+            "local" => self.builtin_local(&argv[1..]),
+            "readonly" => self.builtin_readonly(&argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -342,14 +344,53 @@ impl Evaluator {
     }
 
     fn builtin_unset(&mut self, args: &[String]) -> Result<Outcome> {
-        // Simplified: removes the topmost binding for each name. The
-        // proper `unset -v`/`-f` split lands with the full builtin
-        // surface.
+        // Simplified: removes the nearest binding for each name. The
+        // proper `unset -v`/`-f` split (unset variable vs function)
+        // lands with the full builtin surface.
         for name in args {
-            // Scope doesn't yet expose an `unset` API; emulate by
-            // overwriting with `Empty` (lookups still return Some, but
-            // is_empty() reports true). Good enough for the skeleton.
-            self.scope.set(name.clone(), Value::Empty);
+            if self.scope.is_readonly(name) {
+                return Err(KashError::Readonly(name.clone()));
+            }
+            // A non-existent name returning 0 matches POSIX behaviour.
+            let _ = self.scope.unset(name);
+            // Allow unsetting a function as a convenience.
+            self.functions.remove(name);
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    fn builtin_local(&mut self, args: &[String]) -> Result<Outcome> {
+        if !self.scope.in_function() {
+            return Err(KashError::Runtime(
+                "local: can only be used inside a function".into(),
+            ));
+        }
+        for arg in args {
+            let (name, value) = parse_name_eq_value(arg)?;
+            self.scope.assign_local(&name, Value::Scalar(value))?;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    fn builtin_readonly(&mut self, args: &[String]) -> Result<Outcome> {
+        for arg in args {
+            if let Some(eq) = arg.find('=') {
+                let (name, rest) = arg.split_at(eq);
+                if !is_identifier(name) {
+                    return Err(KashError::Runtime(format!(
+                        "readonly: `{name}` is not a valid identifier"
+                    )));
+                }
+                let value = rest[1..].to_string();
+                self.scope.mark_readonly(name, Some(Value::Scalar(value)))?;
+            } else {
+                if !is_identifier(arg) {
+                    return Err(KashError::Runtime(format!(
+                        "readonly: `{arg}` is not a valid identifier"
+                    )));
+                }
+                self.scope.mark_readonly(arg, None)?;
+            }
         }
         Ok(Outcome::Status(0))
     }
@@ -377,21 +418,23 @@ impl Evaluator {
             .get(&argv[0])
             .cloned()
             .expect("function existed at dispatch time");
-        // Save & swap positionals + push a frame.
+        // Swap in the function's positional arguments.
         let saved = core::mem::replace(&mut self.positionals, argv[1..].to_vec());
         self.positionals_stack.push(saved);
-        // Lexical capture (static scope) doesn't fully apply until the
-        // scope module distinguishes static vs dynamic frames — until
-        // then both scope flavours behave the same way (dynamic).
-        let _ = entry.scope;
+        // Push a function frame. `static_scope = true` for ksh93
+        // `function NAME`-form functions: assignments inside that
+        // form's body default to local, matching the locked
+        // `project_shell_function_scope.md` rule.
+        let static_scope = matches!(entry.scope, FunctionScope::Static);
+        self.scope.push_function_frame(static_scope);
+        // Capture list enforcement (read-only by-ref binding for the
+        // names in `entry.captures`) lights up when the typeset
+        // attribute machinery lands — until then the parser records
+        // the list, the evaluator ignores it.
         let _ = &entry.captures;
-        self.scope.push();
         let result = self.eval_compound(&entry.body);
         self.scope.pop();
-        let restored = self
-            .positionals_stack
-            .pop()
-            .expect("we just pushed");
+        let restored = self.positionals_stack.pop().expect("we just pushed");
         self.positionals = restored;
         result
     }
@@ -407,12 +450,19 @@ impl Evaluator {
         match &c.kind {
             CompoundKind::BraceGroup { body } => self.eval_statements(body),
             CompoundKind::Subshell { body } => {
-                // alloc-only target — no fork. Simulate isolation with
-                // a fresh frame so the subshell's variable writes can't
-                // leak. (Real fork lands with external exec.)
-                self.scope.push();
+                // No fork on the alloc-only build, so simulate
+                // process-style isolation by snapshotting the whole
+                // environment (scope, positionals, function table)
+                // and restoring it on exit. A frame push alone isn't
+                // enough — dynamic-scope assignments would still
+                // propagate into the caller's frames otherwise.
+                let saved_scope = self.scope.clone();
+                let saved_positionals = self.positionals.clone();
+                let saved_functions = self.functions.clone();
                 let result = self.eval_statements(body);
-                self.scope.pop();
+                self.scope = saved_scope;
+                self.positionals = saved_positionals;
+                self.functions = saved_functions;
                 result
             }
             CompoundKind::If {
@@ -508,7 +558,7 @@ impl Evaluator {
         };
         let mut outcome = Outcome::Status(0);
         for item in items {
-            self.scope.set(name.to_string(), Value::Scalar(item));
+            self.scope.assign(name, Value::Scalar(item))?;
             outcome = self.eval_statements(body)?;
             if outcome.is_exit_request() {
                 return Ok(outcome);
@@ -762,7 +812,7 @@ impl Evaluator {
             '=' => {
                 if trigger {
                     let v = self.expand_inline(word)?;
-                    self.scope.set(name.to_string(), Value::Scalar(v.clone()));
+                    self.scope.assign(name, Value::Scalar(v.clone()))?;
                     Ok(v)
                 } else {
                     Ok(current_value)
@@ -988,7 +1038,15 @@ ifstd!({
 fn is_builtin_name(name: &str) -> bool {
     matches!(
         name,
-        ":" | "true" | "false" | "echo" | "exit" | "set" | "unset" | "shift"
+        ":" | "true"
+            | "false"
+            | "echo"
+            | "exit"
+            | "set"
+            | "unset"
+            | "shift"
+            | "local"
+            | "readonly"
     )
 }
 
@@ -1000,6 +1058,42 @@ const fn is_name_start(c: char) -> bool {
 
 const fn is_name_continue(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
+}
+
+/// Parse `NAME` or `NAME=VALUE` for `local` / `readonly`. The `VALUE`
+/// half is treated as a literal (no further expansion) — that matches
+/// the `local FOO=bar` shorthand most carefully.
+fn parse_name_eq_value(arg: &str) -> Result<(alloc::string::String, alloc::string::String)> {
+    use alloc::string::ToString;
+    if let Some(eq) = arg.find('=') {
+        let (name, rest) = arg.split_at(eq);
+        if !is_identifier(name) {
+            return Err(KashError::Runtime(format!(
+                "`{name}` is not a valid identifier"
+            )));
+        }
+        Ok((name.to_string(), rest[1..].to_string()))
+    } else {
+        if !is_identifier(arg) {
+            return Err(KashError::Runtime(format!(
+                "`{arg}` is not a valid identifier"
+            )));
+        }
+        Ok((arg.to_string(), alloc::string::String::new()))
+    }
+}
+
+/// True iff `s` is a POSIX shell identifier (`_` or letter, then
+/// `_` / letters / digits).
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_name_start(first) {
+        return false;
+    }
+    chars.all(is_name_continue)
 }
 
 fn is_valid_param_name(s: &str) -> bool {
@@ -1336,15 +1430,73 @@ mod tests {
     }
 
     #[test]
-    fn function_local_assignment_persists_in_current_skeleton() {
-        // The skeleton's `Scope::push` only allocates a fresh frame
-        // but doesn't yet implement the static-vs-dynamic distinction
-        // — assignments inside the function still target the function
-        // frame and disappear after return.
+    fn posix_function_assignment_propagates_to_caller() {
+        // POSIX `name()` form is dynamic-scoped: a bare assignment
+        // inside the body modifies the caller's binding (or creates a
+        // global if none exists).
         let (_, _, ev) = run("setit() { X=inside; }; setit");
-        // X was set inside the function frame, which is popped on
-        // return. So at top level X should still be unset.
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "inside");
+    }
+
+    #[test]
+    fn ksh_function_assignment_stays_local() {
+        // ksh93 `function NAME` form is statically scoped: bare
+        // assignments in the body act as `local` by default.
+        let (_, _, ev) = run("function setit { X=inside; }; setit");
         assert!(ev.scope().get("X").is_none());
+    }
+
+    #[test]
+    fn local_builtin_shadows_caller_binding() {
+        let (_, out, ev) = run(
+            "X=outer; setit() { local X=inner; echo $X; }; setit; echo $X",
+        );
+        assert_eq!(out, "inner\nouter\n");
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "outer");
+    }
+
+    #[test]
+    fn local_outside_function_errors() {
+        let prog = parse("local X=foo").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(format!("{err}").contains("inside a function"), "got: {err}");
+    }
+
+    #[test]
+    fn readonly_blocks_subsequent_assignment() {
+        let prog = parse("readonly X=fixed; X=other").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(matches!(err, KashError::Readonly(_)));
+    }
+
+    #[test]
+    fn readonly_allows_first_value_then_locks() {
+        let (_, out, _) = run("readonly X=fixed; echo $X");
+        assert_eq!(out, "fixed\n");
+    }
+
+    #[test]
+    fn readonly_propagates_through_function() {
+        let prog = parse("readonly X=fixed; foo() { X=changed; }; foo").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(matches!(err, KashError::Readonly(_)));
+    }
+
+    #[test]
+    fn unset_removes_binding() {
+        let (_, _, ev) = run("X=foo; unset X");
+        assert!(ev.scope().get("X").is_none());
+    }
+
+    #[test]
+    fn unset_refuses_readonly() {
+        let prog = parse("readonly X=v; unset X").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(matches!(err, KashError::Readonly(_)));
     }
 
     #[test]
