@@ -70,6 +70,26 @@ impl Outcome {
     }
 }
 
+/// Set-style shell options. Toggled by `set -o NAME` / `set +o NAME`
+/// and by the short-form letter flags (`set -e`, `set +u`, …). Only
+/// the three POSIX big-three are wired so far; the wider `set -o`
+/// surface is locked in `project_shell_set_options.md` and lands in
+/// follow-up commits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShellOptions {
+    /// `errexit` / `-e` — abort on the first command that exits
+    /// non-zero in a context where the failure isn't being inspected
+    /// (`if`/`while` condition, `&&`/`||` LHS, `!` prefix).
+    pub errexit: bool,
+    /// `nounset` / `-u` — reading an unset variable (plain `$VAR`,
+    /// not `${VAR:-…}` / `${VAR-…}` etc.) is an error.
+    pub nounset: bool,
+    /// `pipefail` — the pipeline's exit status is the rightmost
+    /// non-zero stage's, falling back to zero only if every stage
+    /// succeeded.
+    pub pipefail: bool,
+}
+
 /// One registered function. Stored owned so the call site doesn't
 /// need a borrow of the original AST.
 #[derive(Clone, Debug)]
@@ -103,6 +123,13 @@ pub struct Evaluator {
     /// Function registry: name → definition. Functions live in a flat
     /// table for now; namespace scoping lights up later.
     functions: BTreeMap<String, FunctionEntry>,
+    /// Active `set -o` / short-form options.
+    options: ShellOptions,
+    /// When `false`, the statement loop suppresses `errexit` even if
+    /// the option is on. Used while evaluating an `if` / `while` /
+    /// `until` condition list — those contexts are explicitly checked
+    /// and don't trigger the option per POSIX.
+    errexit_active: bool,
 }
 
 impl Evaluator {
@@ -123,7 +150,15 @@ impl Evaluator {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: BTreeMap::new(),
+            options: ShellOptions::default(),
+            errexit_active: true,
         }
+    }
+
+    /// Read-only access to the active option set.
+    #[must_use]
+    pub fn options(&self) -> &ShellOptions {
+        &self.options
     }
 
     /// Active mode.
@@ -165,8 +200,24 @@ impl Evaluator {
             if outcome.is_exit_request() {
                 return Ok(outcome);
             }
+            if self.options.errexit && self.errexit_active && !outcome.success() {
+                return Ok(Outcome::Exit(outcome.status()));
+            }
         }
         Ok(outcome)
+    }
+
+    /// Run `f` with `errexit` temporarily suppressed (used for
+    /// `if`/`while`/`until` condition lists, which POSIX exempts).
+    fn with_errexit_inactive<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        let saved = self.errexit_active;
+        self.errexit_active = false;
+        let r = f(self);
+        self.errexit_active = saved;
+        r
     }
 
     fn eval_statement(&mut self, stmt: &Statement) -> Result<Outcome> {
@@ -344,19 +395,84 @@ impl Evaluator {
         Ok(Outcome::Exit(code))
     }
 
-    /// `set arg ...` rebinds the positional parameters. Other `set -o`
-    /// forms light up later — for now anything starting with `-`/`+`
-    /// is an unsupported-option error.
+    /// `set` builtin: toggles shell options (`-o NAME` / `+o NAME` and
+    /// the short letter flags `-e`/`-u`/etc.), then — if any
+    /// positional-looking arguments remain — rebinds `$1`/`$2`/…
     fn builtin_set(&mut self, args: &[String]) -> Result<Outcome> {
-        if let Some(a) = args.first() {
-            if a.starts_with('-') || a.starts_with('+') {
-                return Err(KashError::Runtime(
-                    "set: options not yet supported".into(),
-                ));
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if a == "-o" || a == "+o" {
+                let on = a == "-o";
+                i += 1;
+                let Some(name) = args.get(i) else {
+                    return Err(KashError::Runtime(
+                        "set: -o requires an option name".into(),
+                    ));
+                };
+                self.set_long_option(name, on)?;
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = a.strip_prefix('-') {
+                if rest.is_empty() {
+                    // bare `-` ends option processing per POSIX, with
+                    // the difference that it does NOT reset $@ — same
+                    // as `--` for our purposes.
+                    i += 1;
+                    break;
+                }
+                for c in rest.chars() {
+                    self.set_short_option(c, true)?;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = a.strip_prefix('+') {
+                for c in rest.chars() {
+                    self.set_short_option(c, false)?;
+                }
+                i += 1;
+                continue;
+            }
+            // First non-option argument — rebind positionals from here.
+            break;
+        }
+        if i < args.len() {
+            self.positionals = args[i..].to_vec();
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    fn set_long_option(&mut self, name: &str, on: bool) -> Result<()> {
+        match name {
+            "errexit" => self.options.errexit = on,
+            "nounset" => self.options.nounset = on,
+            "pipefail" => self.options.pipefail = on,
+            other => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "set -o: unknown option `{other}`"
+                )));
             }
         }
-        self.positionals = args.to_vec();
-        Ok(Outcome::Status(0))
+        Ok(())
+    }
+
+    fn set_short_option(&mut self, c: char, on: bool) -> Result<()> {
+        match c {
+            'e' => self.options.errexit = on,
+            'u' => self.options.nounset = on,
+            other => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "set: unknown option `-{other}`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn builtin_unset(&mut self, args: &[String]) -> Result<Outcome> {
@@ -514,7 +630,8 @@ impl Evaluator {
         else_body: Option<&[Statement]>,
     ) -> Result<Outcome> {
         for branch in branches {
-            let cond_outcome = self.eval_statements(&branch.cond)?;
+            let cond_outcome =
+                self.with_errexit_inactive(|s| s.eval_statements(&branch.cond))?;
             if cond_outcome.is_exit_request() {
                 return Ok(cond_outcome);
             }
@@ -536,7 +653,7 @@ impl Evaluator {
     ) -> Result<Outcome> {
         let mut outcome = Outcome::Status(0);
         loop {
-            let cond_outcome = self.eval_statements(cond)?;
+            let cond_outcome = self.with_errexit_inactive(|s| s.eval_statements(cond))?;
             if cond_outcome.is_exit_request() {
                 return Ok(cond_outcome);
             }
@@ -790,10 +907,7 @@ impl Evaluator {
                         break;
                     }
                 }
-                match self.scope.get(&name) {
-                    Some(v) => v.to_scalar_string(),
-                    None => String::new(),
-                }
+                self.lookup_param(&name)?
             } else {
                 // Bare `$` — emit verbatim.
                 fields.last_mut().expect("fields invariant").push('$');
@@ -946,9 +1060,8 @@ impl Evaluator {
                         break;
                     }
                 }
-                if let Some(v) = self.scope.get(&name) {
-                    out.push_str(&v.to_scalar_string());
-                }
+                let v = self.lookup_param(&name)?;
+                out.push_str(&v);
             } else {
                 // Standalone `$` followed by something else — emit
                 // the dollar verbatim.
@@ -1015,9 +1128,9 @@ impl Evaluator {
         let name = &body[..idx];
         let rest = &body[idx..];
 
-        // Bare `${NAME}` with no operator.
+        // Bare `${NAME}` with no operator — honours nounset.
         if rest.is_empty() {
-            return Ok(self.lookup_param(name));
+            return self.lookup_param(name);
         }
 
         // Parse the modifier prefix: optional `:`, then one of `-=?+`.
@@ -1035,8 +1148,10 @@ impl Evaluator {
             (false, op, rest)
         };
 
+        // Modifier forms handle "unset" themselves, so look up the
+        // raw value without firing `nounset` here.
         let current_present = self.scope.get(name).is_some();
-        let current_value = self.lookup_param(name);
+        let current_value = self.lookup_param_raw(name);
         let trigger = if test_null {
             !current_present || current_value.is_empty()
         } else {
@@ -1086,9 +1201,10 @@ impl Evaluator {
         }
     }
 
-    /// Look up `name` and return its scalar form, or empty for unset.
-    fn lookup_param(&self, name: &str) -> String {
-        // Specials.
+    /// Like [`lookup_param`](Self::lookup_param) but never triggers
+    /// `nounset`. Used by modifier forms (`${VAR:-…}`, `${VAR:+…}`,
+    /// …) that explicitly handle the unset case themselves.
+    fn lookup_param_raw(&self, name: &str) -> String {
         if name == "?" {
             return self.last_status.to_string();
         }
@@ -1108,9 +1224,49 @@ impl Evaluator {
                     .unwrap_or_default();
             }
         }
+        self.scope
+            .get(name)
+            .map(|v| v.to_scalar_string())
+            .unwrap_or_default()
+    }
+
+    /// Look up `name` and return its scalar form, or empty for unset.
+    /// Honours `nounset`: a plain `$NAME` / `${NAME}` lookup against
+    /// an unset name raises [`KashError::Runtime`] when the option is
+    /// on. Specials (`?`, `#`, `$`, `!`) and positional `$0`-`$9` are
+    /// always considered set.
+    fn lookup_param(&self, name: &str) -> Result<String> {
+        // Specials are always present.
+        if name == "?" {
+            return Ok(self.last_status.to_string());
+        }
+        if name == "#" {
+            return Ok(self.positionals.len().to_string());
+        }
+        if name.len() == 1 {
+            if let Some(d) = name.chars().next().and_then(|c| c.to_digit(10)) {
+                let n = d as usize;
+                if n == 0 {
+                    return Ok(String::new());
+                }
+                return Ok(self
+                    .positionals
+                    .get(n - 1)
+                    .cloned()
+                    .unwrap_or_default());
+            }
+        }
         match self.scope.get(name) {
-            Some(v) => v.to_scalar_string(),
-            None => String::new(),
+            Some(v) => Ok(v.to_scalar_string()),
+            None => {
+                if self.options.nounset {
+                    Err(KashError::Runtime(alloc::format!(
+                        "{name}: parameter not set"
+                    )))
+                } else {
+                    Ok(String::new())
+                }
+            }
         }
     }
 
@@ -1621,17 +1777,33 @@ ifstd!({
                 .map_err(|e| KashError::Runtime(alloc::format!("read pipeline stdout: {e}")))?;
             self.output.push_str(&String::from_utf8_lossy(&buf));
 
-            // Reap every stage. Pipeline exit status = last stage's
-            // (POSIX). `pipefail` lands with the set-options pass.
-            let mut final_status = 0;
+            // Reap every stage. Pipeline exit status is the last
+            // stage's (POSIX default). With `pipefail`, take the
+            // *right-most* non-zero status instead, falling back to
+            // zero only when every stage succeeded.
+            let mut last_status = 0;
+            let mut last_nonzero = 0;
             for (i, child) in children.iter_mut().enumerate() {
                 let st = child
                     .wait()
                     .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+                let code = st.code().unwrap_or(128);
+                if code != 0 {
+                    last_nonzero = code;
+                }
                 if i == last {
-                    final_status = st.code().unwrap_or(128);
+                    last_status = code;
                 }
             }
+            let final_status = if self.options.pipefail {
+                if last_nonzero != 0 {
+                    last_nonzero
+                } else {
+                    0
+                }
+            } else {
+                last_status
+            };
             Ok(Outcome::Status(final_status))
         }
     }
@@ -2749,6 +2921,101 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== set options: errexit / nounset / pipefail =====
+
+    #[test]
+    fn errexit_aborts_on_first_failure() {
+        let (o, out, _) = run("set -e; echo a; false; echo b");
+        // 'echo a' prints, then `false` returns 1 and -e fires.
+        assert_eq!(o, Outcome::Exit(1));
+        assert_eq!(out, "a\n");
+    }
+
+    #[test]
+    fn errexit_off_does_not_abort() {
+        let (_, out, _) = run("echo a; false; echo b");
+        assert_eq!(out, "a\nb\n");
+    }
+
+    #[test]
+    fn errexit_suppressed_in_if_condition() {
+        // `false` in an `if` condition must not trip -e.
+        let (o, out, _) = run("set -e; if false; then echo a; else echo b; fi; echo done");
+        assert_eq!(o.status(), 0);
+        assert_eq!(out, "b\ndone\n");
+    }
+
+    #[test]
+    fn errexit_suppressed_in_while_condition() {
+        // The cond that finally returns non-zero stops the loop but
+        // doesn't trip -e.
+        let (_, out, _) = run(
+            "set -e; N=0; while case $N in 0) false;; *) true;; esac; do echo run; N=1; done; echo done",
+        );
+        assert_eq!(out, "done\n");
+    }
+
+    #[test]
+    fn nounset_errors_on_plain_dollar_var() {
+        let prog = parse("set -u; echo $NOPE").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(format!("{err}").contains("not set"), "got: {err}");
+    }
+
+    #[test]
+    fn nounset_does_not_error_on_default_modifier() {
+        let (_, out, _) = run("set -u; echo ${NOPE:-fallback}");
+        assert_eq!(out, "fallback\n");
+    }
+
+    #[test]
+    fn nounset_does_not_error_on_set_var() {
+        let (_, out, _) = run("set -u; X=hi; echo $X");
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn set_o_named_options_toggle() {
+        let (_, _, ev) = run("set -o errexit; set -o nounset; set -o pipefail");
+        let opts = ev.options();
+        assert!(opts.errexit);
+        assert!(opts.nounset);
+        assert!(opts.pipefail);
+    }
+
+    #[test]
+    fn plus_o_disables_named_options() {
+        let (_, _, ev) = run("set -e -u; set +e +u");
+        let opts = ev.options();
+        assert!(!opts.errexit);
+        assert!(!opts.nounset);
+    }
+
+    #[test]
+    fn set_unknown_option_errors() {
+        let prog = parse("set -o nosuchoption").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pipefail_picks_up_first_stage_failure() {
+        use std::path::Path;
+        if !Path::new("/bin/false").exists() || !Path::new("/bin/cat").exists() {
+            return;
+        }
+        // Without pipefail the pipeline's status is /bin/cat's (0).
+        let prog = parse("/bin/false | /bin/cat").unwrap();
+        let mut ev = Evaluator::new();
+        assert_eq!(ev.eval_program(&prog).unwrap().status(), 0);
+        // With pipefail, the upstream non-zero is reported.
+        let prog = parse("set -o pipefail; /bin/false | /bin/cat").unwrap();
+        let mut ev = Evaluator::new();
+        assert_ne!(ev.eval_program(&prog).unwrap().status(), 0);
     }
 
     // ===== fd-prefixed redirects + fd dups =====
