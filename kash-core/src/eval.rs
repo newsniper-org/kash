@@ -3193,6 +3193,36 @@ ifstd!({
     /// this process's own environment when `cmd` hasn't overridden
     /// it. Used by the venv overlay path to layer `PATH-prepend` /
     /// `PATH-append` on top of whatever's already configured.
+    /// Resolve a bare command name against the shell's *own*
+    /// view of `PATH` — venv overlays included. Returns
+    /// `Some(absolute_or_relative_path)` when a file exists at
+    /// `<dir>/<cmd>` for some directory on the resolved PATH, or
+    /// `None` if `cmd` already contains a slash (use it verbatim)
+    /// or nothing was found (let the spawn-time `execvp` raise
+    /// `NotFound`).
+    fn resolve_in_path<B: crate::collections::MapBackend>(
+        ev: &Evaluator<B>,
+        cmd: &str,
+    ) -> Option<String> {
+        if cmd.contains('/') {
+            return None;
+        }
+        let path = ev.lookup_param_raw("PATH");
+        if path.is_empty() {
+            return None;
+        }
+        for dir in path.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = alloc::format!("{dir}/{cmd}");
+            if std::path::Path::new(&candidate).is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     fn read_cmd_env(cmd: &std::process::Command, name: &str) -> String {
         for (k, v) in cmd.get_envs() {
             if k == std::ffi::OsStr::new(name) {
@@ -3550,7 +3580,9 @@ ifstd!({
                 // stdin (`<<<` / `<<DELIM`) is fed via a piped stdin
                 // we write to after spawn.
                 self.check_external_spawn(&argv[0])?;
-                let mut c = Command::new(&argv[0]);
+                let resolved = resolve_in_path(self, &argv[0])
+                    .unwrap_or_else(|| argv[0].clone());
+                let mut c = Command::new(&resolved);
                 c.args(&argv[1..]);
                 self.apply_exported_env(&mut c);
                 let needs_inline_write = in_inline.is_some();
@@ -3690,7 +3722,9 @@ ifstd!({
             use std::io::Read;
             use std::process::{Command, Stdio};
             self.check_external_spawn(&argv[0])?;
-            let mut cmd = Command::new(&argv[0]);
+            let resolved = resolve_in_path(self, &argv[0])
+                .unwrap_or_else(|| argv[0].clone());
+            let mut cmd = Command::new(&resolved);
             cmd.args(&argv[1..]);
             self.apply_exported_env(&mut cmd);
             cmd.stdin(Stdio::inherit());
@@ -3779,7 +3813,9 @@ ifstd!({
             for (i, spec) in specs.iter_mut().enumerate() {
                 let StageSpec { argv, io } = spec;
                 self.check_external_spawn(&argv[0])?;
-                let mut cmd = Command::new(&argv[0]);
+                let resolved =
+                    resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
+                let mut cmd = Command::new(&resolved);
                 cmd.args(&argv[1..]);
                 self.apply_exported_env(&mut cmd);
 
@@ -7244,6 +7280,41 @@ mod tests {
             let msg = alloc::format!("{err}");
             assert!(msg.contains("invalid TOML"), "got: {msg}");
             let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn venv_path_prepend_resolves_bare_command() {
+            // Drop a tiny executable in a unique dir, prepend that
+            // dir via venv env, then call it by its *bare* name —
+            // resolution must consult the venv-extended PATH (not
+            // just the parent process's).
+            let dir = std::env::temp_dir().join("kash-venv-pathres");
+            let _ = std::fs::create_dir_all(&dir);
+            let script = dir.join("kashtest-uniquecmd");
+            std::fs::write(&script, "#!/bin/sh\necho got-resolved\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).unwrap();
+            }
+            let dir_str = dir.to_str().unwrap();
+            let src = alloc::format!(
+                "venv proj {{\n\
+                     capabilities {{ profile dev; allow-cmd kashtest-uniquecmd }}\n\
+                     env {{ PATH-prepend {dir_str} }}\n\
+                     body {{ kashtest-uniquecmd; }}\n\
+                 }}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            // Seed a parent PATH so the venv PATH-prepend has
+            // something to layer onto.
+            ev.set_env_var("PATH", "/usr/bin:/bin").unwrap();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "got-resolved\n");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
