@@ -271,6 +271,20 @@ pub enum CompoundKind {
         /// Method implementations.
         items: Vec<InstanceMember>,
     },
+    /// A namespace block. Source form: `namespace NAME { body }`.
+    /// `NAME` is a single bare identifier (no embedded dots); to
+    /// nest, write the namespace declarations nested. The body is a
+    /// list of statements that, when evaluated, register declarations
+    /// under the namespace path. Reopening is allowed — repeating
+    /// the same namespace path just appends declarations. Locked in
+    /// `project_shell_namespace.md`.
+    NamespaceDef {
+        /// Namespace name (single segment, no leading `.`).
+        name: String,
+        /// Body statements, evaluated with `name` pushed onto the
+        /// evaluator's namespace-path stack.
+        body: Vec<Statement>,
+    },
     /// A function definition. Three source forms produce this node:
     /// the POSIX `name() <body>`, the ksh93 `function name <body>`,
     /// and the kash extension `function name(p, q, …) <body>` whose

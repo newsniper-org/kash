@@ -333,15 +333,19 @@ impl<'src> Parser<'src> {
         if self.peek_bare_word()? == Some("[[") {
             return self.parse_double_bracket().map(Command::Compound);
         }
-        // `typeclass NAME { … }` / `instance NAME for TYPE { … }`
-        // recognised by bare-word lookahead; they aren't in the
-        // reserved-word table so they can still be used as ordinary
-        // command names outside this exact head position.
+        // `typeclass NAME { … }` / `instance NAME for TYPE { … }` /
+        // `namespace NAME { … }` — recognised by bare-word lookahead;
+        // they aren't in the reserved-word table so they can still
+        // be used as ordinary command names outside this exact head
+        // position.
         if self.peek_bare_word()? == Some("typeclass") {
             return self.parse_typeclass_def().map(Command::Compound);
         }
         if self.peek_bare_word()? == Some("instance") {
             return self.parse_instance_def().map(Command::Compound);
+        }
+        if self.peek_bare_word()? == Some("namespace") {
+            return self.parse_namespace_def().map(Command::Compound);
         }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
@@ -655,6 +659,46 @@ impl<'src> Parser<'src> {
 
     fn lexer_mut(&mut self) -> &mut Lexer<'src> {
         &mut self.lexer
+    }
+
+    // ---------- namespace ----------
+
+    /// Parse `namespace NAME { body }`. `NAME` is a single bare
+    /// identifier with no embedded dots; to declare a nested
+    /// namespace, write the declarations nested. The body is parsed
+    /// as a list of statements (the same surface a brace-group body
+    /// accepts), so reopening, nested namespaces, mode declarations,
+    /// and arbitrary top-level constructs all just compose.
+    fn parse_namespace_def(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?; // "namespace"
+        let start = kw.span.start;
+        let name = self.expect_bare_identifier("namespace name")?;
+        if name.contains('.') {
+            return Err(KashError::Parse(alloc::format!(
+                "namespace name `{name}` must be a single segment; nest declarations to build a path"
+            )));
+        }
+        self.skip_newlines()?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            return Err(KashError::Parse(
+                "expected `{` after namespace name".into(),
+            ));
+        }
+        self.bump()?;
+        let body = self.parse_brace_body()?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+            return Err(KashError::Parse(
+                "expected `}` to close `namespace { … }` block".into(),
+            ));
+        }
+        let close = self.bump()?;
+        let redirects = self.parse_trailing_redirects()?;
+        let end = redirects.last().map_or(close.span.end, |r| r.span.end);
+        Ok(CompoundCommand {
+            kind: CompoundKind::NamespaceDef { name, body },
+            redirects,
+            span: Span::new(start, end),
+        })
     }
 
     // ---------- typeclass / instance ----------

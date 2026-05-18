@@ -135,6 +135,11 @@ struct FunctionEntry {
     scope: FunctionScope,
     captures: Option<Vec<String>>,
     body: Box<CompoundCommand>,
+    /// Namespace path at the point of definition. The call site
+    /// swaps the evaluator's active path to this so the body's bare
+    /// references resolve against the *defining* namespace, not the
+    /// caller's.
+    defining_namespace: Vec<String>,
 }
 
 /// Evaluator state. Construct via [`Evaluator::new`] /
@@ -167,9 +172,19 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     positionals: Vec<String>,
     /// Stack of saved positional sets for nested function calls.
     positionals_stack: Vec<Vec<String>>,
-    /// Function registry: name → definition. Functions live in a flat
-    /// table for now; namespace scoping lights up later.
+    /// Function registry: name → definition. Inside a `namespace`
+    /// block, definitions are stored under their fully-qualified
+    /// name (`.outer.inner.name`); top-level definitions are stored
+    /// under the bare name.
     functions: B::Map<String, FunctionEntry>,
+    /// Active namespace path. Each entry is a single segment with no
+    /// leading `.`; e.g. inside `namespace foo { namespace bar { … } }`
+    /// this is `["foo", "bar"]` and declarations register under
+    /// `.foo.bar.NAME`. Empty at the top level. Push/pop is driven
+    /// by [`CompoundKind::NamespaceDef`] and by function-call entry
+    /// (each function carries the namespace path it was *defined* in
+    /// so callers see the lexical view inside the body).
+    namespace_path: Vec<String>,
     /// Typeclass registry: typeclass name → default methods. Filled
     /// at `typeclass NAME { … }` declaration time.
     typeclasses: alloc::collections::BTreeMap<String, TypeclassEntry>,
@@ -223,6 +238,7 @@ impl<B: MapBackend> Evaluator<B> {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: <B::Map<String, FunctionEntry> as Default>::default(),
+            namespace_path: Vec::new(),
             typeclasses: alloc::collections::BTreeMap::new(),
             instances: alloc::collections::BTreeMap::new(),
             aliases: <B::Map<String, String> as Default>::default(),
@@ -252,6 +268,79 @@ impl<B: MapBackend> Evaluator<B> {
     #[must_use]
     pub fn last_status(&self) -> i32 {
         self.last_status
+    }
+
+    /// Build the fully-qualified storage name for a *declaration*
+    /// (function, variable, typeclass, instance, …) defined at the
+    /// current namespace path. `foo` inside `namespace utils { … }`
+    /// becomes `.utils.foo`; at the top level (empty namespace
+    /// path), the bare name is used unchanged.
+    ///
+    /// If the source already supplies a leading `.`, the path is
+    /// taken as already fully-qualified and returned verbatim — this
+    /// allows e.g. discipline functions like `.sh.value.set` to
+    /// register against the root namespace regardless of where they
+    /// were declared.
+    fn qualify_decl_name(&self, name: &str) -> String {
+        if name.starts_with('.') {
+            return name.to_string();
+        }
+        if self.namespace_path.is_empty() {
+            return name.to_string();
+        }
+        let mut out = String::with_capacity(
+            self.namespace_path.iter().map(|s| s.len() + 1).sum::<usize>()
+                + name.len()
+                + 1,
+        );
+        for seg in &self.namespace_path {
+            out.push('.');
+            out.push_str(seg);
+        }
+        out.push('.');
+        out.push_str(name);
+        out
+    }
+
+    /// Resolve a *reference* to a function by trying, in order:
+    ///
+    /// 1. the name as written (so absolute `.foo.bar` calls and
+    ///    fully-qualified internal calls both win directly);
+    /// 2. the name qualified against the current namespace path
+    ///    (so a bare `helper` inside `namespace foo` finds
+    ///    `.foo.helper`);
+    /// 3. the same against successive outer namespaces (so a bare
+    ///    reference inside `namespace foo.bar` falls back to
+    ///    `.foo.helper` if no `.foo.bar.helper` exists).
+    ///
+    /// Returns the *storage* name on success.
+    fn resolve_function_name(&self, name: &str) -> Option<String> {
+        if self.functions.contains_key(name) {
+            return Some(name.to_string());
+        }
+        // If the caller already wrote a leading `.` we treat that as
+        // an absolute path and don't try any namespace prefixing.
+        if name.starts_with('.') {
+            return None;
+        }
+        for i in (0..=self.namespace_path.len()).rev() {
+            if i == 0 {
+                // Already tried bare lookup above.
+                break;
+            }
+            let mut candidate =
+                String::with_capacity(self.namespace_path[..i].iter().map(|s| s.len() + 1).sum::<usize>() + name.len() + 1);
+            for seg in &self.namespace_path[..i] {
+                candidate.push('.');
+                candidate.push_str(seg);
+            }
+            candidate.push('.');
+            candidate.push_str(name);
+            if self.functions.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Read-only access to the variable scope (for tests and
@@ -517,7 +606,7 @@ impl<B: MapBackend> Evaluator<B> {
         if let Some(out) = self.try_dispatch_typeclass(name, &argv)? {
             return Ok(out);
         }
-        if self.functions.contains_key(name) {
+        if self.resolve_function_name(name).is_some() {
             return self.call_function(&argv);
         }
         match name {
@@ -1131,14 +1220,25 @@ impl<B: MapBackend> Evaluator<B> {
     }
 
     fn call_function(&mut self, argv: &[String]) -> Result<Outcome> {
+        let resolved = self
+            .resolve_function_name(&argv[0])
+            .expect("function existed at dispatch time");
         let entry = self
             .functions
-            .get(&argv[0])
+            .get(&resolved)
             .cloned()
-            .expect("function existed at dispatch time");
+            .expect("just resolved");
         // Swap in the function's positional arguments.
         let saved = core::mem::replace(&mut self.positionals, argv[1..].to_vec());
         self.positionals_stack.push(saved);
+        // Switch the evaluator's namespace path to the function's
+        // *defining* namespace so bare references inside the body
+        // resolve against the lexical view at the point of def,
+        // not the caller's site.
+        let saved_ns = core::mem::replace(
+            &mut self.namespace_path,
+            entry.defining_namespace.clone(),
+        );
         // Push a function frame. `static_scope = true` for ksh93
         // `function NAME`-form functions: assignments inside that
         // form's body default to local, matching the locked
@@ -1152,6 +1252,7 @@ impl<B: MapBackend> Evaluator<B> {
         let _ = &entry.captures;
         let result = self.eval_compound(&entry.body);
         self.scope.pop();
+        self.namespace_path = saved_ns;
         let restored = self.positionals_stack.pop().expect("we just pushed");
         self.positionals = restored;
         result
@@ -1205,15 +1306,23 @@ impl<B: MapBackend> Evaluator<B> {
                 captures,
                 body,
             } => {
+                let qualified = self.qualify_decl_name(name);
                 self.functions.insert(
-                    name.clone(),
+                    qualified,
                     FunctionEntry {
                         scope: *scope,
                         captures: captures.clone(),
                         body: body.clone(),
+                        defining_namespace: self.namespace_path.clone(),
                     },
                 );
                 Ok(Outcome::Status(0))
+            }
+            CompoundKind::NamespaceDef { name, body } => {
+                self.namespace_path.push(name.clone());
+                let result = self.eval_statements(body);
+                self.namespace_path.pop();
+                result
             }
             CompoundKind::TypeclassDef { name, items } => {
                 let mut defaults: alloc::collections::BTreeMap<
@@ -2418,7 +2527,7 @@ ifstd!({
             let stderr_routed_file = stderr_file;
 
             let name = argv[0].as_str();
-            let is_function = self.functions.contains_key(name);
+            let is_function = self.resolve_function_name(name).is_some();
             let is_builtin = is_builtin_name(name);
             if is_function || is_builtin {
                 // Capture the builtin's output buffer fragment.
@@ -2649,7 +2758,7 @@ ifstd!({
                     ));
                 }
                 let name = argv[0].as_str();
-                if self.functions.contains_key(name) || is_builtin_name(name) {
+                if self.resolve_function_name(name).is_some() || is_builtin_name(name) {
                     return Err(KashError::Runtime(alloc::format!(
                         "builtin or function `{name}` in a multi-stage pipeline is not yet supported"
                     )));
@@ -5829,6 +5938,102 @@ mod tests {
              Greet::Int::say\n",
         );
         assert_eq!(out, "overridden\n");
+    }
+
+    // ===== namespace — stage 1: blocks + function prefixing =====
+
+    #[test]
+    fn namespace_function_is_callable_with_dotted_name() {
+        let (_, out, _) = run(
+            "namespace utils {\n\
+                 hello() { echo hi; }\n\
+             }\n\
+             .utils.hello\n",
+        );
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn bare_name_at_top_level_does_not_see_namespaced_function() {
+        let src = "namespace utils { hello() { echo hi; }; }\n\
+                   hello\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        // Without an external exec path in --lib tests, an
+        // unresolved bare name surfaces as a 127.
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn namespace_internal_call_uses_short_name() {
+        let (_, out, _) = run(
+            "namespace utils {\n\
+                 inner() { echo inner-was-called; }\n\
+                 outer() { inner; }\n\
+             }\n\
+             .utils.outer\n",
+        );
+        assert_eq!(out, "inner-was-called\n");
+    }
+
+    #[test]
+    fn namespace_reopening_accumulates_functions() {
+        let (_, out, _) = run(
+            "namespace utils { a() { echo a; }; }\n\
+             namespace utils { b() { echo b; }; }\n\
+             .utils.a\n\
+             .utils.b\n",
+        );
+        assert_eq!(out, "a\nb\n");
+    }
+
+    #[test]
+    fn nested_namespace_yields_dotted_path() {
+        let (_, out, _) = run(
+            "namespace outer {\n\
+                 namespace inner {\n\
+                     hi() { echo hello; }\n\
+                 }\n\
+             }\n\
+             .outer.inner.hi\n",
+        );
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn nested_namespace_inner_call_falls_back_to_outer() {
+        let (_, out, _) = run(
+            "namespace outer {\n\
+                 helper() { echo helper-ran; }\n\
+                 namespace inner {\n\
+                     entry() { helper; }\n\
+                 }\n\
+             }\n\
+             .outer.inner.entry\n",
+        );
+        assert_eq!(out, "helper-ran\n");
+    }
+
+    #[test]
+    fn namespace_function_does_not_see_callers_namespace() {
+        let (_, out, _) = run(
+            "namespace lib {\n\
+                 inner() { echo lib-inner; }\n\
+                 entry() { inner; }\n\
+             }\n\
+             namespace caller {\n\
+                 inner() { echo caller-inner; }\n\
+                 run() { .lib.entry; }\n\
+             }\n\
+             .caller.run\n",
+        );
+        assert_eq!(out, "lib-inner\n");
+    }
+
+    #[test]
+    fn namespace_name_with_embedded_dot_is_rejected() {
+        assert!(parse("namespace foo.bar { x() { :; }; }\n").is_err());
     }
 
     #[test]
