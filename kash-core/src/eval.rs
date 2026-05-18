@@ -704,6 +704,14 @@ impl Evaluator {
             CompoundKind::Until { cond, body } => self.eval_while(cond, body, true),
             CompoundKind::For { name, words, body } => self.eval_for(name, words.as_deref(), body),
             CompoundKind::Case { subject, items } => self.eval_case(subject, items),
+            CompoundKind::DoubleBracket { tokens } => {
+                let mut args: Vec<String> = Vec::with_capacity(tokens.len());
+                for t in tokens {
+                    args.push(self.expand_word(t)?);
+                }
+                let ok = eval_double_bracket(&args)?;
+                Ok(Outcome::Status(if ok { 0 } else { 1 }))
+            }
             CompoundKind::FunctionDef {
                 name,
                 scope,
@@ -2074,6 +2082,289 @@ fn test_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool> {
     }
 }
 
+/// Evaluate the body of a `[[ … ]]` block. Supports everything
+/// `test` does plus the bracket-only operators:
+///
+/// - `==` / `!=` — RHS is a glob pattern (matched via `glob_match`).
+/// - `=~` — RHS is a POSIX ERE-subset regex (see [`regex_match`]).
+/// - `<` / `>` — lexical comparison.
+/// - `!`, `&&`, `||`, `( … )` — logical composition with
+///   short-circuit, evaluated by a small recursive matcher.
+fn eval_double_bracket(args: &[String]) -> Result<bool> {
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut p = BracketParser { args: &strs, pos: 0 };
+    let v = p.parse_or()?;
+    if p.pos != p.args.len() {
+        return Err(KashError::Runtime(alloc::format!(
+            "[[: unexpected token `{}`",
+            p.args[p.pos]
+        )));
+    }
+    Ok(v)
+}
+
+struct BracketParser<'a> {
+    args: &'a [&'a str],
+    pos: usize,
+}
+
+impl<'a> BracketParser<'a> {
+    fn peek(&self) -> Option<&'a str> {
+        self.args.get(self.pos).copied()
+    }
+
+    fn eat(&mut self) -> Option<&'a str> {
+        let v = self.peek();
+        if v.is_some() {
+            self.pos += 1;
+        }
+        v
+    }
+
+    fn parse_or(&mut self) -> Result<bool> {
+        let mut lhs = self.parse_and()?;
+        while self.peek() == Some("||") {
+            self.eat();
+            let rhs = self.parse_and()?;
+            lhs = lhs || rhs;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<bool> {
+        let mut lhs = self.parse_unary()?;
+        while self.peek() == Some("&&") {
+            self.eat();
+            let rhs = self.parse_unary()?;
+            lhs = lhs && rhs;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<bool> {
+        if self.peek() == Some("!") {
+            self.eat();
+            let v = self.parse_unary()?;
+            return Ok(!v);
+        }
+        if self.peek() == Some("(") {
+            self.eat();
+            let v = self.parse_or()?;
+            if self.peek() != Some(")") {
+                return Err(KashError::Runtime("[[: expected `)`".into()));
+            }
+            self.eat();
+            return Ok(v);
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<bool> {
+        // Up to three argv-shaped slots, mirroring `test`. Within
+        // `[[…]]` we additionally recognise `==`/`!=` (glob match),
+        // `=~` (regex), and lexical `<` / `>` as binary ops.
+        let remaining = self.args.len() - self.pos;
+        // Look ahead for binary operator at args[pos+1].
+        if remaining >= 3 {
+            let mid = self.args[self.pos + 1];
+            if matches!(
+                mid,
+                "==" | "!="
+                    | "=~"
+                    | "="
+                    | "<"
+                    | ">"
+                    | "-eq"
+                    | "-ne"
+                    | "-lt"
+                    | "-le"
+                    | "-gt"
+                    | "-ge"
+            ) {
+                let lhs = self.args[self.pos];
+                let rhs = self.args[self.pos + 2];
+                self.pos += 3;
+                return bracket_binary(lhs, mid, rhs);
+            }
+        }
+        if remaining >= 2 {
+            let head = self.args[self.pos];
+            if head.starts_with('-') && head.len() == 2 {
+                let arg = self.args[self.pos + 1];
+                self.pos += 2;
+                return test_unary(head, arg);
+            }
+        }
+        if remaining >= 1 {
+            let v = self.args[self.pos];
+            self.pos += 1;
+            return Ok(!v.is_empty());
+        }
+        // `[[ ]]` empty is false (matches the empty-test rule).
+        Ok(false)
+    }
+}
+
+fn bracket_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool> {
+    match op {
+        "==" | "=" => Ok(glob_match(rhs, lhs)),
+        "!=" => Ok(!glob_match(rhs, lhs)),
+        "=~" => Ok(regex_match(rhs, lhs)),
+        "<" => Ok(lhs < rhs),
+        ">" => Ok(lhs > rhs),
+        _ => test_binary(lhs, op, rhs),
+    }
+}
+
+/// Match `text` against a POSIX-ERE-subset `pattern`. Supports:
+///
+/// - byte literals,
+/// - `.` — any single byte,
+/// - `*` / `+` / `?` — repetition of the previous atom,
+/// - `^` / `$` — start / end anchors,
+/// - `[abc]` / `[^abc]` / `[a-z]` — character class,
+/// - `\X` — literal escape (`\.` matches `.`, etc.).
+///
+/// Not yet wired: alternation (`|`), grouping (`( … )`), backreferences,
+/// non-greedy quantifiers. Implements anchored matching internally and
+/// tries every starting position when the pattern doesn't lead with
+/// `^`. Operates byte-by-byte.
+pub fn regex_match(pattern: &str, text: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let t = text.as_bytes();
+    if pat.first() == Some(&b'^') {
+        return re_match_here(&pat[1..], t);
+    }
+    let mut i = 0;
+    loop {
+        if re_match_here(pat, &t[i..]) {
+            return true;
+        }
+        if i >= t.len() {
+            return false;
+        }
+        i += 1;
+    }
+}
+
+fn re_match_here(pat: &[u8], text: &[u8]) -> bool {
+    if pat.is_empty() {
+        return true;
+    }
+    if pat[0] == b'$' && pat.len() == 1 {
+        return text.is_empty();
+    }
+    // Pull out the next atom + a possible repetition suffix.
+    let (atom_len, atom_match): (usize, ReAtom) = re_lex_atom(pat);
+    let rest_after_atom = &pat[atom_len..];
+    let suffix = rest_after_atom.first().copied();
+    match suffix {
+        Some(b'*') => re_repeat(&atom_match, &rest_after_atom[1..], text, 0),
+        Some(b'+') => re_repeat(&atom_match, &rest_after_atom[1..], text, 1),
+        Some(b'?') => {
+            // 0 or 1
+            if !text.is_empty() && atom_match.matches(text[0])
+                && re_match_here(&rest_after_atom[1..], &text[1..])
+            {
+                return true;
+            }
+            re_match_here(&rest_after_atom[1..], text)
+        }
+        _ => {
+            if !text.is_empty() && atom_match.matches(text[0]) {
+                return re_match_here(rest_after_atom, &text[1..]);
+            }
+            false
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ReAtom<'a> {
+    Any,
+    Literal(u8),
+    Class { body: &'a [u8], negated: bool },
+}
+
+impl<'a> ReAtom<'a> {
+    fn matches(&self, byte: u8) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Literal(b) => *b == byte,
+            Self::Class { body, negated } => {
+                let hit = class_matches(body, byte);
+                hit != *negated
+            }
+        }
+    }
+}
+
+/// Lex one regex atom off the front of `pat`. Returns the byte count
+/// the atom occupies plus a matcher for a single byte.
+fn re_lex_atom(pat: &[u8]) -> (usize, ReAtom<'_>) {
+    match pat[0] {
+        b'.' => (1, ReAtom::Any),
+        b'\\' if pat.len() > 1 => (2, ReAtom::Literal(pat[1])),
+        b'[' => {
+            if let Some(close) = find_re_class_close(pat) {
+                let body_start = if matches!(pat.get(1), Some(b'^' | b'!')) {
+                    2
+                } else {
+                    1
+                };
+                let negated = matches!(pat.get(1), Some(b'^' | b'!'));
+                (
+                    close + 1,
+                    ReAtom::Class {
+                        body: &pat[body_start..close],
+                        negated,
+                    },
+                )
+            } else {
+                // No `]` ever — treat `[` as a literal.
+                (1, ReAtom::Literal(b'['))
+            }
+        }
+        b => (1, ReAtom::Literal(b)),
+    }
+}
+
+fn find_re_class_close(pat: &[u8]) -> Option<usize> {
+    let mut i = 1;
+    if matches!(pat.get(i), Some(b'^' | b'!')) {
+        i += 1;
+    }
+    if pat.get(i) == Some(&b']') {
+        i += 1; // leading `]` is a literal member
+    }
+    while i < pat.len() {
+        if pat[i] == b']' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn re_repeat(atom: &ReAtom<'_>, rest: &[u8], text: &[u8], min: usize) -> bool {
+    // Greedy match; backtrack to the shortest-acceptable length.
+    let mut max = 0;
+    while max < text.len() && atom.matches(text[max]) {
+        max += 1;
+    }
+    let mut count = max;
+    loop {
+        if count >= min && re_match_here(rest, &text[count..]) {
+            return true;
+        }
+        if count == 0 {
+            return false;
+        }
+        count -= 1;
+    }
+}
+
+
 // ===== helpers =====
 
 const fn is_name_start(c: char) -> bool {
@@ -2839,6 +3130,16 @@ fn glob_match(pat: &str, s: &str) -> bool {
 
 fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
     let (p0, s0) = (pat.first().copied(), s.first().copied());
+    // ksh93 / bash extglob: `?(p)` / `*(p)` / `+(p)` / `@(p)` / `!(p)`.
+    if matches!(p0, Some(b'?' | b'*' | b'+' | b'@' | b'!'))
+        && pat.get(1) == Some(&b'(')
+    {
+        if let Some((inner, rest_off)) = extglob_split(pat) {
+            let head = pat[0];
+            let rest = &pat[rest_off..];
+            return extglob_match(head, &inner, rest, s);
+        }
+    }
     match (p0, s0) {
         (None, None) => true,
         (None, _) => false,
@@ -2879,6 +3180,187 @@ fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
         (Some(p), Some(c)) if p == c => glob_match_bytes(&pat[1..], &s[1..]),
         _ => false,
     }
+}
+
+/// Split an extglob construct `X(p1|p2|...)` (where `X` is one of
+/// `?`, `*`, `+`, `@`, `!`) off the front of `pat`. Returns the body
+/// (between `(` and the matching `)`) plus the offset just past the
+/// closing `)`. None if the parens aren't balanced or the leader
+/// doesn't look like an extglob start.
+fn extglob_split(pat: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if pat.len() < 3 {
+        return None;
+    }
+    if pat[1] != b'(' {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = 2;
+    while i < pat.len() {
+        match pat[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let body = pat[2..i].to_vec();
+                    return Some((body, i + 1));
+                }
+            }
+            // `\X` — skip the escape pair so a `\)` doesn't break us.
+            b'\\' if i + 1 < pat.len() => {
+                i += 2;
+                continue;
+            }
+            // Nested `[...]` shouldn't disturb our paren tracking.
+            b'[' => {
+                if let Some(close) = pat[i..].iter().position(|&b| b == b']') {
+                    i += close + 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split an extglob inner body on top-level `|` characters,
+/// respecting nested `( … )` and `[ … ]`.
+fn extglob_alternatives(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let b = body[i];
+        match b {
+            b'(' => {
+                depth += 1;
+                current.push(b);
+            }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                current.push(b);
+            }
+            b'[' => {
+                if let Some(close) = body[i..].iter().position(|&c| c == b']') {
+                    current.extend_from_slice(&body[i..=i + close]);
+                    i += close + 1;
+                    continue;
+                }
+                current.push(b);
+            }
+            b'\\' if i + 1 < body.len() => {
+                current.push(b);
+                current.push(body[i + 1]);
+                i += 2;
+                continue;
+            }
+            b'|' if depth == 0 => {
+                out.push(core::mem::take(&mut current));
+                i += 1;
+                continue;
+            }
+            _ => current.push(b),
+        }
+        i += 1;
+    }
+    out.push(current);
+    out
+}
+
+fn extglob_match(head: u8, inner: &[u8], rest: &[u8], s: &[u8]) -> bool {
+    let alts = extglob_alternatives(inner);
+    // Try to consume some prefix of `s` according to the head's
+    // repetition semantics and then match `rest` against what's left.
+    match head {
+        b'?' => {
+            // 0 or 1 occurrence of any alternative.
+            if glob_match_bytes(rest, s) {
+                return true;
+            }
+            for alt in &alts {
+                if let Some(after) = consume_once(alt, s) {
+                    if glob_match_bytes(rest, after) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        b'@' => {
+            // Exactly one occurrence.
+            for alt in &alts {
+                if let Some(after) = consume_once(alt, s) {
+                    if glob_match_bytes(rest, after) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        b'*' => extglob_repeat(&alts, rest, s, 0),
+        b'+' => extglob_repeat(&alts, rest, s, 1),
+        b'!' => {
+            // Everything except: prefixes of `s` that don't match any
+            // alternative *and* allow the rest to consume the
+            // remainder.
+            for split in 0..=s.len() {
+                let prefix = &s[..split];
+                let after = &s[split..];
+                let matches_any = alts
+                    .iter()
+                    .any(|alt| glob_match_bytes(alt, prefix));
+                if !matches_any && glob_match_bytes(rest, after) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Match `alt` against the whole of `s`; on success return what was
+/// consumed (we only try the full-length consumption, because that
+/// matches typical extglob usage). Returns `None` if no full match.
+fn consume_once<'a>(alt: &[u8], s: &'a [u8]) -> Option<&'a [u8]> {
+    // Try every prefix of `s` and see which one fully matches `alt`.
+    // (`alt` itself is a glob pattern.)
+    for end in (0..=s.len()).rev() {
+        if glob_match_bytes(alt, &s[..end]) {
+            return Some(&s[end..]);
+        }
+    }
+    None
+}
+
+fn extglob_repeat(alts: &[Vec<u8>], rest: &[u8], s: &[u8], min: usize) -> bool {
+    // Try consuming `count` occurrences, starting from the greediest
+    // viable and backtracking down.
+    fn helper(alts: &[Vec<u8>], rest: &[u8], s: &[u8], min: usize, count: usize) -> bool {
+        if count >= min && glob_match_bytes(rest, s) {
+            return true;
+        }
+        if s.is_empty() {
+            return false;
+        }
+        // Try every starting alternative + every consume length.
+        for alt in alts {
+            for end in 1..=s.len() {
+                if glob_match_bytes(alt, &s[..end])
+                    && helper(alts, rest, &s[end..], min, count + 1)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    helper(alts, rest, s, min, 0)
 }
 
 /// Find the position of the `]` that closes a character class
@@ -3327,6 +3809,133 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== [[ ... ]] extended test + regex + extglob =====
+
+    #[test]
+    fn double_bracket_string_equality() {
+        let (_, _, _) = run("[[ foo == foo ]]");
+        let (o, _, _) = run("[[ foo == foo ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ foo == bar ]]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn double_bracket_glob_pattern_match() {
+        let (o, _, _) = run("[[ foobar == foo* ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ baz == foo* ]]");
+        assert_eq!(o.status(), 1);
+        let (o, _, _) = run("[[ baz != foo* ]]");
+        assert_eq!(o.status(), 0);
+    }
+
+    #[test]
+    fn double_bracket_unary_predicates() {
+        let (o, _, _) = run("[[ -z '' ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ -n foo ]]");
+        assert_eq!(o.status(), 0);
+    }
+
+    #[test]
+    fn double_bracket_negation_and_short_circuit() {
+        let (o, _, _) = run("[[ ! foo == bar ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ foo == foo && 1 -lt 2 ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ foo == foo || foo == bar ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ foo == bar && foo == foo ]]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn double_bracket_lexical_compare() {
+        let (o, _, _) = run("[[ apple < banana ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ banana < apple ]]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn double_bracket_drives_if() {
+        let (_, out, _) = run(
+            "X=hello; if [[ $X == h*o ]]; then echo yep; else echo nope; fi",
+        );
+        assert_eq!(out, "yep\n");
+    }
+
+    #[test]
+    fn double_bracket_regex_match() {
+        let (o, _, _) = run("[[ hello =~ ^h.l ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ hello =~ x.*y ]]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn double_bracket_regex_anchors_and_classes() {
+        let (o, _, _) = run("[[ abc123 =~ ^[a-z]+[0-9]+$ ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ abc =~ ^[a-z]+[0-9]+$ ]]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn double_bracket_regex_repetition() {
+        let (o, _, _) = run("[[ aaaa =~ a+ ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ '' =~ a* ]]");
+        assert_eq!(o.status(), 0);
+        let (o, _, _) = run("[[ abc =~ a?b?c? ]]");
+        assert_eq!(o.status(), 0);
+    }
+
+    // ===== extglob =====
+
+    #[test]
+    fn extglob_question_zero_or_one() {
+        let (_, out, _) = run("X=color; case $X in colo?(u)r) echo hit;; *) echo miss;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=colour; case $X in colo?(u)r) echo hit;; *) echo miss;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=coloUr; case $X in colo?(u)r) echo hit;; *) echo miss;; esac");
+        assert_eq!(out, "miss\n");
+    }
+
+    #[test]
+    fn extglob_plus_one_or_more() {
+        let (_, out, _) = run("X=aaa; case $X in +(a)) echo hit;; *) echo miss;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=''; case $X in +(a)) echo hit;; *) echo miss;; esac");
+        assert_eq!(out, "miss\n");
+    }
+
+    #[test]
+    fn extglob_star_zero_or_more() {
+        let (_, out, _) = run("X=''; case $X in *(a)) echo hit;; esac");
+        assert_eq!(out, "hit\n");
+        let (_, out, _) = run("X=aaaa; case $X in *(a)) echo hit;; esac");
+        assert_eq!(out, "hit\n");
+    }
+
+    #[test]
+    fn extglob_at_exactly_one() {
+        let (_, out, _) = run("X=apple; case $X in @(apple|orange)) echo fruit;; *) echo other;; esac");
+        assert_eq!(out, "fruit\n");
+        let (_, out, _) = run("X=banana; case $X in @(apple|orange)) echo fruit;; *) echo other;; esac");
+        assert_eq!(out, "other\n");
+    }
+
+    #[test]
+    fn extglob_bang_anything_except() {
+        let (_, out, _) = run("X=foo; case $X in !(bar)) echo not_bar;; esac");
+        assert_eq!(out, "not_bar\n");
+        let (_, out, _) = run("X=bar; case $X in !(bar)) echo not_bar;; *) echo bar;; esac");
+        assert_eq!(out, "bar\n");
     }
 
     // ===== trap / exit handler =====

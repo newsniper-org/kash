@@ -230,6 +230,17 @@ pub enum CompoundKind {
         /// Case arms, in source order.
         items: Vec<CaseItem>,
     },
+    /// `[[ … ]]` extended test (ksh93 / bash baseline). The body is
+    /// the sequence of expanded words / operator words inside the
+    /// brackets; structural operators (`&&`, `||`, `!`, parens) are
+    /// modelled by their `Word`-typed literal so the evaluator can
+    /// drive a small recursive matcher without needing a dedicated
+    /// expression AST. Word splitting and pathname expansion do *not*
+    /// fire inside `[[…]]` per the locked semantics.
+    DoubleBracket {
+        /// The sequence of words inside the brackets, in source order.
+        tokens: Vec<Word>,
+    },
     /// A function definition. Three source forms produce this node:
     /// the POSIX `name() <body>`, the ksh93 `function name <body>`,
     /// and the kash extension `function name(p, q, …) <body>` whose

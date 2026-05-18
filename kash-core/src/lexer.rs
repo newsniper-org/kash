@@ -571,6 +571,33 @@ impl<'src> Lexer<'src> {
                     }
                     continue;
                 }
+                // ksh93 / bash extglob: `?(p)`, `*(p)`, `+(p)`,
+                // `@(p)`, `!(p)`. Absorb the whole parenthesised
+                // body into the current word so the case-pattern /
+                // [[…]] matchers see one token.
+                if matches!(b, b'?' | b'*' | b'+' | b'@' | b'!')
+                    && self.peek_at(1) == Some(b'(')
+                {
+                    self.pos += 2; // leader + `(`
+                    let mut depth = 1usize;
+                    while let Some(c) = self.peek() {
+                        self.pos += 1;
+                        if c == b'(' {
+                            depth += 1;
+                        } else if c == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if depth != 0 {
+                        return Err(KashError::Parse(alloc::format!(
+                            "unterminated extglob at offset {start}"
+                        )));
+                    }
+                    continue;
+                }
                 if b == b'`' {
                     // Backtick command substitution. No nesting (the
                     // POSIX backtick form famously doesn't nest);

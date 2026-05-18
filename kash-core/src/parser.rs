@@ -330,6 +330,12 @@ impl<'src> Parser<'src> {
     // ---------- command (simple | compound) ----------
 
     fn parse_command(&mut self) -> Result<Command> {
+        // `[[ ... ]]` extended test — recognised before function-def
+        // and reserved-word dispatch because `[[` is its own keyword
+        // even though it lexes as a plain Word.
+        if self.peek_bare_word()? == Some("[[") {
+            return self.parse_double_bracket().map(Command::Compound);
+        }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
         // error rather than tripping the `for` arm).
@@ -642,6 +648,64 @@ impl<'src> Parser<'src> {
 
     fn lexer_mut(&mut self) -> &mut Lexer<'src> {
         &mut self.lexer
+    }
+
+    // ---------- `[[ ... ]]` extended test ----------
+
+    /// Parse a `[[ … ]]` block. Words inside are collected verbatim
+    /// (their later expansion happens at evaluator time). Newlines
+    /// are allowed and skipped; the closing `]]` may carry trailing
+    /// redirects like any other compound.
+    fn parse_double_bracket(&mut self) -> Result<CompoundCommand> {
+        let open = self.bump()?; // `[[`
+        let mut tokens = Vec::new();
+        loop {
+            match self.peek_kind()? {
+                TokenKind::Eof => {
+                    return Err(KashError::Parse(
+                        "unterminated `[[ ... ]]` extended test".into(),
+                    ));
+                }
+                TokenKind::Newline => {
+                    self.bump()?;
+                }
+                TokenKind::Word(s) if s == "]]" => {
+                    let close = self.bump()?;
+                    let redirects = self.parse_trailing_redirects()?;
+                    let end = redirects
+                        .last()
+                        .map_or(close.span.end, |r| r.span.end);
+                    return Ok(CompoundCommand {
+                        kind: CompoundKind::DoubleBracket { tokens },
+                        redirects,
+                        span: Span::new(open.span.start, end),
+                    });
+                }
+                TokenKind::Word(_)
+                | TokenKind::SingleQuoted(_)
+                | TokenKind::DoubleQuoted(_)
+                | TokenKind::AnsiCString(_) => {
+                    let w = self.parse_word()?;
+                    tokens.push(w);
+                }
+                TokenKind::Op(op) if let Some(s) = double_bracket_op_str(*op) => {
+                    // Re-cast structural operators (`&&`, `||`, `(`,
+                    // `)`, `<`, `>`) as plain-text words so the
+                    // evaluator's `[[ … ]]` parser can see them in
+                    // its `args: &[&str]` view.
+                    let tok = self.bump()?;
+                    tokens.push(Word {
+                        segments: alloc::vec![WordSegment::Bare(s.into())],
+                        span: tok.span,
+                    });
+                }
+                other => {
+                    return Err(KashError::Parse(format!(
+                        "unexpected {other:?} inside `[[ ... ]]`"
+                    )));
+                }
+            }
+        }
     }
 
     // ---------- function definitions ----------
@@ -1144,6 +1208,20 @@ fn extract_heredoc_delim(w: &Word) -> (String, bool) {
         }
     }
     (text, quoted)
+}
+
+/// Op-to-string mapping used by `parse_double_bracket` to keep
+/// structural operators inside `[[ … ]]` accessible as words.
+const fn double_bracket_op_str(op: Op) -> Option<&'static str> {
+    match op {
+        Op::DoubleAmp => Some("&&"),
+        Op::DoublePipe => Some("||"),
+        Op::Lparen => Some("("),
+        Op::Rparen => Some(")"),
+        Op::Lt => Some("<"),
+        Op::Gt => Some(">"),
+        _ => None,
+    }
 }
 
 fn is_word_token(t: &TokenKind) -> bool {
