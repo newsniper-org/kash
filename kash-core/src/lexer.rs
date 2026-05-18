@@ -201,6 +201,14 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Current byte position in the source buffer. Exposed so the
+    /// parser can record source spans for here-doc bodies that the
+    /// lexer reads via [`read_heredoc_body`](Self::read_heredoc_body).
+    #[must_use]
+    pub fn byte_pos(&self) -> usize {
+        self.pos
+    }
+
     /// Peek the byte at the given offset, returning `None` past EOF.
     fn peek_at(&self, off: usize) -> Option<u8> {
         self.bytes.get(self.pos + off).copied()
@@ -216,6 +224,58 @@ impl<'src> Lexer<'src> {
         let b = self.peek()?;
         self.pos += 1;
         Some(b)
+    }
+
+    /// Read a here-document body. The caller is responsible for
+    /// having already consumed the `<<DELIM` (or `<<-DELIM`) plus the
+    /// terminating newline of the introducer line; we begin reading at
+    /// the first byte of the line after that.
+    ///
+    /// `delim` is the closing-line marker. `strip_tabs` (the `<<-`
+    /// form) removes a run of `'\t'` characters from the start of
+    /// every body line *and* from the candidate delimiter line before
+    /// the comparison.
+    ///
+    /// Returns the raw body text, with newlines preserved between
+    /// lines but no trailing newline on the final body line before
+    /// the delimiter.
+    pub fn read_heredoc_body(
+        &mut self,
+        delim: &str,
+        strip_tabs: bool,
+    ) -> Result<alloc::string::String, KashError> {
+        use alloc::string::String;
+        let mut body = String::new();
+        loop {
+            let line_start = self.pos;
+            while let Some(b) = self.peek() {
+                if b == b'\n' {
+                    break;
+                }
+                self.pos += 1;
+            }
+            let raw_line = &self.src[line_start..self.pos];
+            let line = if strip_tabs {
+                raw_line.trim_start_matches('\t')
+            } else {
+                raw_line
+            };
+            let at_eof = self.peek().is_none();
+            // Consume the newline (if any) that ends this line.
+            if !at_eof {
+                self.pos += 1;
+            }
+            if line == delim {
+                return Ok(body);
+            }
+            if at_eof {
+                return Err(KashError::Parse(alloc::format!(
+                    "unterminated here-document; missing closing `{delim}`"
+                )));
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
     }
 
     /// Skip horizontal whitespace (`' '`, `'\t'`) and full-line `# ...`

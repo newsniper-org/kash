@@ -1142,9 +1142,19 @@ ifstd!({
             &mut self,
             redirects: &[crate::ast::Redirect],
         ) -> Result<Outcome> {
+            use crate::ast::RedirectKind;
             for r in redirects {
-                let path = self.expand_word(&r.target)?;
-                self.open_redirect_file(r.kind, &path)?;
+                match r.kind {
+                    RedirectKind::HereString | RedirectKind::HereDoc { .. } => {
+                        // Inline-body redirects with no command name
+                        // have nothing to feed to — POSIX says they
+                        // simply succeed.
+                    }
+                    _ => {
+                        let path = self.expand_word(&r.target)?;
+                        self.open_redirect_file(r.kind, &path)?;
+                    }
+                }
             }
             Ok(Outcome::Status(0))
         }
@@ -1171,6 +1181,13 @@ ifstd!({
                     .create(true)
                     .open(path),
                 RedirectKind::Input => OpenOptions::new().read(true).open(path),
+                RedirectKind::HereString | RedirectKind::HereDoc { .. } => {
+                    // Caller is expected to route inline-body redirects
+                    // through the in_inline path, not the file path.
+                    return Err(KashError::Runtime(
+                        "internal: open_redirect_file called for an inline-body redirect".into(),
+                    ));
+                }
             };
             result.map_err(|e| KashError::Runtime(alloc::format!("open `{path}`: {e}")))
         }
@@ -1183,8 +1200,9 @@ ifstd!({
         /// to whichever file the redirects selected (truncating the
         /// buffer afterwards so it doesn't double-emit to the host).
         ///
-        /// External commands receive the opened files as their
-        /// `Stdio`, so the kernel does the work directly.
+        /// External commands receive the opened files / inline-body
+        /// pipes as their `Stdio`, so the kernel does the work
+        /// directly.
         fn eval_with_redirects(
             &mut self,
             cmd: &SimpleCommand,
@@ -1198,18 +1216,53 @@ ifstd!({
             let mut out_file: Option<std::fs::File> = None;
             let mut both: bool = false;
             let mut in_file: Option<std::fs::File> = None;
+            // Inline stdin payload from `<<<` / `<<DELIM`. Mutually
+            // exclusive with `in_file` — the later form wins, matching
+            // POSIX "last redirect to a stream replaces previous ones".
+            let mut in_inline: Option<alloc::vec::Vec<u8>> = None;
             for r in &cmd.redirects {
-                let path = self.expand_word(&r.target)?;
-                let f = self.open_redirect_file(r.kind, &path)?;
                 match r.kind {
-                    RedirectKind::Input => in_file = Some(f),
-                    RedirectKind::Output | RedirectKind::Append => {
-                        out_file = Some(f);
-                        both = false;
+                    RedirectKind::Input
+                    | RedirectKind::Output
+                    | RedirectKind::Append
+                    | RedirectKind::OutputBoth
+                    | RedirectKind::AppendBoth => {
+                        let path = self.expand_word(&r.target)?;
+                        let f = self.open_redirect_file(r.kind, &path)?;
+                        match r.kind {
+                            RedirectKind::Input => {
+                                in_file = Some(f);
+                                in_inline = None;
+                            }
+                            RedirectKind::Output | RedirectKind::Append => {
+                                out_file = Some(f);
+                                both = false;
+                            }
+                            RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
+                                out_file = Some(f);
+                                both = true;
+                            }
+                            _ => unreachable!(),
+                        }
                     }
-                    RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
-                        out_file = Some(f);
-                        both = true;
+                    RedirectKind::HereString => {
+                        // `<<<word` — expansion + a trailing newline.
+                        let text = self.expand_word(&r.target)?;
+                        let mut bytes = text.into_bytes();
+                        bytes.push(b'\n');
+                        in_file = None;
+                        in_inline = Some(bytes);
+                    }
+                    RedirectKind::HereDoc { strip_tabs: _ } => {
+                        // The parser stored the body verbatim in the
+                        // first segment of `target`. A `Bare` segment
+                        // means "subject to expansion"; a quoted
+                        // segment means "verbatim". `expand_word`
+                        // already honours that distinction.
+                        let text = self.expand_word(&r.target)?;
+                        let bytes = text.into_bytes();
+                        in_file = None;
+                        in_inline = Some(bytes);
                     }
                 }
             }
@@ -1232,16 +1285,22 @@ ifstd!({
                     })?;
                     self.output.truncate(old_len);
                 }
-                let _ = in_file; // builtins/functions don't consume stdin yet
-                let _ = both; // stderr-redirect on builtins is a no-op (we don't model stderr)
+                let _ = in_file;
+                let _ = in_inline;
+                let _ = both;
                 Ok(outcome)
             } else {
                 // External command — let the kernel handle stdin/out
-                // straight from the opened file descriptors.
+                // straight from the opened file descriptors. Inline
+                // stdin (`<<<` / `<<DELIM`) is fed via a piped stdin
+                // we write to after spawn.
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
+                let needs_inline_write = in_inline.is_some();
                 if let Some(f) = in_file {
                     c.stdin(Stdio::from(f));
+                } else if needs_inline_write {
+                    c.stdin(Stdio::piped());
                 } else {
                     c.stdin(Stdio::inherit());
                 }
@@ -1268,6 +1327,15 @@ ifstd!({
                         KashError::Runtime(alloc::format!("exec: {e}"))
                     }
                 })?;
+                if let Some(bytes) = in_inline {
+                    if let Some(mut si) = child.stdin.take() {
+                        si.write_all(&bytes).map_err(|e| {
+                            KashError::Runtime(alloc::format!("write stdin: {e}"))
+                        })?;
+                        // Dropping `si` closes the pipe so the child
+                        // sees EOF.
+                    }
+                }
                 if !has_out {
                     if let Some(mut so) = child.stdout.take() {
                         let mut buf = alloc::vec::Vec::<u8>::new();
@@ -2444,6 +2512,96 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== here-doc / here-string =====
+
+    #[cfg(feature = "std")]
+    mod heredoc_tests {
+        use super::*;
+        use std::path::Path;
+
+        fn have(p: &str) -> bool {
+            Path::new(p).exists()
+        }
+
+        #[test]
+        fn here_string_feeds_external_stdin() {
+            if !have("/bin/cat") {
+                return;
+            }
+            let prog = parse("/bin/cat <<<hello").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "hello\n");
+        }
+
+        #[test]
+        fn here_string_expands_dollar_var() {
+            if !have("/bin/cat") {
+                return;
+            }
+            let prog = parse("X=world; /bin/cat <<<\"hi $X\"").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "hi world\n");
+        }
+
+        #[test]
+        fn here_doc_feeds_external_stdin() {
+            if !have("/bin/cat") {
+                return;
+            }
+            let src = "/bin/cat <<EOF\nline one\nline two\nEOF\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "line one\nline two\n");
+        }
+
+        #[test]
+        fn here_doc_expands_dollar_var_by_default() {
+            if !have("/bin/cat") {
+                return;
+            }
+            let src = "X=world; /bin/cat <<EOF\nhi $X\nEOF\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "hi world\n");
+        }
+
+        #[test]
+        fn here_doc_with_quoted_delim_is_verbatim() {
+            if !have("/bin/cat") {
+                return;
+            }
+            // Single-quoted delimiter disables expansion.
+            let src = "X=world; /bin/cat <<'EOF'\nhi $X\nEOF\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "hi $X\n");
+        }
+
+        #[test]
+        fn here_doc_dash_strips_leading_tabs() {
+            if !have("/bin/cat") {
+                return;
+            }
+            let src = "/bin/cat <<-EOF\n\t\tindented\n\tmid\nEOF\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "indented\nmid\n");
+        }
+
+        #[test]
+        fn here_doc_unterminated_errors() {
+            // No closing `EOF` line — should fail at parse time.
+            let res = parse("/bin/cat <<EOF\nbody\n");
+            assert!(res.is_err());
+        }
     }
 
     // ===== arithmetic expansion =====

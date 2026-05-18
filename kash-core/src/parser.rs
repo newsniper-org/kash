@@ -488,12 +488,19 @@ impl<'src> Parser<'src> {
                 tok.kind
             )));
         };
+        // Here-document forms need access to the lexer's raw source
+        // buffer, so they branch out before the regular target-word
+        // step.
+        if matches!(op, Op::DoubleLt | Op::DoubleLtDash) {
+            return self.parse_heredoc(tok.span.start, op);
+        }
         let kind = match op {
             Op::Gt => RedirectKind::Output,
             Op::DoubleGt => RedirectKind::Append,
             Op::Lt => RedirectKind::Input,
             Op::AmpGt => RedirectKind::OutputBoth,
             Op::AmpGtGt => RedirectKind::AppendBoth,
+            Op::TripleLt => RedirectKind::HereString,
             other => {
                 return Err(KashError::Parse(format!(
                     "unsupported redirect operator {other:?}"
@@ -508,7 +515,12 @@ impl<'src> Parser<'src> {
                 | TokenKind::AnsiCString(_)
         ) {
             return Err(KashError::Parse(format!(
-                "expected a filename after `{}`",
+                "expected a {} after `{}`",
+                if matches!(kind, RedirectKind::HereString) {
+                    "word"
+                } else {
+                    "filename"
+                },
                 op_display(op)
             )));
         }
@@ -520,6 +532,67 @@ impl<'src> Parser<'src> {
             target,
             span,
         })
+    }
+
+    /// Handle `<<DELIM` / `<<-DELIM`. Reads the delimiter word, then
+    /// (after the line's terminating newline) pulls the body text
+    /// from the lexer's raw buffer up to the closing delimiter line.
+    fn parse_heredoc(&mut self, op_start: usize, op: Op) -> Result<Redirect> {
+        let strip_tabs = matches!(op, Op::DoubleLtDash);
+        // Delimiter word.
+        let delim_word = self.parse_word()?;
+        let (delim_text, quoted) = extract_heredoc_delim(&delim_word);
+        // POSIX permits the rest of the introducer line to carry
+        // additional tokens, but the minimal here-doc path supports
+        // exactly `<<DELIM<newline>` — bail out cleanly otherwise.
+        match self.peek_kind()? {
+            TokenKind::Newline => {
+                self.bump()?;
+            }
+            TokenKind::Eof => {
+                return Err(KashError::Parse(
+                    "here-doc body missing — input ended right after delimiter".into(),
+                ));
+            }
+            other => {
+                return Err(KashError::Parse(format!(
+                    "here-doc minimal form requires a newline immediately after `<<{delim_text}`, got {other:?}"
+                )));
+            }
+        }
+        // Drain any tokens the lexer pre-buffered before the newline.
+        self.peeked.clear();
+        let body_start = self.lexer_pos();
+        let body = self
+            .lexer_mut()
+            .read_heredoc_body(&delim_text, strip_tabs)?;
+        let body_end = self.lexer_pos();
+        // The captured body becomes the redirect's `target` Word.
+        // `Bare` payload → expansion happens at eval time; quoted →
+        // pass through verbatim.
+        let segment = if quoted {
+            WordSegment::SingleQuoted(body)
+        } else {
+            WordSegment::Bare(body)
+        };
+        let target = Word {
+            segments: alloc::vec![segment],
+            span: Span::new(body_start, body_end),
+        };
+        Ok(Redirect {
+            kind: RedirectKind::HereDoc { strip_tabs },
+            fd: None,
+            target,
+            span: Span::new(op_start, body_end),
+        })
+    }
+
+    fn lexer_pos(&self) -> usize {
+        self.lexer.byte_pos()
+    }
+
+    fn lexer_mut(&mut self) -> &mut Lexer<'src> {
+        &mut self.lexer
     }
 
     // ---------- function definitions ----------
@@ -1002,6 +1075,28 @@ enum StatementContext {
     CaseArm,
 }
 
+/// Extract the here-doc delimiter text and a "was it quoted" flag
+/// from a parsed [`Word`]. POSIX says that *any* quoting in the
+/// delimiter — even partial — disables expansion of the body, so we
+/// take the union of: any quoted segment is present, OR any
+/// backslash escapes appear in the bare text. The minimal cut here
+/// only checks for quoted segments; backslash detection lands when
+/// the parser starts tracking backslash provenance.
+fn extract_heredoc_delim(w: &Word) -> (String, bool) {
+    let mut text = String::new();
+    let mut quoted = false;
+    for seg in &w.segments {
+        match seg {
+            WordSegment::Bare(s) => text.push_str(s),
+            WordSegment::SingleQuoted(s) | WordSegment::DoubleQuoted(s) | WordSegment::AnsiC(s) => {
+                quoted = true;
+                text.push_str(s);
+            }
+        }
+    }
+    (text, quoted)
+}
+
 fn is_word_token(t: &TokenKind) -> bool {
     matches!(
         t,
@@ -1102,7 +1197,14 @@ fn split_assignment(word: Word) -> core::result::Result<Assignment, Word> {
 const fn is_redirect_op(op: Op) -> bool {
     matches!(
         op,
-        Op::Gt | Op::DoubleGt | Op::Lt | Op::AmpGt | Op::AmpGtGt
+        Op::Gt
+            | Op::DoubleGt
+            | Op::Lt
+            | Op::AmpGt
+            | Op::AmpGtGt
+            | Op::TripleLt
+            | Op::DoubleLt
+            | Op::DoubleLtDash
     )
 }
 

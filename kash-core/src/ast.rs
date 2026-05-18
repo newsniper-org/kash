@@ -54,8 +54,7 @@ pub struct Word {
     pub span: Span,
 }
 
-/// Redirection operator kind. Currently a minimal subset — FD dups,
-/// here-docs, and here-strings will land in follow-up commits.
+/// Redirection operator kind. FD-dup variants land in a follow-up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RedirectKind {
@@ -69,6 +68,21 @@ pub enum RedirectKind {
     OutputBoth,
     /// `&>>file` — both stdout and stderr to `file`, append.
     AppendBoth,
+    /// `<<<word` — feed `word` (plus a trailing newline) as stdin.
+    /// `target` carries the word.
+    HereString,
+    /// `<<DELIM` / `<<-DELIM` — feed an inline body as stdin. The
+    /// `target` word's first segment carries the captured body
+    /// verbatim; a `Bare` segment means the body is subject to
+    /// parameter / arithmetic / command-substitution expansion, while
+    /// a `SingleQuoted` segment means the delimiter was quoted in the
+    /// source (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`) and the body must be
+    /// passed through unexpanded.
+    HereDoc {
+        /// True for the `<<-` form, where each body line's leading
+        /// tab characters were stripped at parse time.
+        strip_tabs: bool,
+    },
 }
 
 /// A single redirection clause attached to a [`Command`].
