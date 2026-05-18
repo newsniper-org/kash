@@ -233,38 +233,6 @@ where
         self.recon
     }
 
-    /// Bump the reconstruction counter and re-hash every entry into
-    /// a fresh root sub-table. After this returns the structural
-    /// layout is fully different but the set of `(K, V)` pairs is
-    /// identical.
-    pub fn reconstruct(&mut self) {
-        self.recon = self.recon.wrapping_add(1);
-        // Drain the old root into a flat list, then re-insert each
-        // entry against the new `recon` value. Drained while the
-        // root pointer is `None` so the inserts always see a fresh
-        // tree under the bumped counter.
-        let _entries: Vec<(K, V)> = self.drain_entries();
-        todo!("re-insert entries under the new recon value");
-    }
-
-    /// Drain every entry out of the tree, leaving `self.root` as
-    /// `None` and `self.len` as `0`. Used by [`Self::reconstruct`].
-    fn drain_entries(&mut self) -> Vec<(K, V)> {
-        todo!("DFS walk that pulls Single buckets out into a Vec");
-    }
-}
-
-impl<K, V, H> LightNht<K, V, H>
-where
-    K: Hash + Eq + Clone,
-    V: Clone,
-    H: Hasher + Clone,
-{
-    /// Insert `(key, value)`. Returns the previously-bound value if
-    /// any, `None` otherwise.
-    pub fn insert(&mut self, _key: K, _value: V) -> Option<V> {
-        todo!("descent + Single→Nested promotion + MAX_DEPTH check")
-    }
 }
 
 impl<K, V, H> LightNht<K, V, H>
@@ -272,42 +240,353 @@ where
     K: Hash + Eq,
     H: Hasher + Clone,
 {
-    /// Look up the value associated with `key`, if any.
-    pub fn get<Q>(&self, _key: &Q) -> Option<&V>
+    /// Insert `(key, value)`. Returns the previously-bound value if
+    /// any.
+    ///
+    /// If a descent reaches `MAX_DEPTH` (the 64-bit hash is fully
+    /// consumed without finding an empty slot) the table is
+    /// [`reconstruct`](Self::reconstruct)ed under a bumped `recon`
+    /// counter and the insertion retries. The retry budget is
+    /// bounded so a pathological hasher can't loop forever.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        if self.root.is_none() {
+            self.root = Some(Box::<SubTable<K, V>>::default());
+        }
+        let mut key = key;
+        let mut value = value;
+        let mut depth_coord = Vec::new();
+        for _ in 0..RECONSTRUCT_RETRY_BUDGET {
+            depth_coord.clear();
+            let root = self.root.as_mut().expect("root allocated above");
+            match Self::try_insert_into(
+                &self.hash_builder,
+                self.recon,
+                root,
+                key,
+                value,
+                &mut depth_coord,
+                0,
+                &mut self.len,
+            ) {
+                Ok(prev) => return prev,
+                Err((k, v)) => {
+                    self.reconstruct();
+                    if self.root.is_none() {
+                        self.root = Some(Box::<SubTable<K, V>>::default());
+                    }
+                    key = k;
+                    value = v;
+                }
+            }
+        }
+        panic!(
+            "lightnht: insert hit MAX_DEPTH even after {RECONSTRUCT_RETRY_BUDGET} \
+             reconstructs — hasher quality is almost certainly the issue"
+        );
+    }
+
+    /// Recursive insertion helper. Returns `Err((key, value))` if
+    /// the descent ran past [`MAX_DEPTH`] so the caller can
+    /// reconstruct and retry.
+    #[allow(clippy::too_many_arguments)]
+    fn try_insert_into(
+        hash_builder: &H,
+        recon: usize,
+        sub_table: &mut SubTable<K, V>,
+        key: K,
+        value: V,
+        depth_coord: &mut Vec<u8>,
+        depth: usize,
+        len_counter: &mut usize,
+    ) -> Result<Option<V>, (K, V)> {
+        if depth >= MAX_DEPTH {
+            return Err((key, value));
+        }
+        let hash = compute_hash_with(hash_builder, recon, &key, depth_coord);
+        let slot_idx = (hash & SLOT_MASK) as usize;
+        match &mut sub_table.slots[slot_idx] {
+            Bucket::Empty => {
+                sub_table.slots[slot_idx] = Bucket::Single(key, value);
+                *len_counter += 1;
+                Ok(None)
+            }
+            Bucket::Single(existing_k, _) if *existing_k == key => {
+                // Overwrite. Replace the whole bucket so we get the
+                // owned old value back out cleanly.
+                let old = core::mem::replace(
+                    &mut sub_table.slots[slot_idx],
+                    Bucket::Single(key, value),
+                );
+                match old {
+                    Bucket::Single(_, old_v) => Ok(Some(old_v)),
+                    _ => unreachable!("matched Single above"),
+                }
+            }
+            Bucket::Single(_, _) => {
+                // Promote: pop the existing single, install a fresh
+                // sub-table in its place, then re-insert both entries
+                // into the new sub-table one level deeper.
+                let popped = core::mem::replace(
+                    &mut sub_table.slots[slot_idx],
+                    Bucket::Nested(Box::<SubTable<K, V>>::default()),
+                );
+                let (ek, ev) = match popped {
+                    Bucket::Single(k, v) => (k, v),
+                    _ => unreachable!("matched Single above"),
+                };
+                let nested = match &mut sub_table.slots[slot_idx] {
+                    Bucket::Nested(n) => n,
+                    _ => unreachable!("just installed Nested"),
+                };
+                depth_coord.push(slot_idx as u8);
+                // Existing entry first; this one was already in the
+                // table so the counter shouldn't move.
+                let r1 = Self::try_insert_into(
+                    hash_builder,
+                    recon,
+                    nested,
+                    ek,
+                    ev,
+                    depth_coord,
+                    depth + 1,
+                    len_counter,
+                );
+                if let Err(bounced) = r1 {
+                    depth_coord.pop();
+                    return Err(bounced);
+                }
+                // Counter shouldn't have moved (we just re-located an
+                // existing entry); rewind it if it did.
+                *len_counter -= 1;
+                let r2 = Self::try_insert_into(
+                    hash_builder,
+                    recon,
+                    nested,
+                    key,
+                    value,
+                    depth_coord,
+                    depth + 1,
+                    len_counter,
+                );
+                depth_coord.pop();
+                r2
+            }
+            Bucket::Nested(nested) => {
+                depth_coord.push(slot_idx as u8);
+                let r = Self::try_insert_into(
+                    hash_builder,
+                    recon,
+                    nested,
+                    key,
+                    value,
+                    depth_coord,
+                    depth + 1,
+                    len_counter,
+                );
+                depth_coord.pop();
+                r
+            }
+        }
+    }
+
+    /// Look up the value associated with `key`.
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: core::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        todo!("descent driven by compute_hash(key, depth_coord, recon)")
+        let root = self.root.as_ref()?;
+        let mut depth_coord = Vec::new();
+        Self::get_in(&self.hash_builder, self.recon, root, key, &mut depth_coord)
+    }
+
+    fn get_in<'t, Q>(
+        hash_builder: &H,
+        recon: usize,
+        sub_table: &'t SubTable<K, V>,
+        key: &Q,
+        depth_coord: &mut Vec<u8>,
+    ) -> Option<&'t V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = compute_hash_with(hash_builder, recon, key, depth_coord);
+        let slot_idx = (hash & SLOT_MASK) as usize;
+        match &sub_table.slots[slot_idx] {
+            Bucket::Empty => None,
+            Bucket::Single(k, v) if k.borrow() == key => Some(v),
+            Bucket::Single(_, _) => None,
+            Bucket::Nested(nested) => {
+                depth_coord.push(slot_idx as u8);
+                let r = Self::get_in(hash_builder, recon, nested, key, depth_coord);
+                depth_coord.pop();
+                r
+            }
+        }
     }
 
     /// Remove the binding for `key`. Returns the removed value if
     /// any.
-    pub fn remove<Q>(&mut self, _key: &Q) -> Option<V>
+    ///
+    /// Removal turns the matching `Single` slot back into `Empty`.
+    /// Sub-tables that drop to zero or one live entries are *not*
+    /// collapsed back up the tree in this minimal cut; the doc on
+    /// the crate notes that a follow-up commit can add the
+    /// promote-up optimisation if it ever matters in practice.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: core::borrow::Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        todo!("descent then Single → Empty; no promotion-up for now")
+        let root = self.root.as_mut()?;
+        let mut depth_coord = Vec::new();
+        let result = Self::remove_in(
+            &self.hash_builder,
+            self.recon,
+            root,
+            key,
+            &mut depth_coord,
+        );
+        if result.is_some() {
+            self.len -= 1;
+        }
+        result
     }
 
-    /// Compute the 64-bit hash for `(entry, depth_coord, recon)`.
-    /// Clones [`Self::hash_builder`] so every descent step works
-    /// from a fresh `Hasher` instance — the same prototype hasher
-    /// is re-used, but its state never carries over between calls.
+    fn remove_in<Q>(
+        hash_builder: &H,
+        recon: usize,
+        sub_table: &mut SubTable<K, V>,
+        key: &Q,
+        depth_coord: &mut Vec<u8>,
+    ) -> Option<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = compute_hash_with(hash_builder, recon, key, depth_coord);
+        let slot_idx = (hash & SLOT_MASK) as usize;
+        match &mut sub_table.slots[slot_idx] {
+            Bucket::Empty => None,
+            Bucket::Single(k, _) if k.borrow() == key => {
+                let old = core::mem::replace(
+                    &mut sub_table.slots[slot_idx],
+                    Bucket::Empty,
+                );
+                match old {
+                    Bucket::Single(_, v) => Some(v),
+                    _ => unreachable!("matched Single above"),
+                }
+            }
+            Bucket::Single(_, _) => None,
+            Bucket::Nested(nested) => {
+                depth_coord.push(slot_idx as u8);
+                let r = Self::remove_in(hash_builder, recon, nested, key, depth_coord);
+                depth_coord.pop();
+                r
+            }
+        }
+    }
+
+    /// Bump the reconstruction counter and re-hash every entry into
+    /// a fresh root. The set of `(K, V)` pairs is preserved; the
+    /// structural layout is entirely different.
+    pub fn reconstruct(&mut self) {
+        self.recon = self.recon.wrapping_add(1);
+        let entries = self.drain_entries();
+        // Fresh root, then re-insert every drained entry under the
+        // bumped counter. Inserts go through `try_insert_into`
+        // directly because `insert` itself would re-enter
+        // `reconstruct` on a MAX_DEPTH error, which is exactly the
+        // recursion we're trying to avoid.
+        self.root = Some(Box::<SubTable<K, V>>::default());
+        for (k, v) in entries {
+            let mut depth_coord = Vec::new();
+            let root = self.root.as_mut().expect("just installed");
+            let result = Self::try_insert_into(
+                &self.hash_builder,
+                self.recon,
+                root,
+                k,
+                v,
+                &mut depth_coord,
+                0,
+                &mut self.len,
+            );
+            match result {
+                Ok(prev) => debug_assert!(prev.is_none(), "duplicate key in reconstruct"),
+                Err(_) => panic!(
+                    "lightnht: MAX_DEPTH still exceeded after reconstructing — \
+                     hasher quality is almost certainly the issue"
+                ),
+            }
+        }
+    }
+
+    /// DFS-drain every entry from the current root, then clear the
+    /// root pointer. Used by [`Self::reconstruct`].
+    fn drain_entries(&mut self) -> Vec<(K, V)> {
+        let mut out = Vec::with_capacity(self.len);
+        if let Some(root) = self.root.take() {
+            drain_subtable(*root, &mut out);
+        }
+        self.len = 0;
+        out
+    }
+
+    /// Compute the 64-bit hash for `(entry, depth_coord, recon)`
+    /// against the table's current prototype hasher and reconstruct
+    /// counter. Useful for tests, diagnostics, and external descent
+    /// drivers — internally [`Self::insert`] / [`Self::get`] /
+    /// [`Self::remove`] go through the same routine.
+    ///
+    /// Each call clones the prototype hasher so its state never
+    /// carries between calls.
     #[inline]
-    #[allow(dead_code)] // referenced once insert / get / remove fill in
-    fn compute_hash<Q>(&self, entry: &Q, depth_coord: &[u8]) -> u64
+    pub fn compute_hash<Q>(&self, entry: &Q, depth_coord: &[u8]) -> u64
     where
         Q: Hash + ?Sized,
     {
-        let mut h = self.hash_builder.clone();
-        entry.hash(&mut h);
-        depth_coord.hash(&mut h);
-        self.recon.hash(&mut h);
-        h.finish()
+        compute_hash_with(&self.hash_builder, self.recon, entry, depth_coord)
     }
 }
+
+/// Compute the 64-bit hash for `(entry, depth_coord, recon)` against
+/// `hash_builder`. Clones the prototype hasher so the input fed in
+/// here can't leak into a later call.
+#[inline]
+fn compute_hash_with<H, Q>(hash_builder: &H, recon: usize, entry: &Q, depth_coord: &[u8]) -> u64
+where
+    H: Hasher + Clone,
+    Q: Hash + ?Sized,
+{
+    let mut h = hash_builder.clone();
+    entry.hash(&mut h);
+    depth_coord.hash(&mut h);
+    recon.hash(&mut h);
+    h.finish()
+}
+
+/// Owned DFS over a [`SubTable`]: every `Single` bucket spills its
+/// `(K, V)` into `out`, every `Nested` recurses, every `Empty` is a
+/// no-op. The sub-table is consumed.
+fn drain_subtable<K, V>(sub: SubTable<K, V>, out: &mut Vec<(K, V)>) {
+    for bucket in sub.slots {
+        match bucket {
+            Bucket::Empty => {}
+            Bucket::Single(k, v) => out.push((k, v)),
+            Bucket::Nested(inner) => drain_subtable(*inner, out),
+        }
+    }
+}
+
+/// Upper bound on the number of consecutive reconstruct-retries
+/// during a single `insert`. Reaching this means the hasher is
+/// producing the same colliding chain even after fresh `recon`
+/// values — almost certainly a broken hasher, not a real hash
+/// space exhaustion.
+const RECONSTRUCT_RETRY_BUDGET: usize = 4;
 
 impl<K, V, H> Clone for LightNht<K, V, H>
 where
@@ -379,22 +658,24 @@ where
     pub fn recon(&self) -> usize {
         self.inner.recon()
     }
-
-    /// Forwarded [`LightNht::reconstruct`].
-    pub fn reconstruct(&mut self) {
-        self.inner.reconstruct();
-    }
 }
 
 impl<T, H> LightNhtSet<T, H>
 where
-    T: Hash + Eq + Clone,
+    T: Hash + Eq,
     H: Hasher + Clone,
 {
     /// Insert `item`. Returns `true` if `item` was not already a
     /// member.
     pub fn insert(&mut self, item: T) -> bool {
         self.inner.insert(item, ()).is_none()
+    }
+
+    /// Forwarded [`LightNht::reconstruct`]. Lives on the
+    /// `H: Hasher + Clone` block because the reconstruct path
+    /// re-hashes every entry via the prototype hasher.
+    pub fn reconstruct(&mut self) {
+        self.inner.reconstruct();
     }
 }
 
@@ -441,5 +722,185 @@ where
 {
     fn default() -> Self {
         Self::with_hasher(H::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::{String, ToString};
+    use core::hash::Hasher;
+
+    /// Tiny FxHash-style prototype hasher, just so the tests can
+    /// run without depending on `std::collections::DefaultHasher`.
+    /// **Not** a recommendation — `lightnht` exposes the hasher
+    /// choice to its caller, and the project's "pick a real hasher"
+    /// discussion is the next step. This is only here so the tests
+    /// in this file have *some* `H: Hasher + Clone + Default` to
+    /// drive the algorithm.
+    #[derive(Clone, Default)]
+    struct TestHasher {
+        state: u64,
+    }
+
+    impl Hasher for TestHasher {
+        fn finish(&self) -> u64 {
+            self.state
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            // Fx-style rotate-and-mix. Adequate for tests; not for
+            // real workloads.
+            for &b in bytes {
+                self.state = self
+                    .state
+                    .rotate_left(5)
+                    .wrapping_add(b as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            }
+        }
+    }
+
+    type Map = LightNht<String, i32, TestHasher>;
+    type Set = LightNhtSet<String, TestHasher>;
+
+    fn k(s: &str) -> String {
+        s.to_string()
+    }
+
+    #[test]
+    fn empty_map_has_zero_len() {
+        let m: Map = Map::default();
+        assert_eq!(m.len(), 0);
+        assert!(m.is_empty());
+        assert!(m.get("anything").is_none());
+    }
+
+    #[test]
+    fn insert_single_entry_reads_back() {
+        let mut m: Map = Map::default();
+        assert_eq!(m.insert(k("foo"), 1), None);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("foo"), Some(&1));
+        assert!(m.get("bar").is_none());
+    }
+
+    #[test]
+    fn insert_overwrites_existing() {
+        let mut m: Map = Map::default();
+        assert_eq!(m.insert(k("foo"), 1), None);
+        assert_eq!(m.insert(k("foo"), 2), Some(1));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("foo"), Some(&2));
+    }
+
+    #[test]
+    fn many_inserts_all_readable() {
+        let mut m: Map = Map::default();
+        for i in 0..100 {
+            let key = alloc::format!("k{i}");
+            assert_eq!(m.insert(key, i as i32), None);
+        }
+        assert_eq!(m.len(), 100);
+        for i in 0..100 {
+            let key = alloc::format!("k{i}");
+            assert_eq!(m.get(&key), Some(&(i as i32)));
+        }
+        assert!(m.get("k100").is_none());
+    }
+
+    #[test]
+    fn remove_returns_value_and_drops_len() {
+        let mut m: Map = Map::default();
+        m.insert(k("a"), 10);
+        m.insert(k("b"), 20);
+        m.insert(k("c"), 30);
+        assert_eq!(m.remove("b"), Some(20));
+        assert_eq!(m.len(), 2);
+        assert!(m.get("b").is_none());
+        assert_eq!(m.get("a"), Some(&10));
+        assert_eq!(m.get("c"), Some(&30));
+    }
+
+    #[test]
+    fn remove_missing_returns_none() {
+        let mut m: Map = Map::default();
+        m.insert(k("a"), 1);
+        assert_eq!(m.remove("missing"), None);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn reconstruct_preserves_contents() {
+        let mut m: Map = Map::default();
+        for i in 0..30 {
+            m.insert(alloc::format!("k{i}"), i as i32);
+        }
+        let recon_before = m.recon();
+        m.reconstruct();
+        assert_eq!(m.recon(), recon_before + 1);
+        assert_eq!(m.len(), 30);
+        for i in 0..30 {
+            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&(i as i32)));
+        }
+    }
+
+    #[test]
+    fn reinsert_after_remove_works() {
+        let mut m: Map = Map::default();
+        m.insert(k("a"), 1);
+        m.remove("a");
+        assert_eq!(m.insert(k("a"), 99), None);
+        assert_eq!(m.get("a"), Some(&99));
+    }
+
+    #[test]
+    fn set_insert_then_contains() {
+        let mut s: Set = Set::default();
+        assert!(s.insert(k("alpha")));
+        assert!(s.insert(k("beta")));
+        assert!(!s.insert(k("alpha")));
+        assert_eq!(s.len(), 2);
+        assert!(s.contains("alpha"));
+        assert!(s.contains("beta"));
+        assert!(!s.contains("gamma"));
+    }
+
+    #[test]
+    fn set_remove_drops_member() {
+        let mut s: Set = Set::default();
+        s.insert(k("x"));
+        assert!(s.remove("x"));
+        assert!(!s.contains("x"));
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn clone_keeps_independent_state() {
+        let mut a: Map = Map::default();
+        a.insert(k("foo"), 1);
+        let mut b = a.clone();
+        b.insert(k("foo"), 2);
+        b.insert(k("bar"), 3);
+        assert_eq!(a.get("foo"), Some(&1));
+        assert!(a.get("bar").is_none());
+        assert_eq!(b.get("foo"), Some(&2));
+        assert_eq!(b.get("bar"), Some(&3));
+    }
+
+    #[test]
+    fn promotion_drives_nesting() {
+        // Stress test: insert enough entries that several
+        // sub-tables get promoted. Then verify all are reachable.
+        let mut m: Map = Map::default();
+        for i in 0..1000 {
+            m.insert(alloc::format!("entry-{i:04}"), i as i32);
+        }
+        assert_eq!(m.len(), 1000);
+        for i in 0..1000 {
+            assert_eq!(
+                m.get(&alloc::format!("entry-{i:04}")),
+                Some(&(i as i32)),
+            );
+        }
     }
 }
