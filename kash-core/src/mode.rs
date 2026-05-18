@@ -8,10 +8,10 @@
 //! frozen in `project_shell_modes.md` /
 //! `project_shell_mode_syntax.md`.
 
-use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use core::fmt;
 
+use crate::collections::{BTreeBackend, MapBackend, SetStorage};
 use crate::error::KashError;
 
 /// One of the five base mode buckets.
@@ -108,25 +108,61 @@ impl fmt::Display for Modifier {
 
 /// Fully-resolved mode value: a base bucket plus a set of modifiers.
 ///
-/// `Mode`s compare by both `base` and `modifiers`. The modifier set is
-/// a `BTreeSet` so iteration / `Display` are deterministic and the
-/// monotonicity subset check is straightforward.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Mode {
+/// Generic over a [`MapBackend`] so the engine can swap the modifier
+/// set's storage type. Default is [`BTreeBackend`], which uses
+/// `BTreeSet` and keeps iteration / `Display` deterministic. The
+/// monotonicity subset check ([`Mode::modifiers_satisfy`]) goes
+/// through the [`SetStorage::is_subset`] trait method.
+pub struct Mode<B: MapBackend = BTreeBackend> {
     /// Base mode bucket.
     pub base: BaseMode,
-    /// Active modifiers, ordered by `Modifier`'s `Ord` impl.
-    pub modifiers: BTreeSet<Modifier>,
+    /// Active modifiers.
+    pub modifiers: B::Set<Modifier>,
 }
 
-impl Mode {
+impl<B: MapBackend> Clone for Mode<B>
+where
+    B::Set<Modifier>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base,
+            modifiers: self.modifiers.clone(),
+        }
+    }
+}
+
+impl<B: MapBackend> fmt::Debug for Mode<B>
+where
+    B::Set<Modifier>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mode")
+            .field("base", &self.base)
+            .field("modifiers", &self.modifiers)
+            .finish()
+    }
+}
+
+impl<B: MapBackend> PartialEq for Mode<B>
+where
+    B::Set<Modifier>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base && self.modifiers == other.modifiers
+    }
+}
+
+impl<B: MapBackend> Eq for Mode<B> where B::Set<Modifier>: Eq {}
+
+impl<B: MapBackend> Mode<B> {
     /// Mode with the given base and no modifiers.
     #[inline]
     #[must_use]
-    pub const fn new(base: BaseMode) -> Self {
+    pub fn new(base: BaseMode) -> Self {
         Self {
             base,
-            modifiers: BTreeSet::new(),
+            modifiers: <B::Set<Modifier> as Default>::default(),
         }
     }
 
@@ -134,7 +170,7 @@ impl Mode {
     /// declaration, shebang flag, or symlink invocation overrides it.
     #[inline]
     #[must_use]
-    pub const fn default_mode() -> Self {
+    pub fn default_mode() -> Self {
         Self::new(BaseMode::Default)
     }
 
@@ -175,7 +211,7 @@ impl Mode {
                         "mode name `{s}` ends with a dangling `-`"
                     )));
                 }
-                let mut modifiers = BTreeSet::new();
+                let mut modifiers = <B::Set<Modifier> as Default>::default();
                 for segment in rest.split('-') {
                     if segment.is_empty() {
                         return Err(KashError::Mode(alloc::format!(
@@ -210,16 +246,16 @@ impl Mode {
     }
 }
 
-impl Default for Mode {
+impl<B: MapBackend> Default for Mode<B> {
     fn default() -> Self {
         Self::default_mode()
     }
 }
 
-impl fmt::Display for Mode {
+impl<B: MapBackend> fmt::Display for Mode<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.base.as_str())?;
-        for m in &self.modifiers {
+        for m in self.modifiers.iter() {
             f.write_str("-")?;
             f.write_str(m.as_str())?;
         }
@@ -231,6 +267,11 @@ impl fmt::Display for Mode {
 mod tests {
     use super::*;
     use alloc::format;
+
+    // Default-backend alias so tests use the same `Mode` shape as
+    // before the generic refactor (Rust's default type-param only
+    // fires at declaration site, not at call sites).
+    type Mode = super::Mode<BTreeBackend>;
 
     fn mode(base: BaseMode, mods: &[Modifier]) -> Mode {
         let mut m = Mode::new(base);

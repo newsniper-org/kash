@@ -16,7 +16,6 @@
 //! they land in the next commit.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -25,6 +24,7 @@ use crate::ast::{
     AndOrList, AndOrOp, CaseFallthrough, CaseItem, Command, CompoundCommand, CompoundKind,
     FunctionScope, IfBranch, Pipeline, Program, SimpleCommand, Statement, Word, WordSegment,
 };
+use crate::collections::{BTreeBackend, MapBackend, MapStorage, SetStorage};
 use crate::error::{KashError, Result};
 use crate::mode::Mode;
 use crate::scope::Scope;
@@ -109,8 +109,12 @@ struct FunctionEntry {
 /// Evaluator state. Construct via [`Evaluator::new`] /
 /// [`Evaluator::with_mode`], drive via [`Evaluator::eval_program`],
 /// and drain accumulated stdout via [`Evaluator::take_output`].
-pub struct Evaluator {
-    scope: Scope,
+///
+/// Generic over a [`MapBackend`] so map / set storage is decoupled
+/// from the engine. Default is [`BTreeBackend`]; external callers
+/// don't have to spell the parameter.
+pub struct Evaluator<B: MapBackend = BTreeBackend> {
+    scope: Scope<B>,
     last_status: i32,
     /// Accumulator for `echo` / `print` builtin output. The host pulls
     /// the buffer with [`take_output`](Self::take_output) and decides
@@ -125,7 +129,7 @@ pub struct Evaluator {
     /// Currently active mode. Not yet consulted (mode declarations
     /// aren't wired in), but threaded so callers can construct an
     /// evaluator under e.g. `default-secure`.
-    mode: Mode,
+    mode: Mode<B>,
     /// Current positional arguments (`$1`, `$2`, …). Top-level value
     /// is empty; function calls push their argument list and restore
     /// the caller's on return.
@@ -134,7 +138,7 @@ pub struct Evaluator {
     positionals_stack: Vec<Vec<String>>,
     /// Function registry: name → definition. Functions live in a flat
     /// table for now; namespace scoping lights up later.
-    functions: BTreeMap<String, FunctionEntry>,
+    functions: B::Map<String, FunctionEntry>,
     /// Alias table: NAME → expansion text. Substitution happens at
     /// the start of a simple command's dispatch — the first
     /// (already-expanded) argv slot is matched against this table,
@@ -142,14 +146,14 @@ pub struct Evaluator {
     /// whitespace. Recursion is bounded per-command by an
     /// already-seen set so a self-referential alias (e.g.
     /// `alias ls='ls --color'`) terminates.
-    aliases: BTreeMap<String, String>,
+    aliases: B::Map<String, String>,
     /// Trap action registry: signal name → command source. Names are
     /// normalised to upper-case without a `SIG` prefix
     /// (`INT`, `TERM`, `EXIT`, …). The pseudo-signals `EXIT` / `ERR`
     /// are wired to fire at the appropriate points in evaluation; the
     /// real OS signals are accepted into the table but not yet
     /// delivered (that lands with the unix-only signal layer).
-    traps: BTreeMap<String, String>,
+    traps: B::Map<String, String>,
     /// Re-entrancy guard for trap actions — a trap that itself fires
     /// the same trap (e.g. `trap 'false' ERR` invoking ERR again on
     /// the `false`) would otherwise loop forever.
@@ -163,27 +167,27 @@ pub struct Evaluator {
     errexit_active: bool,
 }
 
-impl Evaluator {
+impl<B: MapBackend> Evaluator<B> {
     /// New evaluator under the default mode.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_mode(Mode::default())
+        Self::with_mode(Mode::<B>::default())
     }
 
     /// New evaluator under a specific mode.
     #[must_use]
-    pub fn with_mode(mode: Mode) -> Self {
+    pub fn with_mode(mode: Mode<B>) -> Self {
         Self {
-            scope: Scope::new(),
+            scope: Scope::<B>::new(),
             last_status: 0,
             output: String::new(),
             trace_output: String::new(),
             mode,
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
-            functions: BTreeMap::new(),
-            aliases: BTreeMap::new(),
-            traps: BTreeMap::new(),
+            functions: <B::Map<String, FunctionEntry> as Default>::default(),
+            aliases: <B::Map<String, String> as Default>::default(),
+            traps: <B::Map<String, String> as Default>::default(),
             in_trap: false,
             options: ShellOptions::default(),
             errexit_active: true,
@@ -200,7 +204,7 @@ impl Evaluator {
     /// Active mode.
     #[inline]
     #[must_use]
-    pub fn mode(&self) -> &Mode {
+    pub fn mode(&self) -> &Mode<B> {
         &self.mode
     }
 
@@ -215,12 +219,12 @@ impl Evaluator {
     /// embedders that want to peek without running anything).
     #[inline]
     #[must_use]
-    pub fn scope(&self) -> &Scope {
+    pub fn scope(&self) -> &Scope<B> {
         &self.scope
     }
 
     #[cfg(test)]
-    pub(crate) fn aliases_for_test(&self) -> &BTreeMap<String, String> {
+    pub(crate) fn aliases_for_test(&self) -> &B::Map<String, String> {
         &self.aliases
     }
 
@@ -408,7 +412,7 @@ impl Evaluator {
         // Loop so chained aliases work, but bound the loop with an
         // already-seen set so a self-referential entry can't recurse
         // forever.
-        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut seen: B::Set<String> = <B::Set<String> as Default>::default();
         loop {
             let head = argv[0].clone();
             if seen.contains(&head) {
@@ -661,7 +665,7 @@ impl Evaluator {
     ///   name is unset.
     fn builtin_alias(&mut self, args: &[String]) -> Result<Outcome> {
         if args.is_empty() {
-            for (name, value) in &self.aliases {
+            for (name, value) in self.aliases.iter() {
                 self.output
                     .push_str(&alloc::format!("alias {name}='{value}'\n"));
             }
@@ -723,7 +727,7 @@ impl Evaluator {
     fn builtin_trap(&mut self, args: &[String]) -> Result<Outcome> {
         if args.is_empty() {
             // `trap` with no args: emit the table in stable order.
-            for (sig, cmd) in &self.traps {
+            for (sig, cmd) in self.traps.iter() {
                 self.output.push_str(&alloc::format!(
                     "trap -- '{cmd}' {sig}\n"
                 ));
@@ -1636,7 +1640,7 @@ impl Evaluator {
     }
 }
 
-impl Default for Evaluator {
+impl<B: MapBackend> Default for Evaluator<B> {
     fn default() -> Self {
         Self::new()
     }
@@ -1645,7 +1649,7 @@ impl Default for Evaluator {
 // ===== std-only: external process exec + multi-stage pipeline =====
 
 ifstd!({
-    impl Evaluator {
+    impl<B: crate::collections::MapBackend> Evaluator<B> {
         /// Open the files named by a list of redirects without
         /// running any command. Used for the POSIX no-command form
         /// (`> file` truncates, `< file` opens-and-discards, …).
@@ -2705,10 +2709,10 @@ fn read_arith_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> Re
 /// Not yet wired: the comma operator. The full kash-extended numeric
 /// surface (floats, complex, big integers) per
 /// `project_shell_arithmetic.md` is its own commit.
-struct ArithParser<'a, 'e> {
+struct ArithParser<'a, 'e, B: MapBackend> {
     src: &'a str,
     pos: usize,
-    ev: &'e mut Evaluator,
+    ev: &'e mut Evaluator<B>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2726,7 +2730,7 @@ enum AssignOp {
     Shr,
 }
 
-impl<'a, 'e> ArithParser<'a, 'e> {
+impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
     fn parse_expr(&mut self) -> Result<i64> {
         self.parse_assign()
     }
@@ -3730,7 +3734,14 @@ fn posix_class_matches(name: &[u8], c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::BTreeBackend;
     use crate::parser::parse;
+
+    // Default-backend aliases so tests don't have to spell the
+    // turbofish on every `Evaluator::new()` — Rust's default type
+    // parameter applies at declaration time only, not during call-site
+    // inference.
+    type Evaluator = super::Evaluator<BTreeBackend>;
 
     fn run(src: &str) -> (Outcome, String, Evaluator) {
         let prog = parse(src).expect("parse");

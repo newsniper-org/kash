@@ -16,12 +16,16 @@
 //! them, the evaluator ignores them, and assignments to captured
 //! names just fall through dynamic resolution. That tightens up when
 //! the typeset attribute machinery lands.
+//!
+//! Storage layer is abstracted through [`MapBackend`] — `Frame<B>` /
+//! `Scope<B>` are generic over the backend, with [`BTreeBackend`] as
+//! the default so external callers don't have to spell the parameter.
 
-use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::collections::{BTreeBackend, MapBackend, MapStorage};
 use crate::error::{KashError, Result};
 use crate::value::Value;
 
@@ -38,11 +42,11 @@ pub struct Binding {
     pub readonly: bool,
 }
 
-/// One stack frame's bindings + scope-discipline flags.
-#[derive(Clone, Debug, Default)]
-pub struct Frame {
+/// One stack frame's bindings + scope-discipline flags. Generic over
+/// the [`MapBackend`] used for the binding table.
+pub struct Frame<B: MapBackend = BTreeBackend> {
     /// Name → binding.
-    pub bindings: BTreeMap<String, Binding>,
+    pub bindings: B::Map<String, Binding>,
     /// True iff this frame was pushed by a function call. `local`
     /// only works inside a function frame.
     pub is_function_frame: bool,
@@ -53,19 +57,74 @@ pub struct Frame {
     pub static_scope: bool,
 }
 
-/// Stack of [`Frame`]s.
-#[derive(Clone, Debug)]
-pub struct Scope {
-    frames: Vec<Frame>,
+impl<B: MapBackend> Default for Frame<B> {
+    fn default() -> Self {
+        Self {
+            bindings: <B::Map<String, Binding> as Default>::default(),
+            is_function_frame: false,
+            static_scope: false,
+        }
+    }
 }
 
-impl Scope {
+impl<B: MapBackend> Clone for Frame<B>
+where
+    B::Map<String, Binding>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            bindings: self.bindings.clone(),
+            is_function_frame: self.is_function_frame,
+            static_scope: self.static_scope,
+        }
+    }
+}
+
+impl<B: MapBackend> core::fmt::Debug for Frame<B>
+where
+    B::Map<String, Binding>: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame")
+            .field("bindings", &self.bindings)
+            .field("is_function_frame", &self.is_function_frame)
+            .field("static_scope", &self.static_scope)
+            .finish()
+    }
+}
+
+/// Stack of [`Frame`]s. Generic over the [`MapBackend`].
+pub struct Scope<B: MapBackend = BTreeBackend> {
+    frames: Vec<Frame<B>>,
+}
+
+impl<B: MapBackend> Clone for Scope<B>
+where
+    Frame<B>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            frames: self.frames.clone(),
+        }
+    }
+}
+
+impl<B: MapBackend> core::fmt::Debug for Scope<B>
+where
+    Frame<B>: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Scope").field("frames", &self.frames).finish()
+    }
+}
+
+impl<B: MapBackend> Scope<B> {
     /// New scope with a single (non-function) root frame.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
-            frames: vec![Frame::default()],
+            frames: vec![Frame::<B>::default()],
         }
     }
 
@@ -73,7 +132,7 @@ impl Scope {
     /// subshell isolation).
     #[inline]
     pub fn push(&mut self) {
-        self.frames.push(Frame::default());
+        self.frames.push(Frame::<B>::default());
     }
 
     /// Push a function frame. `static_scope = true` for ksh93
@@ -82,8 +141,8 @@ impl Scope {
     /// `name()`-form functions.
     #[inline]
     pub fn push_function_frame(&mut self, static_scope: bool) {
-        self.frames.push(Frame {
-            bindings: BTreeMap::new(),
+        self.frames.push(Frame::<B> {
+            bindings: <B::Map<String, Binding> as Default>::default(),
             is_function_frame: true,
             static_scope,
         });
@@ -128,14 +187,6 @@ impl Scope {
 
     /// Plain variable assignment, with the scope-resolution policy
     /// described in the module docs.
-    ///
-    /// 1. If any frame already binds `name` as `readonly`, refuse.
-    /// 2. If the top frame is a static-scoped function frame, write
-    ///    to the top.
-    /// 3. Otherwise walk top → bottom; update the nearest existing
-    ///    binding in place.
-    /// 4. If no frame binds `name`, create the binding in the root
-    ///    (global) frame.
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
         for frame in &self.frames {
             if let Some(b) = frame.bindings.get(name) {
@@ -148,7 +199,7 @@ impl Scope {
             if top.is_function_frame && top.static_scope {
                 let top = self.frames.last_mut().expect("just checked");
                 top.bindings.insert(
-                    name.into(),
+                    name.to_string(),
                     Binding {
                         value,
                         readonly: false,
@@ -160,7 +211,7 @@ impl Scope {
         for i in (0..self.frames.len()).rev() {
             if self.frames[i].bindings.contains_key(name) {
                 self.frames[i].bindings.insert(
-                    name.into(),
+                    name.to_string(),
                     Binding {
                         value,
                         readonly: false,
@@ -171,7 +222,7 @@ impl Scope {
         }
         let root = self.frames.first_mut().expect("at least one frame");
         root.bindings.insert(
-            name.into(),
+            name.to_string(),
             Binding {
                 value,
                 readonly: false,
@@ -181,11 +232,7 @@ impl Scope {
     }
 
     /// `local NAME[=VALUE]` — bind `name` in the topmost (function)
-    /// frame, shadowing any outer binding. The caller is expected to
-    /// have verified the topmost frame is a function frame
-    /// ([`in_function`](Self::in_function)). If the topmost frame
-    /// already has a `readonly` binding for `name`, the assignment is
-    /// refused — `local` doesn't override a frame-local readonly.
+    /// frame, shadowing any outer binding.
     pub fn assign_local(&mut self, name: &str, value: Value) -> Result<()> {
         let top = self.frames.last_mut().expect("at least one frame");
         if let Some(b) = top.bindings.get(name) {
@@ -194,7 +241,7 @@ impl Scope {
             }
         }
         top.bindings.insert(
-            name.into(),
+            name.to_string(),
             Binding {
                 value,
                 readonly: false,
@@ -203,17 +250,11 @@ impl Scope {
         Ok(())
     }
 
-    /// `readonly NAME[=VALUE]` — mark `name` read-only. If `value` is
-    /// `Some`, overwrite the binding's value at the same time. If no
-    /// frame binds `name`, create the (empty, read-only) binding in
-    /// the root frame.
+    /// `readonly NAME[=VALUE]` — mark `name` read-only.
     pub fn mark_readonly(&mut self, name: &str, value: Option<Value>) -> Result<()> {
         for i in (0..self.frames.len()).rev() {
             if let Some(b) = self.frames[i].bindings.get_mut(name) {
                 if b.readonly && value.is_some() {
-                    // Already readonly and the user tried to assign a
-                    // new value via `readonly NAME=...` — that's the
-                    // standard readonly violation.
                     return Err(KashError::Readonly(name.into()));
                 }
                 if let Some(v) = value {
@@ -225,7 +266,7 @@ impl Scope {
         }
         let root = self.frames.first_mut().expect("at least one frame");
         root.bindings.insert(
-            name.into(),
+            name.to_string(),
             Binding {
                 value: value.unwrap_or_default(),
                 readonly: true,
@@ -235,9 +276,7 @@ impl Scope {
     }
 
     /// Remove the nearest binding of `name`. Returns `true` if a
-    /// binding existed. Read-only bindings are not unset; this
-    /// returns `false` in that case (the proper `unset` builtin
-    /// surfaces this as an error).
+    /// binding existed.
     pub fn unset(&mut self, name: &str) -> bool {
         for i in (0..self.frames.len()).rev() {
             if let Some(b) = self.frames[i].bindings.get(name) {
@@ -267,7 +306,7 @@ impl Scope {
     }
 }
 
-impl Default for Scope {
+impl<B: MapBackend> Default for Scope<B> {
     fn default() -> Self {
         Self::new()
     }
@@ -279,25 +318,24 @@ mod tests {
 
     #[test]
     fn root_frame_persists() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("FOO", Value::scalar("bar")).unwrap();
         assert_eq!(s.get("FOO").unwrap().to_scalar_string(), "bar");
     }
 
     #[test]
     fn assign_walks_to_outer_existing_binding() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("X", Value::scalar("outer")).unwrap();
         s.push();
         s.assign("X", Value::scalar("from_inner")).unwrap();
         s.pop();
-        // The inner write should have updated the outer's binding.
         assert_eq!(s.get("X").unwrap().to_scalar_string(), "from_inner");
     }
 
     #[test]
     fn assign_local_isolates_to_function_frame() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("X", Value::scalar("outer")).unwrap();
         s.push_function_frame(false);
         s.assign_local("X", Value::scalar("inner")).unwrap();
@@ -308,10 +346,9 @@ mod tests {
 
     #[test]
     fn static_scope_makes_assign_local_by_default() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("X", Value::scalar("outer")).unwrap();
         s.push_function_frame(true);
-        // Plain assign should still go to the top (static) frame.
         s.assign("X", Value::scalar("inner")).unwrap();
         assert_eq!(s.get("X").unwrap().to_scalar_string(), "inner");
         s.pop();
@@ -320,18 +357,17 @@ mod tests {
 
     #[test]
     fn dynamic_scope_propagates_to_caller() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("X", Value::scalar("outer")).unwrap();
         s.push_function_frame(false);
         s.assign("X", Value::scalar("from_dynamic")).unwrap();
         s.pop();
-        // POSIX-style dynamic: caller's X was updated in place.
         assert_eq!(s.get("X").unwrap().to_scalar_string(), "from_dynamic");
     }
 
     #[test]
     fn readonly_blocks_subsequent_assignment() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.mark_readonly("X", Some(Value::scalar("fixed"))).unwrap();
         let err = s.assign("X", Value::scalar("nope")).unwrap_err();
         assert!(matches!(err, KashError::Readonly(_)));
@@ -340,7 +376,7 @@ mod tests {
 
     #[test]
     fn readonly_creates_empty_when_absent() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.mark_readonly("X", None).unwrap();
         assert!(s.is_readonly("X"));
         assert_eq!(s.get("X").unwrap().to_scalar_string(), "");
@@ -348,15 +384,9 @@ mod tests {
 
     #[test]
     fn local_can_shadow_outer_readonly() {
-        // `readonly` at root, `local` in a function frame creates a
-        // fresh binding *in that frame* — which by itself is NOT
-        // readonly. The outer readonly stays put once the frame pops.
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.mark_readonly("X", Some(Value::scalar("locked"))).unwrap();
         s.push_function_frame(false);
-        // assign_local goes to the top frame; the readonly check is
-        // only against the *top* frame's own binding (a fresh frame
-        // has none), so this should succeed.
         s.assign_local("X", Value::scalar("shadow")).unwrap();
         assert_eq!(s.get("X").unwrap().to_scalar_string(), "shadow");
         s.pop();
@@ -366,7 +396,7 @@ mod tests {
 
     #[test]
     fn unset_removes_binding_and_refuses_readonly() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         s.assign("X", Value::scalar("v")).unwrap();
         assert!(s.unset("X"));
         assert!(s.get("X").is_none());
@@ -377,7 +407,7 @@ mod tests {
 
     #[test]
     fn in_function_reports_frame_kind() {
-        let mut s = Scope::new();
+        let mut s = Scope::<BTreeBackend>::new();
         assert!(!s.in_function());
         s.push();
         assert!(!s.in_function());
