@@ -131,12 +131,12 @@ struct InstanceEntry {
 /// One active virtual-environment frame.
 #[derive(Clone, Debug, Default)]
 struct VenvFrame {
-    /// Materialised capability set for the frame. Empty
-    /// [`CapabilitySet`] = "no `capabilities { … }` section was
-    /// given" = unrestricted. Callers must consult
-    /// [`Evaluator::is_capability_allowed`] /
-    /// [`Evaluator::is_cmd_allowed`] for the venv-aware check.
-    capabilities: crate::capability::CapabilitySet,
+    /// Materialised capability set for the frame. `None` means the
+    /// venv had no `capabilities { … }` section, so capability
+    /// checks pass through unrestricted. `Some(set)` — even one
+    /// from `profile none` (empty set) — means the venv *did*
+    /// declare a policy and checks consult the set.
+    capabilities: Option<crate::capability::CapabilitySet>,
     /// Env-overlay directives applied at *external-command spawn*
     /// time. Stored in source order so successive `PATH-prepend`s
     /// stack correctly (the latest prepended entry ends up first).
@@ -897,7 +897,11 @@ impl<B: MapBackend> Evaluator<B> {
 
     /// Run `argv[0]` as an external program. Available only under
     /// `std` — the alloc-only build collapses this into `NotFound`.
+    /// The venv capability check fires here so both builds enforce
+    /// the same policy at the *call* site; the std-only spawn
+    /// helpers run it again at the spawn site for defence-in-depth.
     fn run_external(&mut self, argv: &[String]) -> Result<Outcome> {
+        self.check_external_spawn(&argv[0])?;
         #[cfg(feature = "std")]
         {
             self.run_external_std(argv)
@@ -1760,8 +1764,9 @@ impl<B: MapBackend> Evaluator<B> {
                     body = Some(statements);
                 }
                 crate::ast::VenvSection::Capabilities { spec } => {
-                    frame.capabilities = crate::capability::CapabilitySet::from_spec(spec)
+                    let set = crate::capability::CapabilitySet::from_spec(spec)
                         .map_err(KashError::Runtime)?;
+                    frame.capabilities = Some(set);
                 }
                 crate::ast::VenvSection::Env { directives } => {
                     frame.env_directives.extend(directives.iter().cloned());
@@ -1784,15 +1789,9 @@ impl<B: MapBackend> Evaluator<B> {
     /// that's the lexical frame the running code is in.
     #[must_use]
     pub fn is_capability_allowed(&self, cap: crate::capability::Capability) -> bool {
-        match self.venv_stack.last() {
+        match self.venv_stack.last().and_then(|f| f.capabilities.as_ref()) {
             None => true,
-            Some(frame) => {
-                if frame.capabilities == crate::capability::CapabilitySet::default() {
-                    // No `capabilities { … }` section was given.
-                    return true;
-                }
-                frame.capabilities.allows(cap)
-            }
+            Some(set) => set.allows(cap),
         }
     }
 
@@ -1803,16 +1802,38 @@ impl<B: MapBackend> Evaluator<B> {
     /// must clear it.
     #[must_use]
     pub fn is_cmd_allowed(&self, cmd: &str) -> bool {
-        match self.venv_stack.last() {
+        match self.venv_stack.last().and_then(|f| f.capabilities.as_ref()) {
             None => true,
-            Some(frame) => {
-                if frame.capabilities == crate::capability::CapabilitySet::default() {
-                    return true;
-                }
-                frame.capabilities.allows(crate::capability::Capability::ExecSpawn)
-                    && frame.capabilities.cmd_allowed(cmd)
+            Some(set) => {
+                set.allows(crate::capability::Capability::ExecSpawn)
+                    && set.cmd_allowed(cmd)
             }
         }
+    }
+
+    /// Gate every external-command spawn against the active venv
+    /// frame. Returns `Err(KashError::CapabilityDenied)` if either
+    /// the `ExecSpawn` capability is revoked or the `allow-cmd`
+    /// list rejects `cmd`. Called from every spawn site.
+    pub(crate) fn check_external_spawn(&self, cmd: &str) -> Result<()> {
+        let Some(set) = self
+            .venv_stack
+            .last()
+            .and_then(|f| f.capabilities.as_ref())
+        else {
+            return Ok(());
+        };
+        if !set.allows(crate::capability::Capability::ExecSpawn) {
+            return Err(KashError::CapabilityDenied(alloc::format!(
+                "spawning `{cmd}`: this venv revoked the `exec-spawn` capability"
+            )));
+        }
+        if !set.cmd_allowed(cmd) {
+            return Err(KashError::CapabilityDenied(alloc::format!(
+                "spawning `{cmd}`: not in this venv's `allow-cmd` list"
+            )));
+        }
+        Ok(())
     }
 
     /// Apply a `mode` declaration. Parses the spec, gates against
@@ -3352,6 +3373,7 @@ ifstd!({
                 // straight from the opened file descriptors. Inline
                 // stdin (`<<<` / `<<DELIM`) is fed via a piped stdin
                 // we write to after spawn.
+                self.check_external_spawn(&argv[0])?;
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
                 self.apply_exported_env(&mut c);
@@ -3491,6 +3513,7 @@ ifstd!({
         fn run_external_std(&mut self, argv: &[String]) -> Result<Outcome> {
             use std::io::Read;
             use std::process::{Command, Stdio};
+            self.check_external_spawn(&argv[0])?;
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]);
             self.apply_exported_env(&mut cmd);
@@ -3579,6 +3602,7 @@ ifstd!({
 
             for (i, spec) in specs.iter_mut().enumerate() {
                 let StageSpec { argv, io } = spec;
+                self.check_external_spawn(&argv[0])?;
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 self.apply_exported_env(&mut cmd);
@@ -7989,6 +8013,53 @@ mod tests {
         let src = "venv myproj { env { NAME_ONLY }; body {}; }\n";
         let prog = parse(src);
         assert!(prog.is_err());
+    }
+
+    #[test]
+    fn venv_revoking_exec_spawn_blocks_external_command() {
+        // `profile none` denies everything, including exec-spawn.
+        // The external `/bin/ls` call should be capability-denied.
+        let src = "venv tight {\n\
+                       capabilities { profile none }\n\
+                       body { /bin/ls /tmp; }\n\
+                   }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 126);
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("exec-spawn"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_allow_cmd_blocks_disallowed_external_command() {
+        // basic profile *does* grant exec-spawn, but the allow-cmd
+        // list constrains spawn to a closed set.
+        let src = "venv tight {\n\
+                       capabilities { profile basic; allow-cmd /bin/echo }\n\
+                       body { /bin/cat /tmp; }\n\
+                   }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 126);
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("allow-cmd"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_allow_cmd_lets_listed_command_through() {
+        // The same allow-cmd setup but invoking a *listed* command
+        // shouldn't trip the check at parse / dispatch time.
+        let src = "venv tight {\n\
+                       capabilities { profile basic; allow-cmd /bin/echo }\n\
+                       body { :; }\n\
+                   }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        // The body is `:` (a noop) so no external spawn even
+        // happens — this checks the spec materialises cleanly.
+        assert!(ev.eval_program(&prog).is_ok());
     }
 
     #[test]

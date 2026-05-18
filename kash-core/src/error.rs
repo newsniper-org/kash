@@ -56,6 +56,11 @@ pub enum KashError {
     /// because the variant carries a `std::io::Error`.
     #[cfg(feature = "std")]
     Io(std::io::Error),
+    /// venv capability check denied an operation. Carries a
+    /// human-readable description of what was attempted and which
+    /// capability / allow-list rule blocked it. POSIX exit code
+    /// `126` (command found but not invocable) — closest match.
+    CapabilityDenied(String),
     /// Catch-all for ad-hoc errors that don't have a dedicated
     /// variant yet.
     Other(String),
@@ -70,6 +75,7 @@ impl KashError {
     ///
     /// - `Parse`, `Mode` → `2` (syntax / shell-misuse)
     /// - `NotFound` → `127`
+    /// - `CapabilityDenied` → `126`
     /// - `LeakyJobs` → `3`
     /// - everything else → `1`
     #[inline]
@@ -78,6 +84,7 @@ impl KashError {
         match self {
             Self::Parse(_) | Self::Mode(_) => 2,
             Self::NotFound(_) => 127,
+            Self::CapabilityDenied(_) => 126,
             Self::LeakyJobs(_) => 3,
             Self::Runtime(_)
             | Self::TypeMismatch { .. }
@@ -105,6 +112,7 @@ impl fmt::Display for KashError {
             Self::SecureViolation(msg) => write!(f, "-secure violation: {msg}"),
             Self::Mode(msg) => write!(f, "mode error: {msg}"),
             Self::LeakyJobs(msg) => write!(f, "leaky jobs: {msg}"),
+            Self::CapabilityDenied(msg) => write!(f, "capability denied: {msg}"),
             #[cfg(feature = "std")]
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::Other(msg) => f.write_str(msg),
