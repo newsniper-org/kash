@@ -7,16 +7,15 @@
 //! literals). Designed to be allocation-friendly (Vec/Box) but
 //! `no_std + alloc` compatible.
 //!
-//! Scope of this commit: the bottom layer needed to parse POSIX
-//! command syntax — words (with their quoted-segment provenance),
-//! a minimal redirect subset, simple commands, pipelines (with
-//! `|&` coprocess flag), AND-OR lists, and statement terminators
-//! (`;`, `&`, newline). Compound commands (`if`, `for`, `while`,
-//! `case`, brace/subshell/arithmetic groups), function definitions,
-//! assignments, here-docs, FD-dup redirects, and `!` negation are
-//! intentionally *not* modelled yet — they'll land as the parser
-//! grows.
+//! Scope of this commit: POSIX command syntax up through and including
+//! compound commands — brace groups, subshells, `if`/`elif`/`else`,
+//! `while`/`until`, `for`, and `case` (with the three POSIX/ksh93
+//! fall-through variants `;;`, `;&`, `;;&`). Function definitions,
+//! assignment prefixes, here-docs, FD-dup redirects, `!` pipeline
+//! negation, and kash-specific declarations (`mode`, `namespace`,
+//! `typeclass`, `instance`, `use`) are intentionally not modelled yet.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -72,7 +71,7 @@ pub enum RedirectKind {
     AppendBoth,
 }
 
-/// A single redirection clause attached to a [`SimpleCommand`].
+/// A single redirection clause attached to a [`Command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Redirect {
     /// What the redirection does.
@@ -85,6 +84,18 @@ pub struct Redirect {
     /// Right-hand side: target filename / word.
     pub target: Word,
     /// Source span covering the whole redirect (operator + target).
+    pub span: Span,
+}
+
+/// `KEY=VALUE` prefix on a [`SimpleCommand`]. Reserved for the
+/// follow-up commit that wires up assignment parsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Assignment {
+    /// Variable name.
+    pub name: String,
+    /// Right-hand side expression as a word.
+    pub value: Word,
+    /// Source span covering `name=value`.
     pub span: Span,
 }
 
@@ -108,16 +119,170 @@ pub struct SimpleCommand {
     pub span: Span,
 }
 
-/// `KEY=VALUE` prefix on a [`SimpleCommand`]. Reserved for the
-/// follow-up commit that wires up assignment parsing.
+/// A pipeline stage — either a simple command or a compound command,
+/// in either case wrapped together with the redirect clauses that
+/// apply to *this* stage as a unit (e.g. `{ a; b; } > /tmp/log` parks
+/// the redirect on the brace group, not on `b`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Assignment {
-    /// Variable name.
-    pub name: String,
-    /// Right-hand side expression as a word.
-    pub value: Word,
-    /// Source span covering `name=value`.
+pub enum Command {
+    /// A simple command (its redirects live inside [`SimpleCommand`]).
+    Simple(SimpleCommand),
+    /// A compound command plus its outer redirect list.
+    Compound(CompoundCommand),
+}
+
+impl Command {
+    /// Source span of this command.
+    #[must_use]
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Simple(s) => s.span,
+            Self::Compound(c) => c.span,
+        }
+    }
+}
+
+/// A compound command (one of the grouping / control-flow forms),
+/// together with any outer redirects that apply to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompoundCommand {
+    /// Which compound form this is.
+    pub kind: CompoundKind,
+    /// Redirects attached to the compound as a whole.
+    pub redirects: Vec<Redirect>,
+    /// Source span covering the whole compound + its redirects.
     pub span: Span,
+}
+
+/// Compound command shape. POSIX shapes only in this commit; kash-
+/// specific shapes (`namespace { ... }`, `typeclass ... { ... }`, …)
+/// land in later commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompoundKind {
+    /// `{ ... }` — runs in the current shell environment.
+    BraceGroup {
+        /// Statements inside the group.
+        body: Vec<Statement>,
+    },
+    /// `( ... )` — runs in a subshell.
+    Subshell {
+        /// Statements inside the subshell.
+        body: Vec<Statement>,
+    },
+    /// `if … then … (elif … then …)* (else …)? fi`.
+    If {
+        /// One entry per `if` / `elif` arm, in source order. `branches`
+        /// is always non-empty (the first entry is the `if` arm).
+        branches: Vec<IfBranch>,
+        /// Optional `else` body.
+        else_body: Option<Vec<Statement>>,
+    },
+    /// `while COND do BODY done` — loops as long as `cond` exits zero.
+    While {
+        /// Loop condition (a list of statements; exit status of the
+        /// last one decides whether to enter the body).
+        cond: Vec<Statement>,
+        /// Loop body.
+        body: Vec<Statement>,
+    },
+    /// `until COND do BODY done` — loops as long as `cond` exits non-zero.
+    Until {
+        /// Loop condition (sense inverted vs. [`While`](Self::While)).
+        cond: Vec<Statement>,
+        /// Loop body.
+        body: Vec<Statement>,
+    },
+    /// `for NAME [in WORDS]? do BODY done`.
+    For {
+        /// Loop variable name.
+        name: String,
+        /// Iteration set. `None` means the `in` clause was omitted, so
+        /// the loop iterates over `"$@"` (positional parameters).
+        words: Option<Vec<Word>>,
+        /// Loop body.
+        body: Vec<Statement>,
+    },
+    /// `case SUBJECT in PATTERN) BODY ;; … esac`.
+    Case {
+        /// Subject word (gets pattern-matched against each item).
+        subject: Word,
+        /// Case arms, in source order.
+        items: Vec<CaseItem>,
+    },
+    /// A function definition. Three source forms produce this node:
+    /// the POSIX `name() <body>`, the ksh93 `function name <body>`,
+    /// and the kash extension `function name(p, q, …) <body>` whose
+    /// `(p, q, …)` part is the capture list. Locked in
+    /// `project_shell_function_scope.md`.
+    FunctionDef {
+        /// Function name.
+        name: String,
+        /// Scoping policy (lexical / dynamic). Determined by source
+        /// form: POSIX → [`FunctionScope::Dynamic`]; ksh93 / kash form
+        /// → [`FunctionScope::Static`].
+        scope: FunctionScope,
+        /// Capture list, if present. `Some(names)` means the function
+        /// is the kash `function name(p, q, …) …` form and captures
+        /// those bindings *by reference, read-only* at definition site.
+        /// `None` covers both other forms (no capture list at all).
+        captures: Option<Vec<String>>,
+        /// Function body. Always a compound command.
+        body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// Scoping policy attached to a function definition. The choice is
+/// fixed at parse time by the source form (per
+/// `project_shell_function_scope.md`); the evaluator reads it back at
+/// call time to pick the right lookup discipline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionScope {
+    /// POSIX `name()` form — looks up captured names via dynamic
+    /// scope (the runtime call stack).
+    Dynamic,
+    /// ksh93 `function` keyword form (with or without a capture list)
+    /// — lexical scope.
+    Static,
+}
+
+/// One `if` / `elif` arm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfBranch {
+    /// Condition list — exit status of the last statement decides.
+    pub cond: Vec<Statement>,
+    /// Body to run if the condition succeeded.
+    pub body: Vec<Statement>,
+    /// Source span covering `if`/`elif` … `then` … body (up to but
+    /// not including the next `elif`/`else`/`fi`).
+    pub span: Span,
+}
+
+/// One case arm: pattern set + body + fall-through behaviour.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseItem {
+    /// Patterns separated by `|` (e.g. `a|b|c)` → three patterns).
+    pub patterns: Vec<Word>,
+    /// Body to run when any pattern matches.
+    pub body: Vec<Statement>,
+    /// Trailing fall-through marker.
+    pub fallthrough: CaseFallthrough,
+    /// Source span covering the arm.
+    pub span: Span,
+}
+
+/// What to do after running a case arm's body. The three variants
+/// match the POSIX `;;` plus the bash/ksh93 fall-through extensions
+/// (locked in `project_shell_glob_pattern.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseFallthrough {
+    /// `;;` — stop after this arm (standard POSIX).
+    Stop,
+    /// `;&` — fall through and run the next arm's body unconditionally.
+    Continue,
+    /// `;;&` — stop *if* this body's exit was successful; otherwise
+    /// continue matching subsequent arms.
+    MatchNext,
 }
 
 /// Pipeline join operator. Determines runtime semantics of the join.
@@ -130,7 +295,7 @@ pub enum PipeOp {
     PipeAmp,
 }
 
-/// A pipeline: one or more [`SimpleCommand`]s joined by `|` / `|&`.
+/// A pipeline: one or more [`Command`]s joined by `|` / `|&`.
 ///
 /// `stages` and `ops` are kept in lock-step. `ops[0]` is a placeholder
 /// — only `ops[i]` for `i >= 1` describes a real join (the one *into*
@@ -139,7 +304,7 @@ pub enum PipeOp {
 pub struct Pipeline {
     /// Pipeline stages, in left-to-right source order. Always
     /// non-empty.
-    pub stages: Vec<SimpleCommand>,
+    pub stages: Vec<Command>,
     /// Join operators. `ops.len() == stages.len()` always — entry 0 is
     /// an unused placeholder.
     pub ops: Vec<PipeOp>,
@@ -177,9 +342,10 @@ pub enum Terminator {
     Background,
 }
 
-/// One top-level command: an and-or list with a terminator.
+/// One top-level statement: an and-or list with a terminator. Same
+/// shape inside compound-command bodies as at program top level.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Command {
+pub struct Statement {
     /// The and-or list itself.
     pub list: AndOrList,
     /// Trailing terminator.
@@ -188,10 +354,15 @@ pub struct Command {
     pub span: Span,
 }
 
-/// A full source unit: zero or more [`Command`]s in source order.
+/// A full source unit: zero or more [`Statement`]s in source order.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Program {
-    /// Commands in source order. May be empty (empty input / all
+    /// Statements in source order. May be empty (empty input / all
     /// comments / only blank lines).
-    pub commands: Vec<Command>,
+    pub statements: Vec<Statement>,
 }
+
+// Re-export the boxed shape used internally by some parser plumbing.
+// Kept private to the crate so the public surface stays flat.
+#[allow(dead_code)]
+pub(crate) type BoxedStatements = Box<Vec<Statement>>;
