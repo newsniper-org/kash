@@ -891,9 +891,19 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 Ok(crate::ast::VenvSection::Capabilities { spec })
             }
+            "env" => {
+                let directives = self.parse_env_section_body()?;
+                if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                    return Err(KashError::Parse(
+                        "expected `}` to close `env { … }` section".into(),
+                    ));
+                }
+                self.bump()?;
+                Ok(crate::ast::VenvSection::Env { directives })
+            }
             other => Err(KashError::Parse(alloc::format!(
                 "unknown venv section `{other}` — supported sections are \
-                 `body`, `capabilities`; env / imports / load-config land \
+                 `body`, `capabilities`, `env`; imports / load-config land \
                  in follow-up stages"
             ))),
         }
@@ -997,6 +1007,76 @@ impl<'src> Parser<'src> {
             }
         }
         Ok(spec)
+    }
+
+    /// Parse the inside of an `env { … }` section. Each line is
+    /// either `NAME=VALUE`, `PATH-prepend DIR`, or
+    /// `PATH-append DIR`.
+    fn parse_env_section_body(
+        &mut self,
+    ) -> Result<Vec<crate::ast::EnvDirective>> {
+        let mut out: Vec<crate::ast::EnvDirective> = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `env { … }` section".into(),
+                ));
+            }
+            let head = self
+                .peek_bare_word()?
+                .ok_or_else(|| {
+                    KashError::Parse(
+                        "expected `NAME=VALUE`, `PATH-prepend DIR`, or `PATH-append DIR`".into(),
+                    )
+                })?
+                .to_string();
+            match head.as_str() {
+                "PATH-prepend" => {
+                    self.bump()?;
+                    let dir = self.expect_bare_word("directory to prepend to PATH")?;
+                    out.push(crate::ast::EnvDirective::PathPrepend { dir });
+                }
+                "PATH-append" => {
+                    self.bump()?;
+                    let dir = self.expect_bare_word("directory to append to PATH")?;
+                    out.push(crate::ast::EnvDirective::PathAppend { dir });
+                }
+                _ => {
+                    // Expect `NAME=VALUE`. The lexer doesn't split
+                    // on `=`, so `NAME=VALUE` arrives as a single
+                    // bare word.
+                    if let Some(eq) = head.find('=') {
+                        let (name, rest) = head.split_at(eq);
+                        let value = &rest[1..];
+                        if name.is_empty() {
+                            return Err(KashError::Parse(
+                                "`env { … }` entry: empty name before `=`".into(),
+                            ));
+                        }
+                        out.push(crate::ast::EnvDirective::Set {
+                            name: name.to_string(),
+                            value: value.to_string(),
+                        });
+                        self.bump()?;
+                    } else {
+                        return Err(KashError::Parse(alloc::format!(
+                            "`env {{ … }}` entry `{head}` is neither `NAME=VALUE` nor a path directive"
+                        )));
+                    }
+                }
+            }
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        Ok(out)
     }
 
     // ---------- namespace ----------

@@ -137,6 +137,10 @@ struct VenvFrame {
     /// [`Evaluator::is_capability_allowed`] /
     /// [`Evaluator::is_cmd_allowed`] for the venv-aware check.
     capabilities: crate::capability::CapabilitySet,
+    /// Env-overlay directives applied at *external-command spawn*
+    /// time. Stored in source order so successive `PATH-prepend`s
+    /// stack correctly (the latest prepended entry ends up first).
+    env_directives: Vec<crate::ast::EnvDirective>,
 }
 
 impl VenvFrame {
@@ -1759,6 +1763,9 @@ impl<B: MapBackend> Evaluator<B> {
                     frame.capabilities = crate::capability::CapabilitySet::from_spec(spec)
                         .map_err(KashError::Runtime)?;
                 }
+                crate::ast::VenvSection::Env { directives } => {
+                    frame.env_directives.extend(directives.iter().cloned());
+                }
             }
         }
         self.venv_stack.push(frame);
@@ -3008,6 +3015,37 @@ impl<B: MapBackend> Default for Evaluator<B> {
 // ===== std-only: external process exec + multi-stage pipeline =====
 
 ifstd!({
+    /// Read `name`'s value from `cmd`'s pre-set env, falling back to
+    /// this process's own environment when `cmd` hasn't overridden
+    /// it. Used by the venv overlay path to layer `PATH-prepend` /
+    /// `PATH-append` on top of whatever's already configured.
+    fn read_cmd_env(cmd: &std::process::Command, name: &str) -> String {
+        for (k, v) in cmd.get_envs() {
+            if k == std::ffi::OsStr::new(name) {
+                return v
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+            }
+        }
+        std::env::var(name).unwrap_or_default()
+    }
+
+    fn path_prepend(current: String, dir: &str) -> String {
+        if current.is_empty() {
+            dir.to_string()
+        } else {
+            alloc::format!("{dir}:{current}")
+        }
+    }
+
+    fn path_append(current: String, dir: &str) -> String {
+        if current.is_empty() {
+            dir.to_string()
+        } else {
+            alloc::format!("{current}:{dir}")
+        }
+    }
+
     /// Resolved IO routing for one pipeline stage (or single command).
     /// Produced by `resolve_stage_io`; consumed by the spawn path.
     #[derive(Default)]
@@ -3036,10 +3074,42 @@ ifstd!({
         /// the external-exec / pipeline / redirect-bearing paths so
         /// the child sees the same exported set that interactive
         /// shells do.
+        ///
+        /// Then layer every active venv frame's env overlay on top,
+        /// from outermost to innermost so the innermost wins on
+        /// `Set` and `PATH-prepend`s accumulate in source order.
         fn apply_exported_env(&self, cmd: &mut std::process::Command) {
             for (name, b) in self.scope.all_bindings() {
                 if b.attrs.export {
                     cmd.env(name, b.value.to_scalar_string());
+                }
+            }
+            for frame in &self.venv_stack {
+                self.apply_venv_env_directives(cmd, &frame.env_directives);
+            }
+        }
+
+        /// Apply one venv frame's `env { … }` directives to `cmd`.
+        /// Pure overlay: `Set` overwrites, `PathPrepend` / `PathAppend`
+        /// mutate `PATH` based on whatever `cmd` currently has (which
+        /// already reflects the exported scope plus outer venvs).
+        fn apply_venv_env_directives(
+            &self,
+            cmd: &mut std::process::Command,
+            directives: &[crate::ast::EnvDirective],
+        ) {
+            use crate::ast::EnvDirective;
+            for d in directives {
+                match d {
+                    EnvDirective::Set { name, value } => {
+                        cmd.env(name, value);
+                    }
+                    EnvDirective::PathPrepend { dir } => {
+                        cmd.env("PATH", path_prepend(read_cmd_env(cmd, "PATH"), dir));
+                    }
+                    EnvDirective::PathAppend { dir } => {
+                        cmd.env("PATH", path_append(read_cmd_env(cmd, "PATH"), dir));
+                    }
                 }
             }
         }
@@ -6766,6 +6836,86 @@ mod tests {
         }
 
         #[test]
+        fn venv_env_overlay_reaches_external_command() {
+            // Inside the venv, `printenv PYTHONHOME` must see the
+            // value the `env { … }` section set, not whatever the
+            // parent shell had.
+            if !have("/usr/bin/printenv") {
+                return;
+            }
+            let src = "venv myproj {\n\
+                           env { PYTHONHOME=/opt/venv }\n\
+                           body { /usr/bin/printenv PYTHONHOME; }\n\
+                       }\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "/opt/venv\n");
+        }
+
+        #[test]
+        fn venv_path_prepend_lands_first_on_path() {
+            if !have("/usr/bin/printenv") {
+                return;
+            }
+            // We prepend a recognizable token to PATH and verify it
+            // shows up as the first colon-separated entry.
+            let src = "venv myproj {\n\
+                           env { PATH-prepend /tmp/kashtest-needle }\n\
+                           body { /usr/bin/printenv PATH; }\n\
+                       }\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            let first = out.trim_end().split(':').next().unwrap_or("");
+            assert_eq!(first, "/tmp/kashtest-needle", "full PATH: {out}");
+        }
+
+        #[test]
+        fn venv_path_append_lands_last_on_path() {
+            if !have("/usr/bin/printenv") {
+                return;
+            }
+            let src = "venv myproj {\n\
+                           env { PATH-append /tmp/kashtest-tail }\n\
+                           body { /usr/bin/printenv PATH; }\n\
+                       }\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            let last = out
+                .trim_end()
+                .rsplit(':')
+                .next()
+                .unwrap_or("");
+            assert_eq!(last, "/tmp/kashtest-tail", "full PATH: {out}");
+        }
+
+        #[test]
+        fn venv_env_overlay_drops_after_frame_pops() {
+            // After the venv block ends, a fresh external lookup
+            // must not see the overlay value.
+            if !have("/usr/bin/printenv") {
+                return;
+            }
+            let src = "venv myproj { env { KASH_TEST_OVERLAY=in-venv } body { /usr/bin/printenv KASH_TEST_OVERLAY; }; }\n\
+                       /usr/bin/printenv KASH_TEST_OVERLAY ; echo done\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            // The second printenv exits non-zero when the var is
+            // unset; we ignore its status and check that the only
+            // value printed was the one from inside the venv.
+            let _ = ev.eval_program(&prog);
+            let out = ev.take_output();
+            assert!(out.starts_with("in-venv\n"));
+            assert!(out.ends_with("done\n"));
+            // No second `in-venv` line.
+            assert_eq!(out.matches("in-venv").count(), 1, "out: {out}");
+        }
+
+        #[test]
         fn here_doc_with_trailing_semicolon_separates_statements() {
             if !have("/bin/cat") {
                 return;
@@ -7817,6 +7967,28 @@ mod tests {
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
         assert!(msg.contains("unknown capability"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_env_section_parses() {
+        let (_, out, _) = run(
+            "venv myproj {\n\
+                 env {\n\
+                     PYTHONHOME=/opt/venv\n\
+                     PATH-prepend /opt/venv/bin\n\
+                     PATH-append /opt/other/bin\n\
+                 }\n\
+                 body { echo ok }\n\
+             }\n",
+        );
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn venv_env_entry_without_equals_rejected() {
+        let src = "venv myproj { env { NAME_ONLY }; body {}; }\n";
+        let prog = parse(src);
+        assert!(prog.is_err());
     }
 
     #[test]

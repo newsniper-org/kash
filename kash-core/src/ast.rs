@@ -367,6 +367,42 @@ pub enum VenvSection {
         /// Textual spec produced by `parse_capabilities_section`.
         spec: crate::capability::CapabilitySpec,
     },
+    /// `env { … }` — environment overlay applied to *external*
+    /// commands spawned from inside the venv. Directives:
+    ///
+    ///   * `NAME=VALUE` — set / override an env entry
+    ///   * `PATH-prepend DIR` — prepend `DIR` to `PATH`
+    ///   * `PATH-append  DIR` — append  `DIR` to `PATH`
+    ///
+    /// Order matters: directives are applied in declaration order
+    /// at spawn time, so later `PATH-prepend`s end up *first* on
+    /// the resulting `PATH`.
+    Env {
+        /// Directive list in source order.
+        directives: Vec<EnvDirective>,
+    },
+}
+
+/// One directive inside a venv `env { … }` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvDirective {
+    /// `NAME=VALUE` — overwrite (or define) an env entry.
+    Set {
+        /// Env var name.
+        name: String,
+        /// Env var value.
+        value: String,
+    },
+    /// `PATH-prepend DIR`.
+    PathPrepend {
+        /// Directory to prepend to `PATH`.
+        dir: String,
+    },
+    /// `PATH-append DIR`.
+    PathAppend {
+        /// Directory to append to `PATH`.
+        dir: String,
+    },
 }
 
 /// The three source forms of [`CompoundKind::ModeDecl`].
