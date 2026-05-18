@@ -1241,7 +1241,9 @@ impl<B: MapBackend> Evaluator<B> {
             .imports
             .last_mut()
             .expect("root imports frame always present");
-        frame.push(parsed);
+        for entry in parsed {
+            frame.push(entry);
+        }
         Ok(Outcome::Status(0))
     }
 
@@ -4798,9 +4800,11 @@ fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
 }
 
-/// Parse the args to `use`. Accepts the four documented forms and
-/// emits a single [`ImportEntry`].
-fn parse_use_args(args: &[String]) -> Result<ImportEntry> {
+/// Parse the args to `use`. Accepts the four documented forms plus
+/// the brace expansion shorthand `use .foo.{a,b}` (which expands to
+/// the cross-product of single-symbol imports), returning one or
+/// more [`ImportEntry`] values.
+fn parse_use_args(args: &[String]) -> Result<Vec<ImportEntry>> {
     fn split_path(raw: &str) -> Result<Vec<String>> {
         let stripped = raw.strip_prefix('.').unwrap_or(raw);
         let segs: Vec<String> = stripped
@@ -4817,36 +4821,48 @@ fn parse_use_args(args: &[String]) -> Result<ImportEntry> {
 
     let strs: Vec<&str> = args.iter().map(alloc::string::String::as_str).collect();
     match strs.as_slice() {
-        ["namespace", path] => Ok(ImportEntry::Wildcard {
+        ["namespace", path] => Ok(alloc::vec![ImportEntry::Wildcard {
             source: split_path(path)?,
-        }),
+        }]),
         ["namespace", path, "as", alias] => {
             if alias.contains('.') {
                 return Err(KashError::Runtime(alloc::format!(
                     "use namespace … as: alias `{alias}` must be a bare identifier"
                 )));
             }
-            Ok(ImportEntry::Aliased {
+            Ok(alloc::vec![ImportEntry::Aliased {
                 source: split_path(path)?,
                 alias: alloc::string::String::from(*alias),
-            })
+            }])
         }
         [absolute] if absolute.starts_with('.') => {
-            let segs = split_path(absolute)?;
-            if segs.len() < 2 {
-                return Err(KashError::Runtime(alloc::format!(
-                    "use: `{absolute}` needs at least one path segment before the symbol name"
-                )));
+            let expanded = expand_brace_in_path(absolute)?;
+            let mut out = Vec::with_capacity(expanded.len());
+            for path in &expanded {
+                let segs = split_path(path)?;
+                if segs.len() < 2 {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "use: `{path}` needs at least one path segment before the symbol name"
+                    )));
+                }
+                let source_name = segs.last().unwrap().clone();
+                let source_path = segs[..segs.len() - 1].to_vec();
+                out.push(ImportEntry::Symbol {
+                    source_path,
+                    source_name,
+                    alias: None,
+                });
             }
-            let source_name = segs.last().unwrap().clone();
-            let source_path = segs[..segs.len() - 1].to_vec();
-            Ok(ImportEntry::Symbol {
-                source_path,
-                source_name,
-                alias: None,
-            })
+            Ok(out)
         }
         [absolute, "as", alias] if absolute.starts_with('.') => {
+            // The brace form forbids `as ALIAS` — a single alias
+            // can't cleanly bind multiple imports.
+            if absolute.contains('{') {
+                return Err(KashError::Runtime(
+                    "use: `{…}` brace form and `as ALIAS` cannot be combined".into(),
+                ));
+            }
             let segs = split_path(absolute)?;
             if segs.len() < 2 {
                 return Err(KashError::Runtime(alloc::format!(
@@ -4860,16 +4876,84 @@ fn parse_use_args(args: &[String]) -> Result<ImportEntry> {
             }
             let source_name = segs.last().unwrap().clone();
             let source_path = segs[..segs.len() - 1].to_vec();
-            Ok(ImportEntry::Symbol {
+            Ok(alloc::vec![ImportEntry::Symbol {
                 source_path,
                 source_name,
                 alias: Some(alloc::string::String::from(*alias)),
-            })
+            }])
         }
         _ => Err(KashError::Runtime(
-            "use: expected one of `use namespace PATH [as ALIAS]` or `use .PATH.NAME [as ALIAS]`".into(),
+            "use: expected one of `use namespace PATH [as ALIAS]`, `use .PATH.NAME [as ALIAS]`, or `use .PATH.{N1,N2,…}`".into(),
         )),
     }
+}
+
+/// Expand brace groups in a `use` path. Supports the comma form
+/// (`a,b,c`) and the cross-product of multiple groups
+/// (`.{x,y}.{a,b}` → 4 paths). Returns `vec![raw.to_string()]` when
+/// no brace group is present.
+fn expand_brace_in_path(raw: &str) -> Result<Vec<String>> {
+    let mut frontier = alloc::vec![alloc::string::String::new()];
+    let mut rest = raw;
+    while let Some(open) = rest.find('{') {
+        let close = match find_matching_brace(rest, open) {
+            Some(i) => i,
+            None => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "use: unbalanced `{{` in path `{raw}`"
+                )));
+            }
+        };
+        let prefix = &rest[..open];
+        let inner = &rest[open + 1..close];
+        let alts: Vec<&str> = inner.split(',').collect();
+        if alts.iter().any(|s| s.is_empty()) {
+            return Err(KashError::Runtime(alloc::format!(
+                "use: empty brace alternative in `{raw}`"
+            )));
+        }
+        let mut next = Vec::with_capacity(frontier.len() * alts.len());
+        for base in &frontier {
+            for alt in &alts {
+                let mut s = base.clone();
+                s.push_str(prefix);
+                s.push_str(alt);
+                next.push(s);
+            }
+        }
+        frontier = next;
+        rest = &rest[close + 1..];
+    }
+    if rest.is_empty() {
+        return Ok(frontier);
+    }
+    let suffix = rest;
+    for s in frontier.iter_mut() {
+        s.push_str(suffix);
+    }
+    Ok(frontier)
+}
+
+/// Locate the `}` that matches the `{` at `open`. Nested braces are
+/// supported. Returns `None` if no match.
+fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: u32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Build `.<seg1>.<seg2>…<name>` for a namespace-qualified lookup.
@@ -7243,6 +7327,49 @@ mod tests {
              .bar.Sayer::Int::say\n",
         );
         assert_eq!(out, "foo\nbar\n");
+    }
+
+    #[test]
+    fn use_brace_form_imports_each_symbol() {
+        let (_, out, _) = run(
+            "namespace utils { a() { echo A; }; b() { echo B; }; c() { echo C; }; }\n\
+             show() { use .utils.{a,b}; a; b; }\n\
+             show\n",
+        );
+        assert_eq!(out, "A\nB\n");
+    }
+
+    #[test]
+    fn use_brace_form_cross_product() {
+        // `.{x,y}.{a,b}.hi` expands to four imports
+        // (xa, xb, ya, yb) — first wins on resolution.
+        let (_, out, _) = run(
+            "namespace x { namespace a { hi() { echo xa-hi; }; }; }\n\
+             namespace y { namespace b { hi() { echo yb-hi; }; }; }\n\
+             show() { use .{x,y}.{a,b}.hi; hi; }\n\
+             show\n",
+        );
+        assert_eq!(out, "xa-hi\n");
+    }
+
+    #[test]
+    fn use_brace_form_with_as_rejected() {
+        let src = "namespace u { a() { :; }; b() { :; }; }\n\
+                   show() { use .u.{a,b} as x; }\n\
+                   show\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[test]
+    fn use_brace_form_empty_alternative_rejected() {
+        let src = "namespace u { :; }\n\
+                   show() { use .u.{a,}; }\n\
+                   show\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
     }
 
     #[test]

@@ -654,6 +654,31 @@ impl<'src> Lexer<'src> {
                 if self.peek().is_some() {
                     self.pos += 1;
                 }
+            } else if b == b'{' && self.pos > start {
+                // Brace group *inside* a running word — e.g. the
+                // `{a,b}` half of `.utils.{a,b}` for `use`. Absorb
+                // up to the matching `}` (balanced, with nesting)
+                // so the whole construct lands in a single Word
+                // token. A `{` at word *start* is still a brace-
+                // group opener and breaks out of word-reading.
+                self.pos += 1;
+                let mut depth = 1usize;
+                while let Some(c) = self.peek() {
+                    self.pos += 1;
+                    if c == b'{' {
+                        depth += 1;
+                    } else if c == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                if depth != 0 {
+                    return Err(KashError::Parse(alloc::format!(
+                        "unterminated `{{…}}` group inside word at offset {start}"
+                    )));
+                }
             } else {
                 break;
             }
