@@ -2898,6 +2898,27 @@ impl<B: MapBackend> Default for Evaluator<B> {
 // ===== std-only: external process exec + multi-stage pipeline =====
 
 ifstd!({
+    /// Resolved IO routing for one pipeline stage (or single command).
+    /// Produced by `resolve_stage_io`; consumed by the spawn path.
+    #[derive(Default)]
+    struct StageIo {
+        /// File to plumb into the stage's stdout, if any.
+        stdout_file: Option<std::fs::File>,
+        /// File to plumb into the stage's stderr, if any.
+        stderr_file: Option<std::fs::File>,
+        /// File to plumb into the stage's stdin, if any.
+        in_file: Option<std::fs::File>,
+        /// Inline bytes (here-doc / here-string) to feed into the
+        /// stage's stdin, if any.
+        in_inline: Option<alloc::vec::Vec<u8>>,
+        /// `2>&1` / `&>` family — stderr follows whatever stdout is
+        /// routed to.
+        stderr_follows_stdout: bool,
+        /// `1>&2` family — stdout follows whatever stderr is routed
+        /// to.
+        stdout_follows_stderr: bool,
+    }
+
     impl<B: crate::collections::MapBackend> Evaluator<B> {
         /// Walk the scope stack and push every binding flagged with
         /// `attrs.export` into `cmd`'s environment, using the
@@ -2988,29 +3009,15 @@ ifstd!({
         /// External commands receive the opened files / inline-body
         /// pipes as their `Stdio`, so the kernel does the work
         /// directly.
-        fn eval_with_redirects(
-            &mut self,
-            cmd: &SimpleCommand,
-            argv: &[String],
-        ) -> Result<Outcome> {
+        /// Walk a redirect list and resolve it to a stage IO setup.
+        /// Shared by `eval_with_redirects` (single command) and the
+        /// pipeline stage path. The returned [`StageIo`] is owned —
+        /// callers wire its handles into a `std::process::Command`
+        /// or feed inline bytes through a piped stdin.
+        fn resolve_stage_io(&mut self, redirects: &[crate::ast::Redirect]) -> Result<StageIo> {
             use crate::ast::RedirectKind;
-            use std::io::{Read, Write};
-            use std::process::{Command, Stdio};
-            // Resolved per-fd routing. Built up by walking the
-            // redirect list in source order: each entry either opens
-            // a file, redirects an inline payload, or duplicates one
-            // of the standard streams onto another.
-            let mut stdout_file: Option<std::fs::File> = None;
-            let mut stderr_file: Option<std::fs::File> = None;
-            let mut in_file: Option<std::fs::File> = None;
-            let mut in_inline: Option<alloc::vec::Vec<u8>> = None;
-            // Cross-stream dup flags. `stderr_follows_stdout` covers
-            // `2>&1` *and* the `&>` / `&>>` forms; `stdout_follows_stderr`
-            // covers `1>&2`. The order of writes through the redirect
-            // list resets these as needed.
-            let mut stderr_follows_stdout: bool = false;
-            let mut stdout_follows_stderr: bool = false;
-            for r in &cmd.redirects {
+            let mut io = StageIo::default();
+            for r in redirects {
                 let fd_hint = r.fd.unwrap_or_else(|| default_fd_for(r.kind));
                 match r.kind {
                     RedirectKind::Input => {
@@ -3021,20 +3028,20 @@ ifstd!({
                                 "redirecting fd {fd_hint} for input isn't supported yet"
                             )));
                         }
-                        in_file = Some(f);
-                        in_inline = None;
+                        io.in_file = Some(f);
+                        io.in_inline = None;
                     }
                     RedirectKind::Output | RedirectKind::Append => {
                         let path = self.expand_word(&r.target)?;
                         let f = self.open_redirect_file(r.kind, &path)?;
                         match fd_hint {
                             1 => {
-                                stdout_file = Some(f);
-                                stdout_follows_stderr = false;
+                                io.stdout_file = Some(f);
+                                io.stdout_follows_stderr = false;
                             }
                             2 => {
-                                stderr_file = Some(f);
-                                stderr_follows_stdout = false;
+                                io.stderr_file = Some(f);
+                                io.stderr_follows_stdout = false;
                             }
                             other => {
                                 return Err(KashError::Runtime(alloc::format!(
@@ -3046,25 +3053,21 @@ ifstd!({
                     RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
                         let path = self.expand_word(&r.target)?;
                         let f = self.open_redirect_file(r.kind, &path)?;
-                        stdout_file = Some(f);
-                        stderr_follows_stdout = true;
-                        stdout_follows_stderr = false;
+                        io.stdout_file = Some(f);
+                        io.stderr_follows_stdout = true;
+                        io.stdout_follows_stderr = false;
                     }
                     RedirectKind::DupOutput => {
                         let target = self.expand_word(&r.target)?;
                         if target == "-" {
-                            // `[n]>&-` close — collapse the sink to
-                            // /dev/null by clearing any file routing.
-                            // Approximate: route to inherit, which is
-                            // visually identical for most uses.
                             match fd_hint {
                                 1 => {
-                                    stdout_file = None;
-                                    stdout_follows_stderr = false;
+                                    io.stdout_file = None;
+                                    io.stdout_follows_stderr = false;
                                 }
                                 2 => {
-                                    stderr_file = None;
-                                    stderr_follows_stdout = false;
+                                    io.stderr_file = None;
+                                    io.stderr_follows_stdout = false;
                                 }
                                 other => {
                                     return Err(KashError::Runtime(alloc::format!(
@@ -3081,14 +3084,14 @@ ifstd!({
                         })?;
                         match (fd_hint, src_fd) {
                             (2, 1) => {
-                                stderr_follows_stdout = true;
-                                stderr_file = None;
+                                io.stderr_follows_stdout = true;
+                                io.stderr_file = None;
                             }
                             (1, 2) => {
-                                stdout_follows_stderr = true;
-                                stdout_file = None;
+                                io.stdout_follows_stderr = true;
+                                io.stdout_file = None;
                             }
-                            (a, b) if a == b => { /* self-dup is a no-op */ }
+                            (a, b) if a == b => {}
                             _ => {
                                 return Err(KashError::Runtime(alloc::format!(
                                     "fd dup {fd_hint}>&{src_fd} isn't supported yet"
@@ -3105,17 +3108,36 @@ ifstd!({
                         let text = self.expand_word(&r.target)?;
                         let mut bytes = text.into_bytes();
                         bytes.push(b'\n');
-                        in_file = None;
-                        in_inline = Some(bytes);
+                        io.in_file = None;
+                        io.in_inline = Some(bytes);
                     }
                     RedirectKind::HereDoc { strip_tabs: _ } => {
                         let text = self.expand_word(&r.target)?;
                         let bytes = text.into_bytes();
-                        in_file = None;
-                        in_inline = Some(bytes);
+                        io.in_file = None;
+                        io.in_inline = Some(bytes);
                     }
                 }
             }
+            Ok(io)
+        }
+
+        fn eval_with_redirects(
+            &mut self,
+            cmd: &SimpleCommand,
+            argv: &[String],
+        ) -> Result<Outcome> {
+            use std::io::{Read, Write};
+            use std::process::{Command, Stdio};
+            // All per-fd routing flows through the shared resolver.
+            let StageIo {
+                stdout_file,
+                stderr_file,
+                in_file,
+                in_inline,
+                stderr_follows_stdout,
+                stdout_follows_stderr,
+            } = self.resolve_stage_io(&cmd.redirects)?;
             // Compatibility shim with the older two-flag layout the
             // rest of this function used: `out_file` / `both` from the
             // pre-fd-routing world.
@@ -3318,14 +3340,26 @@ ifstd!({
         /// Spawn an N-stage pipeline of external commands. Stages
         /// that resolve to a builtin or function are rejected — the
         /// in-process / cross-process bridge for those lands later.
+        /// Each stage may carry its *own* redirects (`cat <<EOF | wc
+        /// -l`, `tee >file | cat`, …); the resolver consults each
+        /// stage's redirect list and lets it override the
+        /// previous-stage-pipe / capture defaults.
         fn run_pipeline_external(&mut self, pipe: &Pipeline) -> Result<Outcome> {
-            use std::io::Read;
+            use std::io::{Read, Write};
             use std::process::{Child, Command, Stdio};
 
-            // Resolve every stage's argv up front. If any stage is a
-            // builtin / function / compound, bail before we spawn
-            // anything.
-            let mut argvs: alloc::vec::Vec<alloc::vec::Vec<String>> =
+            // Resolve every stage's argv + redirects up front. We
+            // can't lazy-resolve later because some redirect targets
+            // are `Word`s that need expansion against the current
+            // scope, and the borrow checker prefers we do all that
+            // before we start touching children. The pre-validation
+            // also lets us reject built-in / function stages before
+            // any process is spawned.
+            struct StageSpec {
+                argv: alloc::vec::Vec<String>,
+                io: StageIo,
+            }
+            let mut specs: alloc::vec::Vec<StageSpec> =
                 alloc::vec::Vec::with_capacity(pipe.stages.len());
             for stage in &pipe.stages {
                 let simple = match stage {
@@ -3336,11 +3370,6 @@ ifstd!({
                         ));
                     }
                 };
-                if !simple.redirects.is_empty() {
-                    return Err(KashError::Runtime(
-                        "redirections in pipeline stages are not yet supported".into(),
-                    ));
-                }
                 if !simple.assignments.is_empty() {
                     return Err(KashError::Runtime(
                         "assignment prefixes in pipeline stages are not yet supported".into(),
@@ -3361,19 +3390,28 @@ ifstd!({
                         "builtin or function `{name}` in a multi-stage pipeline is not yet supported"
                     )));
                 }
-                argvs.push(argv);
+                let io = self.resolve_stage_io(&simple.redirects)?;
+                specs.push(StageSpec { argv, io });
             }
 
-            // Spawn each stage, wiring stdin to the previous stage's
-            // stdout. The very last stage's stdout is captured into
-            // the evaluator's output buffer.
-            let n = argvs.len();
+            let n = specs.len();
             let mut children: alloc::vec::Vec<Child> = alloc::vec::Vec::with_capacity(n);
-            for (i, argv) in argvs.iter().enumerate() {
+
+            for (i, spec) in specs.iter_mut().enumerate() {
+                let StageSpec { argv, io } = spec;
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 self.apply_exported_env(&mut cmd);
-                if i == 0 {
+
+                // stdin: per-stage redirect wins; else previous-stage
+                // pipe (i > 0); else inherit (first stage).
+                let inline_bytes = io.in_inline.take();
+                let need_inline_pipe = inline_bytes.is_some();
+                if let Some(f) = io.in_file.take() {
+                    cmd.stdin(Stdio::from(f));
+                } else if need_inline_pipe {
+                    cmd.stdin(Stdio::piped());
+                } else if i == 0 {
                     cmd.stdin(Stdio::inherit());
                 } else {
                     let prev_stdout = children[i - 1]
@@ -3382,31 +3420,66 @@ ifstd!({
                         .expect("previous stage was spawned with piped stdout");
                     cmd.stdin(Stdio::from(prev_stdout));
                 }
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::inherit());
-                let child = cmd.spawn().map_err(|e| {
+
+                // stdout: per-stage file routing wins. Otherwise:
+                // intermediate stages → piped (for next stage);
+                // last stage → piped (for capture into self.output).
+                if let Some(f) = io.stdout_file.take() {
+                    if io.stderr_follows_stdout {
+                        let f2 = f.try_clone().map_err(|e| {
+                            KashError::Runtime(alloc::format!("dup: {e}"))
+                        })?;
+                        cmd.stdout(Stdio::from(f));
+                        cmd.stderr(Stdio::from(f2));
+                    } else {
+                        cmd.stdout(Stdio::from(f));
+                    }
+                } else {
+                    cmd.stdout(Stdio::piped());
+                }
+
+                if let Some(ef) = io.stderr_file.take() {
+                    cmd.stderr(Stdio::from(ef));
+                } else if !io.stderr_follows_stdout {
+                    // Leave stderr alone unless already routed by the
+                    // `&>`/`2>&1` block above.
+                    cmd.stderr(Stdio::inherit());
+                }
+
+                let mut child = cmd.spawn().map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
                         KashError::NotFound(alloc::format!("command `{}`", argv[0]))
                     } else {
                         KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
                     }
                 })?;
+                // Inline stdin (here-doc / here-string) writes now,
+                // not later — small bodies fit in the kernel pipe
+                // buffer, and the child usually drains while we
+                // write. Large bodies that would deadlock are a
+                // separate concern (deferred IO loop), not a
+                // common-case shell concern.
+                if let Some(bytes) = inline_bytes
+                    && let Some(mut si) = child.stdin.take()
+                {
+                    si.write_all(&bytes).map_err(|e| {
+                        KashError::Runtime(alloc::format!("write stdin: {e}"))
+                    })?;
+                }
                 children.push(child);
             }
 
-            // Drain the last child's stdout before reaping anyone,
-            // so a producer that writes more than a pipe-buffer's
-            // worth doesn't deadlock waiting for us to read.
+            // Last stage's stdout: if the stage routed it to a file
+            // we don't have a piped handle; otherwise drain it into
+            // `self.output`.
             let last = n - 1;
-            let mut last_stdout = children[last]
-                .stdout
-                .take()
-                .expect("last stage was spawned with piped stdout");
             let mut buf = alloc::vec::Vec::<u8>::new();
-            last_stdout
-                .read_to_end(&mut buf)
-                .map_err(|e| KashError::Runtime(alloc::format!("read pipeline stdout: {e}")))?;
-            self.output.push_str(&String::from_utf8_lossy(&buf));
+            if let Some(mut last_stdout) = children[last].stdout.take() {
+                last_stdout.read_to_end(&mut buf).map_err(|e| {
+                    KashError::Runtime(alloc::format!("read pipeline stdout: {e}"))
+                })?;
+                self.output.push_str(&String::from_utf8_lossy(&buf));
+            }
 
             // Reap every stage. Pipeline exit status is the last
             // stage's (POSIX default). With `pipefail`, take the
@@ -6481,23 +6554,55 @@ mod tests {
         }
 
         #[test]
-        fn here_doc_with_pipe_trailing_on_introducer_line_parses() {
+        fn here_doc_with_pipe_trailing_on_introducer_line_runs() {
             // `<<EOF` followed by `| …` on the same line: the pipe
             // and its tail belong to the surrounding pipeline, not
-            // to the here-doc body. The evaluator's pipeline-stage
-            // redirect support is a separate work item; this test
-            // pins the parse-side fix introduced for (η).
+            // to the here-doc body. With pipeline-stage redirect
+            // support, the body actually flows into the next stage.
+            if !have("/bin/cat") || !have("/bin/wc") {
+                return;
+            }
             let src = "/bin/cat <<EOF | /bin/wc -l\nalpha\nbeta\ngamma\nEOF\n";
             let prog = parse(src).expect("introducer-line trailing should parse");
-            // Must yield a single Pipeline statement (the `|` was
-            // *not* swallowed by the here-doc body).
-            assert_eq!(prog.statements.len(), 1);
-            // Structural sanity: the second pipeline stage exists
-            // and starts with `/bin/wc`, and the here-doc body
-            // contains the expected lines.
-            let dbg = alloc::format!("{:?}", prog.statements[0]);
-            assert!(dbg.contains("/bin/wc"), "got: {dbg}");
-            assert!(dbg.contains("alpha"));
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output().trim(), "3");
+        }
+
+        #[test]
+        fn pipeline_stage_with_output_redirect() {
+            if !have("/bin/echo") || !have("/bin/cat") {
+                return;
+            }
+            let tmp = std::env::temp_dir().join("kash-pipe-mid-redirect.txt");
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "/bin/echo hello | /bin/cat >{path}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let contents = std::fs::read_to_string(&tmp).unwrap();
+            assert_eq!(contents, "hello\n");
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn pipeline_stage_with_input_redirect_from_file() {
+            if !have("/bin/cat") || !have("/bin/wc") {
+                return;
+            }
+            let tmp = std::env::temp_dir().join("kash-pipe-in-redirect.txt");
+            std::fs::write(&tmp, "a\nb\nc\n").unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "/bin/cat <{path} | /bin/wc -l\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output().trim(), "3");
+            let _ = std::fs::remove_file(&tmp);
         }
 
         #[test]
@@ -7165,14 +7270,16 @@ mod tests {
     #[test]
     fn use_namespace_is_scoped_to_the_calling_function() {
         // `outer` runs `inner` (which imports `utils`) then tries
-        // `greet` from its own body. Because imports are scoped to
-        // the function frame, `outer`'s `greet` is unresolved —
-        // alloc-only builds raise; std builds fall through to an
-        // external-exec attempt that fails too. Either way the
-        // first call must have succeeded, leaving `hi` in stdout.
-        let src = "namespace utils { greet() { echo hi; }; }\n\
-                   inner() { use namespace utils; greet; }\n\
-                   outer() { inner; greet; }\n\
+        // the imported name from its own body. Because imports are
+        // scoped to the function frame, `outer`'s bare reference
+        // must miss. The command name `kashtestunique` is chosen
+        // to avoid colliding with any real PATH entry on std
+        // builds — otherwise we'd accidentally exec it — *and* to
+        // avoid the `_`-prefix exclusion the wildcard import path
+        // applies.
+        let src = "namespace utils { kashtestunique() { echo hi; }; }\n\
+                   inner() { use namespace utils; kashtestunique; }\n\
+                   outer() { inner; kashtestunique; }\n\
                    outer\n";
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
