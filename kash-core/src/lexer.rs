@@ -332,6 +332,48 @@ impl<'src> Lexer<'src> {
                         self.pos += 1;
                     }
                 }
+                Some(b'$') if self.peek_at(1) == Some(b'(') => {
+                    // `$(...)` inside double quotes — track nested
+                    // parens so a `"` inside the sub-command body
+                    // doesn't terminate the outer string.
+                    self.pos += 2;
+                    let mut depth = 1usize;
+                    while let Some(c) = self.peek() {
+                        self.pos += 1;
+                        if c == b'(' {
+                            depth += 1;
+                        } else if c == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if depth != 0 {
+                        return Err(KashError::Parse(alloc::format!(
+                            "unterminated `$(...)` inside double-quoted string at byte {start}"
+                        )));
+                    }
+                }
+                Some(b'`') => {
+                    // Backtick command substitution inside double
+                    // quotes — skip until the matching backtick.
+                    self.pos += 1;
+                    while let Some(c) = self.peek() {
+                        if c == b'`' {
+                            self.pos += 1;
+                            break;
+                        }
+                        if c == b'\\' {
+                            self.pos += 1;
+                            if self.peek().is_some() {
+                                self.pos += 1;
+                            }
+                            continue;
+                        }
+                        self.pos += 1;
+                    }
+                }
                 Some(_) => self.pos += 1,
                 None => {
                     return Err(KashError::Parse(alloc::format!(
@@ -442,6 +484,52 @@ impl<'src> Lexer<'src> {
                         return Err(KashError::Parse(alloc::format!(
                             "unterminated `${{...}}` at offset {start}"
                         )));
+                    }
+                    continue;
+                }
+                if b == b'$' && self.peek_at(1) == Some(b'(') {
+                    // `$(...)` command substitution. Nested
+                    // parentheses are tracked so that e.g.
+                    // `$(echo $(date))` lexes as one Word.
+                    self.pos += 2; // `$(`
+                    let mut depth = 1usize;
+                    while let Some(c) = self.peek() {
+                        self.pos += 1;
+                        if c == b'(' {
+                            depth += 1;
+                        } else if c == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if depth != 0 {
+                        return Err(KashError::Parse(alloc::format!(
+                            "unterminated `$(...)` at offset {start}"
+                        )));
+                    }
+                    continue;
+                }
+                if b == b'`' {
+                    // Backtick command substitution. No nesting (the
+                    // POSIX backtick form famously doesn't nest);
+                    // `\\` inside escapes the next byte (so `\\` `\``
+                    // / `\\$` survive).
+                    self.pos += 1;
+                    while let Some(c) = self.peek() {
+                        if c == b'`' {
+                            self.pos += 1;
+                            break;
+                        }
+                        if c == b'\\' {
+                            self.pos += 1;
+                            if self.peek().is_some() {
+                                self.pos += 1;
+                            }
+                            continue;
+                        }
+                        self.pos += 1;
                     }
                     continue;
                 }

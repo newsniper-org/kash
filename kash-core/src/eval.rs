@@ -705,6 +705,18 @@ impl Evaluator {
     ) -> Result<()> {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
+            if c == '`' {
+                let body = read_backtick_body(&mut chars)?;
+                let value = self.run_command_substitution(&body)?;
+                match split_ifs {
+                    Some(ifs) => append_split(&value, ifs, fields),
+                    None => fields
+                        .last_mut()
+                        .expect("fields invariant")
+                        .push_str(&value),
+                }
+                continue;
+            }
             if c != '$' {
                 fields.last_mut().expect("fields invariant").push(c);
                 continue;
@@ -716,7 +728,11 @@ impl Evaluator {
                 fields.last_mut().expect("fields invariant").push('$');
                 continue;
             };
-            let value = if next == '{' {
+            let value = if next == '(' {
+                chars.next();
+                let body = read_paren_body(&mut chars)?;
+                self.run_command_substitution(&body)?
+            } else if next == '{' {
                 chars.next();
                 let mut depth = 1usize;
                 let mut body = String::new();
@@ -793,12 +809,43 @@ impl Evaluator {
         }
     }
 
+    /// Parse `src` as kash source, run it in a fresh subshell-style
+    /// context (environment snapshot + isolated output buffer), then
+    /// return the captured stdout with trailing newlines stripped.
+    /// POSIX defines command substitution as a subshell, so this
+    /// snapshots the scope / positionals / function table just like
+    /// `( ... )` does.
+    fn run_command_substitution(&mut self, src: &str) -> Result<String> {
+        let prog = crate::parser::parse(src)?;
+        let saved_scope = self.scope.clone();
+        let saved_positionals = self.positionals.clone();
+        let saved_functions = self.functions.clone();
+        let saved_output = core::mem::take(&mut self.output);
+        let result = self.eval_program(&prog);
+        let captured = core::mem::replace(&mut self.output, saved_output);
+        self.scope = saved_scope;
+        self.positionals = saved_positionals;
+        self.functions = saved_functions;
+        result?;
+        let mut s = captured;
+        while s.ends_with('\n') {
+            s.pop();
+        }
+        Ok(s)
+    }
+
     /// Walk `text` and append it to `out`, substituting `$NAME`,
     /// `${…}`, and the specials (`$?`, `$#`, `$0`-`$9`, `$$`) along
     /// the way. Used for `Bare` and `DoubleQuoted` segments.
     fn expand_dollar(&mut self, text: &str, out: &mut String) -> Result<()> {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
+            if c == '`' {
+                let body = read_backtick_body(&mut chars)?;
+                let value = self.run_command_substitution(&body)?;
+                out.push_str(&value);
+                continue;
+            }
             if c != '$' {
                 out.push(c);
                 continue;
@@ -808,7 +855,12 @@ impl Evaluator {
                 out.push('$');
                 continue;
             };
-            if next == '{' {
+            if next == '(' {
+                chars.next();
+                let body = read_paren_body(&mut chars)?;
+                let value = self.run_command_substitution(&body)?;
+                out.push_str(&value);
+            } else if next == '{' {
                 chars.next(); // consume `{`
                 let mut depth = 1usize;
                 let mut body = String::new();
@@ -1540,6 +1592,60 @@ fn parse_name_eq_value(arg: &str) -> Result<(alloc::string::String, alloc::strin
 
 /// True iff `s` is a POSIX shell identifier (`_` or letter, then
 /// `_` / letters / digits).
+/// Read a `$( … )` body up to and including the matching `)`. The
+/// leading `$(` is expected to have already been consumed. Returns
+/// the raw body between the parens (without the parens themselves).
+/// Nested parens are tracked so e.g. `$(echo (sub))` works.
+fn read_paren_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> Result<String> {
+    let mut depth = 1usize;
+    let mut body = String::new();
+    for c in chars.by_ref() {
+        if c == '(' {
+            depth += 1;
+            body.push(c);
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(body);
+            }
+            body.push(c);
+        } else {
+            body.push(c);
+        }
+    }
+    Err(KashError::Parse(
+        "unterminated `$(...)` command substitution".into(),
+    ))
+}
+
+/// Read a backtick body up to and including the matching backtick.
+/// The leading backtick is expected to have already been consumed.
+/// Inside a backtick body, `\\` escapes the next byte (the POSIX
+/// rule); other characters are passed through verbatim.
+fn read_backtick_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> Result<String> {
+    let mut body = String::new();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            return Ok(body);
+        }
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                if matches!(n, '$' | '`' | '\\') {
+                    chars.next();
+                    body.push(n);
+                    continue;
+                }
+            }
+            body.push('\\');
+            continue;
+        }
+        body.push(c);
+    }
+    Err(KashError::Parse(
+        "unterminated backtick command substitution".into(),
+    ))
+}
+
 /// Append `value` to `fields`, splitting on IFS bytes. Matches the
 /// POSIX rule "unquoted expansion results undergo field splitting"
 /// with a minimal-but-correct-for-the-common-case implementation:
@@ -2022,6 +2128,67 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== command substitution =====
+
+    #[test]
+    fn dollar_paren_substitution_basic() {
+        let (_, out, _) = run("echo $(echo hi)");
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn backtick_substitution_basic() {
+        let (_, out, _) = run("echo `echo hi`");
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn substitution_strips_trailing_newlines() {
+        let (_, out, _) = run("X=$(echo hi); echo [$X]");
+        assert_eq!(out, "[hi]\n");
+    }
+
+    #[test]
+    fn substitution_in_double_quotes_preserves_content() {
+        let (_, out, _) = run("echo \"$(echo one two)\"");
+        // Inside `"..."`, splitting doesn't fire, so the spaces in
+        // `one two` survive into a single arg.
+        assert_eq!(out, "one two\n");
+    }
+
+    #[test]
+    fn substitution_unquoted_splits_on_ifs() {
+        let (_, out, _) = run("for w in $(echo a b c); do echo $w; done");
+        assert_eq!(out, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn substitution_runs_in_subshell() {
+        // Assignments inside the substitution body must not leak.
+        let (_, _, ev) = run("Y=$(X=inner; echo $X)");
+        assert!(ev.scope().get("X").is_none());
+        assert_eq!(ev.scope().get("Y").unwrap().to_scalar_string(), "inner");
+    }
+
+    #[test]
+    fn nested_dollar_paren_substitution() {
+        let (_, out, _) = run("echo $(echo $(echo hi))");
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn substitution_in_assignment_rhs() {
+        let (_, _, ev) = run("X=$(echo computed); :");
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "computed");
+    }
+
+    #[test]
+    fn substitution_propagates_runtime_error() {
+        let prog = parse("X=$(false; nope_not_a_real_cmd_xyzzy)").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
     }
 
     // ===== IFS field splitting =====
