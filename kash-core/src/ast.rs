@@ -367,6 +367,16 @@ pub enum VenvSection {
         /// Textual spec produced by `parse_capabilities_section`.
         spec: crate::capability::CapabilitySpec,
     },
+    /// `imports { use namespace foo; use .bar.x as q; … }` —
+    /// auto-applied at venv body entry, auto-removed on exit.
+    /// Each entry is the *argument list* of a `use` invocation
+    /// (the `use` keyword itself is consumed by the parser); the
+    /// evaluator runs each through the same parser as the `use`
+    /// builtin.
+    Imports {
+        /// List of `use`-arg-lists, one per directive line.
+        statements: Vec<Vec<Word>>,
+    },
     /// `load-config PATH` — load capability + env (+ v.6 imports)
     /// from an external *data-only* TOML file. The path is taken
     /// verbatim from source (subject to ordinary expansion at

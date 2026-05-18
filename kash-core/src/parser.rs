@@ -909,10 +909,19 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 Ok(crate::ast::VenvSection::Env { directives })
             }
+            "imports" => {
+                let statements = self.parse_imports_section_body()?;
+                if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                    return Err(KashError::Parse(
+                        "expected `}` to close `imports { … }` section".into(),
+                    ));
+                }
+                self.bump()?;
+                Ok(crate::ast::VenvSection::Imports { statements })
+            }
             other => Err(KashError::Parse(alloc::format!(
                 "unknown venv section `{other}` — supported sections are \
-                 `body`, `capabilities`, `env`; imports / load-config land \
-                 in follow-up stages"
+                 `body`, `capabilities`, `env`, `imports`, `load-config`"
             ))),
         }
     }
@@ -1077,6 +1086,67 @@ impl<'src> Parser<'src> {
                     }
                 }
             }
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse the body of an `imports { … }` section. Each line is
+    /// `use ARG…` where the argument list mirrors the `use`
+    /// builtin's surface (`namespace foo [as u]`, `.foo.x [as y]`,
+    /// `.foo.{a,b}`, …). The `use` keyword is consumed; only the
+    /// argument list is captured here for the evaluator to feed
+    /// through `parse_use_args`.
+    fn parse_imports_section_body(&mut self) -> Result<Vec<Vec<Word>>> {
+        let mut out: Vec<Vec<Word>> = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `imports { … }` section".into(),
+                ));
+            }
+            // Each line must start with the literal word `use`.
+            if self.peek_bare_word()? != Some("use") {
+                return Err(KashError::Parse(
+                    "`imports { … }` directives must start with `use`".into(),
+                ));
+            }
+            self.bump()?; // consume `use`
+            let mut args: Vec<Word> = Vec::new();
+            loop {
+                match self.peek_kind()? {
+                    TokenKind::Newline
+                    | TokenKind::Op(Op::Semi)
+                    | TokenKind::Op(Op::Rbrace)
+                    | TokenKind::Eof => break,
+                    TokenKind::Word(_)
+                    | TokenKind::SingleQuoted(_)
+                    | TokenKind::DoubleQuoted(_)
+                    | TokenKind::AnsiCString(_) => {
+                        args.push(self.parse_word()?);
+                    }
+                    other => {
+                        return Err(KashError::Parse(format!(
+                            "unexpected {other:?} in `imports {{ … }}` directive"
+                        )));
+                    }
+                }
+            }
+            if args.is_empty() {
+                return Err(KashError::Parse(
+                    "`use` directive in `imports { … }` is missing arguments".into(),
+                ));
+            }
+            out.push(args);
             if matches!(
                 self.peek_kind()?,
                 TokenKind::Op(Op::Semi) | TokenKind::Newline

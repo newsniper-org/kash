@@ -1742,10 +1742,10 @@ impl<B: MapBackend> Evaluator<B> {
     }
 
     /// Evaluate a `venv NAME { … }` block. Materialise each
-    /// configuring section (`capabilities`, future env / imports /
-    /// load-config) into a fresh [`VenvFrame`], push it, run the
-    /// (at-most-one) `body { … }` section against it, then pop on
-    /// the way out.
+    /// configuring section into a fresh [`VenvFrame`], push it,
+    /// apply any namespace imports onto the active imports slot,
+    /// run the (at-most-one) `body { … }` section against the
+    /// frame, then strip the imports and pop the frame on exit.
     fn eval_venv_decl(
         &mut self,
         _name: &str,
@@ -1753,6 +1753,7 @@ impl<B: MapBackend> Evaluator<B> {
     ) -> Result<Outcome> {
         let mut frame = VenvFrame::new();
         let mut body: Option<&[Statement]> = None;
+        let mut import_entries: Vec<ImportEntry> = Vec::new();
         for section in sections {
             match section {
                 crate::ast::VenvSection::Body { statements } => {
@@ -1771,6 +1772,16 @@ impl<B: MapBackend> Evaluator<B> {
                 crate::ast::VenvSection::Env { directives } => {
                     frame.env_directives.extend(directives.iter().cloned());
                 }
+                crate::ast::VenvSection::Imports { statements } => {
+                    for arg_words in statements {
+                        let mut args: Vec<String> = Vec::with_capacity(arg_words.len());
+                        for w in arg_words {
+                            args.push(self.expand_word(w)?);
+                        }
+                        let entries = parse_use_args(&args)?;
+                        import_entries.extend(entries);
+                    }
+                }
                 crate::ast::VenvSection::LoadConfig { path } => {
                     let resolved = self.expand_word(path)?;
                     let (caps_spec, env_dirs) = load_venv_config(&resolved)?;
@@ -1784,10 +1795,26 @@ impl<B: MapBackend> Evaluator<B> {
             }
         }
         self.venv_stack.push(frame);
+        // Push the import entries onto the active imports slot.
+        // We record how many we added so we can pop *only* our
+        // contribution on exit, even if the body itself ran
+        // additional `use` statements.
+        let imports_added = import_entries.len();
+        if imports_added > 0
+            && let Some(frame) = self.imports.last_mut()
+        {
+            frame.extend(import_entries);
+        }
         let result = match body {
             Some(stmts) => self.eval_statements(stmts),
             None => Ok(Outcome::Status(0)),
         };
+        if imports_added > 0
+            && let Some(frame) = self.imports.last_mut()
+        {
+            let target = frame.len().saturating_sub(imports_added);
+            frame.truncate(target);
+        }
         self.venv_stack.pop();
         result
     }
@@ -8223,6 +8250,45 @@ mod tests {
         // The body is `:` (a noop) so no external spawn even
         // happens — this checks the spec materialises cleanly.
         assert!(ev.eval_program(&prog).is_ok());
+    }
+
+    #[test]
+    fn venv_imports_section_applies_namespace_import_to_body() {
+        let (_, out, _) = run(
+            "namespace utils { hi() { echo hi-from-utils; }; }\n\
+             venv myproj {\n\
+                 imports { use namespace utils }\n\
+                 body { hi; }\n\
+             }\n",
+        );
+        assert_eq!(out, "hi-from-utils\n");
+    }
+
+    #[test]
+    fn venv_imports_drop_on_exit() {
+        // After the venv ends, the bare `hi` reference must not
+        // resolve anymore — the imports were scoped to the venv.
+        let src = "namespace utils { unique_kash_hi() { echo h; }; }\n\
+                   venv myproj {\n\
+                       imports { use namespace utils }\n\
+                       body { unique_kash_hi; }\n\
+                   }\n\
+                   unique_kash_hi\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let _ = ev.eval_program(&prog);
+        let out = ev.take_output();
+        // The inner call ran; the outer one didn't (would either
+        // raise or fall through to external exec — either way no
+        // second "h" line).
+        assert_eq!(out.matches('h').count(), 1, "out: {out}");
+    }
+
+    #[test]
+    fn venv_imports_directive_without_use_keyword_rejected() {
+        let src = "venv myproj { imports { namespace utils }; body {}; }\n";
+        let prog = parse(src);
+        assert!(prog.is_err());
     }
 
     #[test]
