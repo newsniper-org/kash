@@ -38,12 +38,12 @@ use kash_macros::ifstd;
 
 pub mod ast;
 pub mod error;
+pub mod eval;
 pub mod lexer;
 pub mod mode;
 pub mod parser;
+pub mod scope;
 pub mod value;
-mod eval;
-mod scope;
 
 /// Semantic version of this crate, as in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
