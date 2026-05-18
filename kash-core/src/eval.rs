@@ -128,13 +128,15 @@ struct InstanceEntry {
     methods: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
 }
 
-/// One active virtual-environment frame. v.1 carries no
-/// configuration yet — it's a marker that says "we're inside a
-/// venv". v.2 attaches a capability set, v.3 an env / PATH
-/// overlay, v.6 namespace imports, etc.
+/// One active virtual-environment frame.
 #[derive(Clone, Debug, Default)]
 struct VenvFrame {
-    // Future fields hang here in follow-up stages.
+    /// Materialised capability set for the frame. Empty
+    /// [`CapabilitySet`] = "no `capabilities { … }` section was
+    /// given" = unrestricted. Callers must consult
+    /// [`Evaluator::is_capability_allowed`] /
+    /// [`Evaluator::is_cmd_allowed`] for the venv-aware check.
+    capabilities: crate::capability::CapabilitySet,
 }
 
 impl VenvFrame {
@@ -1731,30 +1733,79 @@ impl<B: MapBackend> Evaluator<B> {
         }
     }
 
-    /// Evaluate a `venv NAME { … }` block. v.1 semantics: push a
-    /// venv frame onto the stack, run the (at-most-one) `body { … }`
-    /// section's statements, then pop the frame. The frame is a
-    /// marker for now — future stages hang capability sets, env
-    /// overlays, and namespace imports off it.
+    /// Evaluate a `venv NAME { … }` block. Materialise each
+    /// configuring section (`capabilities`, future env / imports /
+    /// load-config) into a fresh [`VenvFrame`], push it, run the
+    /// (at-most-one) `body { … }` section against it, then pop on
+    /// the way out.
     fn eval_venv_decl(
         &mut self,
         _name: &str,
         sections: &[crate::ast::VenvSection],
     ) -> Result<Outcome> {
-        self.venv_stack.push(VenvFrame::new());
-        // v.1 surface: `body` is the only section; nothing else
-        // exists yet. Run it if present, fall through to a no-op
-        // 0-status outcome otherwise.
-        let body = sections
-            .iter()
-            .map(|crate::ast::VenvSection::Body { statements }| statements)
-            .next();
+        let mut frame = VenvFrame::new();
+        let mut body: Option<&[Statement]> = None;
+        for section in sections {
+            match section {
+                crate::ast::VenvSection::Body { statements } => {
+                    if body.is_some() {
+                        return Err(KashError::Parse(
+                            "multiple `body { … }` sections in one venv block".into(),
+                        ));
+                    }
+                    body = Some(statements);
+                }
+                crate::ast::VenvSection::Capabilities { spec } => {
+                    frame.capabilities = crate::capability::CapabilitySet::from_spec(spec)
+                        .map_err(KashError::Runtime)?;
+                }
+            }
+        }
+        self.venv_stack.push(frame);
         let result = match body {
             Some(stmts) => self.eval_statements(stmts),
             None => Ok(Outcome::Status(0)),
         };
         self.venv_stack.pop();
         result
+    }
+
+    /// True iff `cap` is permitted at the current point. With no
+    /// active venv frame, every capability is permitted (the venv
+    /// system only gates *inside* a venv). When multiple venv
+    /// frames are stacked, the *innermost* one's policy applies —
+    /// that's the lexical frame the running code is in.
+    #[must_use]
+    pub fn is_capability_allowed(&self, cap: crate::capability::Capability) -> bool {
+        match self.venv_stack.last() {
+            None => true,
+            Some(frame) => {
+                if frame.capabilities == crate::capability::CapabilitySet::default() {
+                    // No `capabilities { … }` section was given.
+                    return true;
+                }
+                frame.capabilities.allows(cap)
+            }
+        }
+    }
+
+    /// True iff the external command name `cmd` may be spawned at
+    /// the current point. With no active venv frame (or a venv
+    /// without a `capabilities { … }` section), every name passes.
+    /// Otherwise both `ExecSpawn` and the `allow-cmd` list (if any)
+    /// must clear it.
+    #[must_use]
+    pub fn is_cmd_allowed(&self, cmd: &str) -> bool {
+        match self.venv_stack.last() {
+            None => true,
+            Some(frame) => {
+                if frame.capabilities == crate::capability::CapabilitySet::default() {
+                    return true;
+                }
+                frame.capabilities.allows(crate::capability::Capability::ExecSpawn)
+                    && frame.capabilities.cmd_allowed(cmd)
+            }
+        }
     }
 
     /// Apply a `mode` declaration. Parses the spec, gates against
@@ -7694,10 +7745,10 @@ mod tests {
 
     #[test]
     fn venv_unknown_section_is_rejected() {
-        // v.1 surface is `body` only. Spelling `capabilities` or
-        // anything else must error out at parse time, not silently
-        // be interpreted as a command.
-        let src = "venv myproj { capabilities { profile basic; }; }\n";
+        // A typo'd section name must error at parse time so it
+        // doesn't silently become a command. `capabilities` is now
+        // a known section (v.2); pick a name that isn't.
+        let src = "venv myproj { capabilites { profile basic; }; }\n";
         let prog = parse(src);
         assert!(prog.is_err());
     }
@@ -7705,6 +7756,91 @@ mod tests {
     #[test]
     fn venv_name_with_embedded_dot_is_rejected() {
         assert!(parse("venv foo.bar { body {} }\n").is_err());
+    }
+
+    #[test]
+    fn venv_capabilities_section_parses_profile_only() {
+        // Smoke test: parse + execute, body just runs.
+        let (_, out, _) = run(
+            "venv myproj {\n\
+                 capabilities { profile basic }\n\
+                 body { echo inside }\n\
+             }\n",
+        );
+        assert_eq!(out, "inside\n");
+    }
+
+    #[test]
+    fn venv_capabilities_section_parses_grants_and_revokes() {
+        let (_, out, _) = run(
+            "venv myproj {\n\
+                 capabilities {\n\
+                     profile basic\n\
+                     + fs-write\n\
+                     - exec-spawn\n\
+                 }\n\
+                 body { echo ok }\n\
+             }\n",
+        );
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn venv_capabilities_section_parses_allow_cmd_list() {
+        let (_, out, _) = run(
+            "venv myproj {\n\
+                 capabilities {\n\
+                     profile basic\n\
+                     allow-cmd ls cat grep\n\
+                 }\n\
+                 body { echo ok }\n\
+             }\n",
+        );
+        assert_eq!(out, "ok\n");
+    }
+
+    #[test]
+    fn venv_unknown_profile_rejected_at_run_time() {
+        let src = "venv myproj { capabilities { profile no-such-thing }; body {}; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("unknown") && msg.contains("profile"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_unknown_capability_name_rejected_at_run_time() {
+        let src = "venv myproj { capabilities { + nosuchcap }; body {}; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("unknown capability"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_capability_checks_reflect_active_frame() {
+        // Build a program where the body asks the evaluator for a
+        // capability check via the public API — done in-test by
+        // executing a body that's a no-op, then peeking at the
+        // evaluator from outside. Here we just confirm the
+        // pop-on-exit invariant.
+        let prog = parse(
+            "venv tight {\n\
+                 capabilities { profile none }\n\
+                 body { echo inside }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut ev = Evaluator::new();
+        // Before the program runs: no venv, everything allowed.
+        assert!(ev.is_capability_allowed(crate::capability::Capability::ExecSpawn));
+        assert!(ev.is_cmd_allowed("anything"));
+        ev.eval_program(&prog).unwrap();
+        // After the program ran: frame popped, everything allowed
+        // again.
+        assert!(ev.is_capability_allowed(crate::capability::Capability::ExecSpawn));
     }
 
     #[test]

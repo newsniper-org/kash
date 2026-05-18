@@ -881,11 +881,122 @@ impl<'src> Parser<'src> {
                 self.bump()?;
                 Ok(crate::ast::VenvSection::Body { statements })
             }
+            "capabilities" => {
+                let spec = self.parse_capabilities_section_body()?;
+                if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                    return Err(KashError::Parse(
+                        "expected `}` to close `capabilities { … }` section".into(),
+                    ));
+                }
+                self.bump()?;
+                Ok(crate::ast::VenvSection::Capabilities { spec })
+            }
             other => Err(KashError::Parse(alloc::format!(
-                "unknown venv section `{other}` — v.1 only supports `body`; \
-                 capabilities / env / imports / load-config are follow-up stages"
+                "unknown venv section `{other}` — supported sections are \
+                 `body`, `capabilities`; env / imports / load-config land \
+                 in follow-up stages"
             ))),
         }
+    }
+
+    /// Read a single bare word — any contiguous run of word bytes,
+    /// including hyphens and digits. Distinct from
+    /// `expect_bare_identifier` which enforces POSIX
+    /// `[_A-Za-z][_A-Za-z0-9]*`. Used inside the `capabilities { … }`
+    /// section where directive names (`allow-cmd`) and capability
+    /// names (`fs-write`) carry hyphens.
+    fn expect_bare_word(&mut self, what: &str) -> Result<String> {
+        let word = self
+            .peek_bare_word()?
+            .ok_or_else(|| KashError::Parse(format!("expected {what}")))?
+            .to_string();
+        self.bump()?;
+        Ok(word)
+    }
+
+    /// Parse the *inside* of a `capabilities { … }` section
+    /// (between the opening `{` and the closing `}`). Each line is
+    /// one directive:
+    ///   * `profile NAME`
+    ///   * `+ NAME` — grant the capability
+    ///   * `- NAME` — revoke the capability
+    ///   * `allow-cmd NAME …` — set the external-command allow-list
+    ///
+    /// Lines are separated by `\n` or `;`.
+    fn parse_capabilities_section_body(
+        &mut self,
+    ) -> Result<crate::capability::CapabilitySpec> {
+        let mut spec = crate::capability::CapabilitySpec::default();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `capabilities { … }` section".into(),
+                ));
+            }
+            // First word on the line — the directive keyword. Bare
+            // words only; quoted forms are user error here.
+            let head = self
+                .peek_bare_word()?
+                .ok_or_else(|| {
+                    KashError::Parse(
+                        "expected a capability directive inside `capabilities { … }`".into(),
+                    )
+                })?
+                .to_string();
+            match head.as_str() {
+                "profile" => {
+                    self.bump()?;
+                    let name = self.expect_bare_word("profile name")?;
+                    if spec.profile.is_some() {
+                        return Err(KashError::Parse(
+                            "multiple `profile` directives in one `capabilities { … }` section"
+                                .into(),
+                        ));
+                    }
+                    spec.profile = Some(name);
+                }
+                "+" => {
+                    self.bump()?;
+                    let name = self.expect_bare_word("capability name to grant")?;
+                    spec.grants.push(name);
+                }
+                "-" => {
+                    self.bump()?;
+                    let name = self.expect_bare_word("capability name to revoke")?;
+                    spec.revokes.push(name);
+                }
+                "allow-cmd" => {
+                    self.bump()?;
+                    let mut list: Vec<String> = Vec::new();
+                    while self.peek_bare_word()?.is_some()
+                        && !matches!(
+                            self.peek_kind()?,
+                            TokenKind::Newline | TokenKind::Op(Op::Semi) | TokenKind::Op(Op::Rbrace)
+                        )
+                    {
+                        list.push(self.expect_bare_word("allow-cmd entry")?);
+                    }
+                    spec.allow_cmd = Some(list);
+                }
+                other => {
+                    return Err(KashError::Parse(alloc::format!(
+                        "unknown capability directive `{other}` — expected one of \
+                         `profile`, `+`, `-`, `allow-cmd`"
+                    )));
+                }
+            }
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        Ok(spec)
     }
 
     // ---------- namespace ----------

@@ -349,8 +349,7 @@ pub enum CompoundKind {
 
 /// One section inside a [`CompoundKind::VenvDecl`] body.
 /// Each variant maps to a `<keyword> { … }` block at venv-body
-/// position. v.1 only ships `Body`; future stages add
-/// `Capabilities`, `Env`, `Imports`, and `LoadConfig`.
+/// position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VenvSection {
     /// `body { … }` — statements that run *inside* the venv frame.
@@ -359,6 +358,14 @@ pub enum VenvSection {
     Body {
         /// Statements to run under the venv frame.
         statements: Vec<Statement>,
+    },
+    /// `capabilities { … }` — capability profile + fine-grained
+    /// grant / revoke + external-command allow-list. The spec is
+    /// captured textually here; the evaluator materialises it into
+    /// a runtime capability set when the venv frame is pushed.
+    Capabilities {
+        /// Textual spec produced by `parse_capabilities_section`.
+        spec: crate::capability::CapabilitySpec,
     },
 }
 

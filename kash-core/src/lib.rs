@@ -37,6 +37,7 @@ extern crate alloc;
 use kash_macros::ifstd;
 
 pub mod ast;
+pub mod capability;
 pub mod collections;
 pub mod error;
 pub mod eval;
