@@ -297,12 +297,20 @@ pub enum CompoundKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeclassMember {
     /// A method with a default implementation body. Same shape as a
-    /// top-level function definition.
+    /// top-level function definition. Source form: `name() body`.
     Default {
         /// Method name.
         name: String,
         /// Method body.
         body: alloc::boxed::Box<CompoundCommand>,
+    },
+    /// A signature-only (abstract) method. Source form: `name()`
+    /// with no body. Every instance of the typeclass must provide a
+    /// concrete implementation; instance-registration time enforces
+    /// that.
+    Signature {
+        /// Method name.
+        name: String,
     },
 }
 

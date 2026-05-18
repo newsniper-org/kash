@@ -98,12 +98,26 @@ pub struct ShellOptions {
     pub xtrace: bool,
 }
 
-/// One registered typeclass. Stores the default-method bodies; an
-/// instance can later override individual entries.
+/// One registered typeclass. Tracks both members that carry a
+/// default implementation and abstract (signature-only) members.
+/// `instance` registration enforces that every abstract member has
+/// a concrete impl and that the instance does not introduce names
+/// the typeclass never declared.
 #[derive(Clone, Debug)]
 struct TypeclassEntry {
     /// Default-method bodies keyed by method name.
     defaults: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
+    /// Abstract (signature-only) method names. An instance must
+    /// provide a body for each of these.
+    abstracts: alloc::collections::BTreeSet<String>,
+}
+
+impl TypeclassEntry {
+    /// True iff `method` is declared by this typeclass (either
+    /// abstract or with a default body).
+    fn declares(&self, method: &str) -> bool {
+        self.defaults.contains_key(method) || self.abstracts.contains(method)
+    }
 }
 
 /// One registered instance: concrete method bodies for a given
@@ -1202,17 +1216,37 @@ impl<B: MapBackend> Evaluator<B> {
                 Ok(Outcome::Status(0))
             }
             CompoundKind::TypeclassDef { name, items } => {
+                let mut defaults: alloc::collections::BTreeMap<
+                    String,
+                    alloc::boxed::Box<CompoundCommand>,
+                > = alloc::collections::BTreeMap::new();
+                let mut abstracts: alloc::collections::BTreeSet<String> =
+                    alloc::collections::BTreeSet::new();
+                for m in items {
+                    match m {
+                        crate::ast::TypeclassMember::Default { name: n, body } => {
+                            if defaults.contains_key(n) || abstracts.contains(n) {
+                                return Err(KashError::Parse(alloc::format!(
+                                    "typeclass `{name}` declares method `{n}` twice"
+                                )));
+                            }
+                            defaults.insert(n.clone(), body.clone());
+                        }
+                        crate::ast::TypeclassMember::Signature { name: n } => {
+                            if defaults.contains_key(n) || abstracts.contains(n) {
+                                return Err(KashError::Parse(alloc::format!(
+                                    "typeclass `{name}` declares method `{n}` twice"
+                                )));
+                            }
+                            abstracts.insert(n.clone());
+                        }
+                    }
+                }
                 self.typeclasses.insert(
                     name.clone(),
                     TypeclassEntry {
-                        defaults: items
-                            .iter()
-                            .map(|m| match m {
-                                crate::ast::TypeclassMember::Default { name: n, body } => {
-                                    (n.clone(), body.clone())
-                                }
-                            })
-                            .collect(),
+                        defaults,
+                        abstracts,
                     },
                 );
                 Ok(Outcome::Status(0))
@@ -1222,20 +1256,42 @@ impl<B: MapBackend> Evaluator<B> {
                 for_type,
                 items,
             } => {
+                // Validate against the typeclass declaration: every
+                // abstract member must be supplied, and the instance
+                // must not introduce names the typeclass never
+                // declared. The typeclass itself must already exist.
+                let Some(tc_entry) = self.typeclasses.get(typeclass) else {
+                    return Err(KashError::NotFound(alloc::format!(
+                        "typeclass `{typeclass}` (cannot define an instance for an undeclared typeclass)"
+                    )));
+                };
+                let mut methods: alloc::collections::BTreeMap<
+                    String,
+                    alloc::boxed::Box<CompoundCommand>,
+                > = alloc::collections::BTreeMap::new();
+                for m in items {
+                    let crate::ast::InstanceMember::Method { name: n, body } = m;
+                    if !tc_entry.declares(n) {
+                        return Err(KashError::Parse(alloc::format!(
+                            "instance `{typeclass} for {for_type}` defines `{n}`, but typeclass `{typeclass}` does not declare it"
+                        )));
+                    }
+                    if methods.contains_key(n) {
+                        return Err(KashError::Parse(alloc::format!(
+                            "instance `{typeclass} for {for_type}` defines method `{n}` twice"
+                        )));
+                    }
+                    methods.insert(n.clone(), body.clone());
+                }
+                for required in &tc_entry.abstracts {
+                    if !methods.contains_key(required) {
+                        return Err(KashError::Parse(alloc::format!(
+                            "instance `{typeclass} for {for_type}` is missing abstract method `{required}`"
+                        )));
+                    }
+                }
                 let key = (typeclass.clone(), for_type.clone());
-                self.instances.insert(
-                    key,
-                    InstanceEntry {
-                        methods: items
-                            .iter()
-                            .map(|m| match m {
-                                crate::ast::InstanceMember::Method { name: n, body } => {
-                                    (n.clone(), body.clone())
-                                }
-                            })
-                            .collect(),
-                    },
-                );
+                self.instances.insert(key, InstanceEntry { methods });
                 Ok(Outcome::Status(0))
             }
         }
@@ -5677,6 +5733,102 @@ mod tests {
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         assert_eq!(err.exit_code(), 127);
+    }
+
+    // ===== typeclass / instance — stage 4: signature-only members =====
+
+    #[test]
+    fn signature_only_member_dispatches_to_instance() {
+        // `say()` has no body — every instance must supply one.
+        let (_, out, _) = run(
+            "typeclass Greet { say(); }\n\
+             instance Greet for Int { say() { echo int $1; }; }\n\
+             Greet::Int::say 7\n",
+        );
+        assert_eq!(out, "int 7\n");
+    }
+
+    #[test]
+    fn signature_only_member_with_no_matching_instance_is_error() {
+        // No instance was defined — the call has no body to run.
+        let src = "typeclass Greet { say(); }\n\
+                   instance Greet for String { say() { echo s; }; }\n\
+                   Greet::Int::say\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn instance_missing_abstract_method_is_rejected() {
+        // The typeclass declares `say()` and `wave()`; the instance
+        // only supplies `say` — registration must reject this.
+        let src = "typeclass Greet { say(); wave(); }\n\
+                   instance Greet for Int { say() { echo s; }; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("missing abstract method"), "got: {msg}");
+        assert!(msg.contains("wave"), "got: {msg}");
+    }
+
+    #[test]
+    fn instance_for_unknown_typeclass_is_rejected() {
+        let src = "instance Greet for Int { say() { echo s; }; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn instance_with_extraneous_method_is_rejected() {
+        // Typeclass declares only `say`; instance also defines
+        // `extra` — extras are rejected to keep the typeclass
+        // surface authoritative.
+        let src = "typeclass Greet { say() { echo d; }; }\n\
+                   instance Greet for Int { say() { echo s; }; extra() { echo x; }; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("does not declare"), "got: {msg}");
+        assert!(msg.contains("extra"), "got: {msg}");
+    }
+
+    #[test]
+    fn typeclass_duplicate_member_is_rejected() {
+        let src = "typeclass Greet { say(); say() { echo d; }; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("twice"), "got: {msg}");
+    }
+
+    #[test]
+    fn signature_only_and_default_can_coexist() {
+        // Mixing abstract and default members in the same typeclass
+        // must be supported, with instances overriding either.
+        let (_, out, _) = run(
+            "typeclass Greet { say(); wave() { echo default-wave; }; }\n\
+             instance Greet for Int { say() { echo int-say; }; }\n\
+             Greet::Int::say\n\
+             Greet::Int::wave\n",
+        );
+        assert_eq!(out, "int-say\ndefault-wave\n");
+    }
+
+    #[test]
+    fn instance_can_override_default_too() {
+        let (_, out, _) = run(
+            "typeclass Greet { say() { echo default; }; }\n\
+             instance Greet for Int { say() { echo overridden; }; }\n\
+             Greet::Int::say\n",
+        );
+        assert_eq!(out, "overridden\n");
     }
 
     #[test]

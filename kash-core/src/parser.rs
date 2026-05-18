@@ -659,9 +659,10 @@ impl<'src> Parser<'src> {
 
     // ---------- typeclass / instance ----------
 
-    /// Parse `typeclass NAME { … }`. Body items are ordinary function
-    /// definitions; signature-only declarations land with the
-    /// dispatch commit.
+    /// Parse `typeclass NAME { … }`. Each body item is either a
+    /// *default* method (`name() body`) or a *signature-only*
+    /// abstract method (`name()` with no body). Mixing both inside a
+    /// single typeclass is allowed.
     fn parse_typeclass_def(&mut self) -> Result<CompoundCommand> {
         let kw = self.bump()?; // "typeclass"
         let start = kw.span.start;
@@ -684,12 +685,7 @@ impl<'src> Parser<'src> {
                     "unterminated `typeclass { … }` block".into(),
                 ));
             }
-            let cmd = self.parse_command()?;
-            let func = extract_function_def(cmd)?;
-            items.push(crate::ast::TypeclassMember::Default {
-                name: func.0,
-                body: func.1,
-            });
+            items.push(self.parse_typeclass_member()?);
             if matches!(
                 self.peek_kind()?,
                 TokenKind::Op(Op::Semi) | TokenKind::Newline
@@ -705,6 +701,38 @@ impl<'src> Parser<'src> {
             redirects,
             span: Span::new(start, end),
         })
+    }
+
+    /// Parse a single member inside `typeclass { … }`. Accepts
+    /// `name() body` (default impl) and `name()` (signature-only).
+    fn parse_typeclass_member(&mut self) -> Result<crate::ast::TypeclassMember> {
+        let method_name = self.expect_bare_identifier("typeclass member name")?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lparen)) {
+            return Err(KashError::Parse(alloc::format!(
+                "expected `()` after typeclass member `{method_name}`"
+            )));
+        }
+        self.bump()?; // (
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rparen)) {
+            return Err(KashError::Parse(alloc::format!(
+                "expected `)` after `{method_name}(`"
+            )));
+        }
+        self.bump()?; // )
+        // Look past insignificant whitespace and decide: body-or-not.
+        // A function body starts with one of the compound-command
+        // opener tokens; anything else (`;`, newline, `}`) ends the
+        // member declaration as a signature-only entry.
+        self.skip_newlines()?;
+        if self.peek_function_body_start()? {
+            let body = self.parse_function_body()?;
+            Ok(crate::ast::TypeclassMember::Default {
+                name: method_name,
+                body: alloc::boxed::Box::new(body),
+            })
+        } else {
+            Ok(crate::ast::TypeclassMember::Signature { name: method_name })
+        }
     }
 
     /// Parse `instance NAME for TYPE { … }`.
@@ -965,6 +993,27 @@ impl<'src> Parser<'src> {
             caps.push(name.to_string());
         }
         Ok(caps)
+    }
+
+    /// True iff the *next* token can start a function body (any
+    /// compound command shape that `parse_function_body` accepts).
+    /// Used by typeclass-member parsing to distinguish `name() body`
+    /// from a signature-only `name()`.
+    fn peek_function_body_start(&mut self) -> Result<bool> {
+        Ok(match self.peek_kind()? {
+            TokenKind::Op(Op::Lbrace) | TokenKind::Op(Op::Lparen) => true,
+            TokenKind::Word(_) => matches!(
+                self.peek_reserved()?,
+                Some(
+                    Reserved::If
+                        | Reserved::While
+                        | Reserved::Until
+                        | Reserved::For
+                        | Reserved::Case
+                )
+            ),
+            _ => false,
+        })
     }
 
     /// Parse a function body — any compound command (POSIX requires a
