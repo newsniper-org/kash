@@ -336,6 +336,20 @@ impl<B: MapBackend> Evaluator<B> {
         self.positionals = args;
     }
 
+    /// Seed a single export-flagged binding. Used by CLI entry
+    /// points to surface the inherited process environment (each
+    /// entry is registered as `name=value` with `export` set, so
+    /// child commands see it through `apply_exported_env`).
+    pub fn set_env_var(&mut self, name: &str, value: &str) -> Result<()> {
+        self.scope.assign(name, Value::Scalar(value.into()))?;
+        let attrs = crate::scope::AttrSet {
+            export: true,
+            ..crate::scope::AttrSet::default()
+        };
+        self.scope.apply_attrs(name, &attrs)?;
+        Ok(())
+    }
+
     /// Active mode.
     #[inline]
     #[must_use]

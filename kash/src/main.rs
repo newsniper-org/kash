@@ -67,6 +67,20 @@ fn main() -> ExitCode {
         }
     };
     let mut ev = Evaluator::<kash_core::collections::BTreeBackend>::with_mode(mode);
+    // Seed the inherited process environment as export-flagged
+    // bindings — same surface a real shell presents. `kash`
+    // invocations under `posix-strict` follow POSIX behaviour
+    // (every env entry visible as a parameter).
+    for (k, v) in env::vars() {
+        // Only valid POSIX-style names land here; the rest stay
+        // reachable through child processes (we still hand them
+        // back at spawn time) but aren't bound in-shell.
+        if is_valid_env_name(&k)
+            && let Err(e) = ev.set_env_var(&k, &v)
+        {
+            eprintln!("{invocation}: warning: skipped env `{k}`: {e}");
+        }
+    }
     ev.set_positionals(parsed.positional);
     let outcome = ev.eval_program(&prog);
     let captured = ev.take_output();
@@ -168,6 +182,22 @@ fn read_source(invocation: &CliInvocation, name: &str) -> Result<String, ExitCod
             Err(ExitCode::from(1))
         }
     }
+}
+
+/// POSIX env-var name: `[A-Za-z_][A-Za-z0-9_]*`. Other names (e.g.
+/// the `=NAME` variants some processes export) can't be reached by
+/// `$NAME` anyway, so we skip them on inherit and let them flow
+/// straight through to spawned children.
+fn is_valid_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// Shells return exit statuses in `0..=255`. Clamp anything wider —
