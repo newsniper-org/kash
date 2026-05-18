@@ -16,7 +16,7 @@
 //! they land in the next commit.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -123,6 +123,14 @@ pub struct Evaluator {
     /// Function registry: name → definition. Functions live in a flat
     /// table for now; namespace scoping lights up later.
     functions: BTreeMap<String, FunctionEntry>,
+    /// Alias table: NAME → expansion text. Substitution happens at
+    /// the start of a simple command's dispatch — the first
+    /// (already-expanded) argv slot is matched against this table,
+    /// and on a hit the slot is replaced by the alias body split on
+    /// whitespace. Recursion is bounded per-command by an
+    /// already-seen set so a self-referential alias (e.g.
+    /// `alias ls='ls --color'`) terminates.
+    aliases: BTreeMap<String, String>,
     /// Trap action registry: signal name → command source. Names are
     /// normalised to upper-case without a `SIG` prefix
     /// (`INT`, `TERM`, `EXIT`, …). The pseudo-signals `EXIT` / `ERR`
@@ -161,6 +169,7 @@ impl Evaluator {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             traps: BTreeMap::new(),
             in_trap: false,
             options: ShellOptions::default(),
@@ -191,6 +200,11 @@ impl Evaluator {
     #[must_use]
     pub fn scope(&self) -> &Scope {
         &self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aliases_for_test(&self) -> &BTreeMap<String, String> {
+        &self.aliases
     }
 
     /// Drain the accumulated output buffer, returning its contents.
@@ -364,6 +378,32 @@ impl Evaluator {
             // an empty word list lands here too).
             return Ok(Outcome::Status(0));
         }
+        // Alias resolution: substitute the first slot from
+        // `self.aliases`, splitting the expansion text on whitespace.
+        // Loop so chained aliases work, but bound the loop with an
+        // already-seen set so a self-referential entry can't recurse
+        // forever.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let head = argv[0].clone();
+            if seen.contains(&head) {
+                break;
+            }
+            let Some(body) = self.aliases.get(&head).cloned() else {
+                break;
+            };
+            seen.insert(head);
+            let parts: Vec<String> = body
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if parts.is_empty() {
+                break;
+            }
+            let tail: Vec<String> = argv.split_off(1);
+            argv = parts;
+            argv.extend(tail);
+        }
         if !cmd.redirects.is_empty() {
             #[cfg(feature = "std")]
             {
@@ -399,6 +439,8 @@ impl Evaluator {
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
             "trap" => self.builtin_trap(&argv[1..]),
+            "alias" => self.builtin_alias(&argv[1..]),
+            "unalias" => self.builtin_unalias(&argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -551,6 +593,59 @@ impl Evaluator {
         for arg in args {
             let (name, value) = parse_name_eq_value(arg)?;
             self.scope.assign_local(&name, Value::Scalar(value))?;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// `alias [NAME[=VALUE] ...]` builtin.
+    ///
+    /// - `alias` with no args lists every entry (`alias NAME='VALUE'`,
+    ///   one per line).
+    /// - `alias NAME=VALUE` installs / overwrites an entry.
+    /// - `alias NAME` (no `=`) prints just that entry; errors if the
+    ///   name is unset.
+    fn builtin_alias(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.is_empty() {
+            for (name, value) in &self.aliases {
+                self.output
+                    .push_str(&alloc::format!("alias {name}='{value}'\n"));
+            }
+            return Ok(Outcome::Status(0));
+        }
+        for arg in args {
+            if let Some(eq) = arg.find('=') {
+                let (name, rest) = arg.split_at(eq);
+                if !is_identifier(name) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "alias: `{name}` is not a valid identifier"
+                    )));
+                }
+                self.aliases
+                    .insert(name.to_string(), rest[1..].to_string());
+            } else {
+                match self.aliases.get(arg) {
+                    Some(v) => self
+                        .output
+                        .push_str(&alloc::format!("alias {arg}='{v}'\n")),
+                    None => {
+                        return Err(KashError::Runtime(alloc::format!(
+                            "alias: {arg}: not found"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// `unalias [-a] NAME ...` builtin. `-a` removes everything.
+    fn builtin_unalias(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.first().map(|s| s.as_str()) == Some("-a") {
+            self.aliases.clear();
+            return Ok(Outcome::Status(0));
+        }
+        for name in args {
+            self.aliases.remove(name);
         }
         Ok(Outcome::Status(0))
     }
@@ -1854,6 +1949,8 @@ ifstd!({
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
                 "trap" => self.builtin_trap(&argv[1..]),
+                "alias" => self.builtin_alias(&argv[1..]),
+                "unalias" => self.builtin_unalias(&argv[1..]),
                 other => Err(KashError::Runtime(alloc::format!(
                     "internal: dispatch_builtin called for `{other}`"
                 ))),
@@ -2044,6 +2141,8 @@ fn is_builtin_name(name: &str) -> bool {
             | "test"
             | "["
             | "trap"
+            | "alias"
+            | "unalias"
     )
 }
 
@@ -4048,6 +4147,54 @@ mod tests {
         assert_eq!(out, "not_bar\n");
         let (_, out, _) = run("X=bar; case $X in !(bar)) echo not_bar;; *) echo bar;; esac");
         assert_eq!(out, "bar\n");
+    }
+
+    // ===== alias / unalias =====
+
+    #[test]
+    fn alias_substitutes_first_word() {
+        let (_, out, _) = run("alias greet='echo hello'; greet");
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn alias_preserves_trailing_args() {
+        let (_, out, _) = run("alias say='echo hi'; say world");
+        assert_eq!(out, "hi world\n");
+    }
+
+    #[test]
+    fn alias_chains_through_other_aliases() {
+        let (_, out, _) = run("alias a='echo first'; alias b=a; b");
+        assert_eq!(out, "first\n");
+    }
+
+    #[test]
+    fn alias_self_reference_terminates() {
+        // `alias true=true` would loop forever without the seen-set
+        // guard.
+        let (o, _, _) = run("alias true=true; true");
+        assert_eq!(o, Outcome::Status(0));
+    }
+
+    #[test]
+    fn unalias_removes_entry() {
+        let prog = parse("alias foo='echo hi'; unalias foo; foo").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn unalias_a_removes_everything() {
+        let (_, _, ev) = run("alias x=y; alias p=q; unalias -a");
+        assert!(ev.aliases_for_test().is_empty());
+    }
+
+    #[test]
+    fn alias_listing_emits_quoted_form() {
+        let (_, out, _) = run("alias greet='echo hi'; alias");
+        assert!(out.contains("alias greet='echo hi'"), "got: {out:?}");
     }
 
     // ===== trap / exit handler =====
