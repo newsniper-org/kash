@@ -420,6 +420,44 @@ impl<'src> Lexer<'src> {
     fn read_word(&mut self, start: usize) -> Result<Token, KashError> {
         while let Some(b) = self.peek() {
             if is_word_byte(b) {
+                // `${...}` parameter expansion: brace-delimited, may
+                // contain word terminators (`}` in the brace body is
+                // not a closer for the outer word). Absorb the whole
+                // brace body so the parser sees one `Word` token.
+                if b == b'$' && self.peek_at(1) == Some(b'{') {
+                    self.pos += 2; // `${`
+                    let mut depth = 1usize;
+                    while let Some(c) = self.peek() {
+                        self.pos += 1;
+                        if c == b'{' {
+                            depth += 1;
+                        } else if c == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    if depth != 0 {
+                        return Err(KashError::Parse(alloc::format!(
+                            "unterminated `${{...}}` at offset {start}"
+                        )));
+                    }
+                    continue;
+                }
+                if b == b'$' {
+                    // `$` followed by one of the single-byte specials
+                    // (`?`, `#`, `$`, `!`, `@`, `*`, or `0`-`9`) is a
+                    // single parameter reference. The trailing byte is
+                    // *not* a word-byte on its own (`#` would start a
+                    // comment, etc.), so absorb it explicitly here.
+                    if let Some(n) = self.peek_at(1) {
+                        if matches!(n, b'?' | b'#' | b'$' | b'!' | b'@' | b'*' | b'0'..=b'9') {
+                            self.pos += 2;
+                            continue;
+                        }
+                    }
+                }
                 self.pos += 1;
             } else if b == b'\\' {
                 if self.peek_at(1) == Some(b'\n') {
