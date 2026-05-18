@@ -88,6 +88,10 @@ pub struct ShellOptions {
     /// non-zero stage's, falling back to zero only if every stage
     /// succeeded.
     pub pipefail: bool,
+    /// `xtrace` / `-x` — print every simple command's expanded argv
+    /// to the trace buffer prefixed with the value of `PS4` (default
+    /// `"+ "`) before running it.
+    pub xtrace: bool,
 }
 
 /// One registered function. Stored owned so the call site doesn't
@@ -110,6 +114,11 @@ pub struct Evaluator {
     /// when (and where) to display it; the evaluator never touches
     /// real I/O. That keeps the engine `no_std + alloc` friendly.
     output: String,
+    /// Mirror of stderr for `set -x` (xtrace) lines and any future
+    /// diagnostic emission. Kept separate from `output` so a host
+    /// that wants to route it elsewhere (a real `stderr` fd, a debug
+    /// pane, …) can drain just this buffer.
+    trace_output: String,
     /// Currently active mode. Not yet consulted (mode declarations
     /// aren't wired in), but threaded so callers can construct an
     /// evaluator under e.g. `default-secure`.
@@ -165,6 +174,7 @@ impl Evaluator {
             scope: Scope::new(),
             last_status: 0,
             output: String::new(),
+            trace_output: String::new(),
             mode,
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
@@ -211,6 +221,12 @@ impl Evaluator {
     /// The internal buffer is left empty.
     pub fn take_output(&mut self) -> String {
         core::mem::take(&mut self.output)
+    }
+
+    /// Drain the accumulated trace buffer (xtrace lines), returning
+    /// its contents. The internal buffer is left empty.
+    pub fn take_trace_output(&mut self) -> String {
+        core::mem::take(&mut self.trace_output)
     }
 
     /// Evaluate a full program. The returned [`Outcome`] is the *last*
@@ -404,6 +420,10 @@ impl Evaluator {
             argv = parts;
             argv.extend(tail);
         }
+        // xtrace emission happens after alias substitution but
+        // before redirect application, so the trace shows the
+        // command exactly as it will run.
+        self.maybe_xtrace(&argv);
         if !cmd.redirects.is_empty() {
             #[cfg(feature = "std")]
             {
@@ -546,6 +566,7 @@ impl Evaluator {
             "errexit" => self.options.errexit = on,
             "nounset" => self.options.nounset = on,
             "pipefail" => self.options.pipefail = on,
+            "xtrace" => self.options.xtrace = on,
             other => {
                 return Err(KashError::Runtime(alloc::format!(
                     "set -o: unknown option `{other}`"
@@ -559,6 +580,7 @@ impl Evaluator {
         match c {
             'e' => self.options.errexit = on,
             'u' => self.options.nounset = on,
+            'x' => self.options.xtrace = on,
             other => {
                 return Err(KashError::Runtime(alloc::format!(
                     "set: unknown option `-{other}`"
@@ -566,6 +588,30 @@ impl Evaluator {
             }
         }
         Ok(())
+    }
+
+    /// Emit `argv` to the trace buffer if `xtrace` is on. PS4 (default
+    /// `"+ "`) prefixes each line; arguments are joined with a single
+    /// space. Quoting is *not* re-applied (matching bash's minimal
+    /// xtrace output) — the trace is a debugging aid, not a precise
+    /// re-serialisation.
+    fn maybe_xtrace(&mut self, argv: &[String]) {
+        if !self.options.xtrace {
+            return;
+        }
+        let ps4 = self
+            .scope
+            .get("PS4")
+            .map(|v| v.to_scalar_string())
+            .unwrap_or_else(|| "+ ".into());
+        self.trace_output.push_str(&ps4);
+        for (i, a) in argv.iter().enumerate() {
+            if i > 0 {
+                self.trace_output.push(' ');
+            }
+            self.trace_output.push_str(a);
+        }
+        self.trace_output.push('\n');
     }
 
     fn builtin_unset(&mut self, args: &[String]) -> Result<Outcome> {
@@ -4147,6 +4193,59 @@ mod tests {
         assert_eq!(out, "not_bar\n");
         let (_, out, _) = run("X=bar; case $X in !(bar)) echo not_bar;; *) echo bar;; esac");
         assert_eq!(out, "bar\n");
+    }
+
+    // ===== xtrace (-x / set -o xtrace) =====
+
+    #[test]
+    fn xtrace_emits_command_to_trace_buffer() {
+        let prog = parse("set -x; echo hi").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let trace = ev.take_trace_output();
+        assert!(trace.contains("+ echo hi"), "got: {trace:?}");
+        assert_eq!(ev.take_output(), "hi\n");
+    }
+
+    #[test]
+    fn xtrace_off_after_plus_x() {
+        let prog = parse("set -x; echo a; set +x; echo b").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let trace = ev.take_trace_output();
+        assert!(trace.contains("+ echo a"));
+        assert!(!trace.contains("+ echo b"), "trace = {trace:?}");
+    }
+
+    #[test]
+    fn xtrace_traces_every_command_including_builtins() {
+        let prog = parse("set -x; X=1; true; echo done").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let trace = ev.take_trace_output();
+        // `X=1` is an assignment-only command with no words; nothing
+        // to trace. `true` and `echo done` should show up.
+        assert!(trace.contains("+ true"), "got: {trace:?}");
+        assert!(trace.contains("+ echo done"), "got: {trace:?}");
+    }
+
+    #[test]
+    fn xtrace_honours_custom_ps4() {
+        let prog = parse("PS4='> '; set -x; echo go").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let trace = ev.take_trace_output();
+        assert!(trace.contains("> echo go"), "got: {trace:?}");
+    }
+
+    #[test]
+    fn xtrace_via_set_o_xtrace() {
+        let prog = parse("set -o xtrace; echo on; set +o xtrace; echo off").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let trace = ev.take_trace_output();
+        assert!(trace.contains("+ echo on"));
+        assert!(!trace.contains("+ echo off"));
     }
 
     // ===== alias / unalias =====
