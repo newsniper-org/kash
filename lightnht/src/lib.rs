@@ -678,6 +678,295 @@ fn drain_subtable<K, V>(sub: SubTable<K, V>, out: &mut Vec<(K, V)>) {
     }
 }
 
+// ===== QLM (Quad Lai-Massey) hasher =====
+//
+// Word size = 32-bit. State = 4 words (a, b, c, d) arranged on a
+// 2×2 grid. Each "round" runs two Lai-Massey mixes along the row
+// axis (`(a,b)` and `(c,d)`) followed by two along the column axis
+// (`(a,c)` and `(b,d)`). After one round every word has been
+// touched by every other word (4-word butterfly).
+//
+// Per byte of input: XOR into word `a`, run one round. Finalisation
+// runs two extra rounds, then folds the 128-bit state into 64 bits.
+//
+// This is **not** a cryptographic hash. The output is intended for
+// hash-table bucket selection where decent avalanche and resistance
+// to accidental collisions matters and DoS-class adversaries don't.
+
+/// Magic constant used inside `f`: `frac(φ) × 2^32`. The
+/// fractional part of the golden ratio is a common "looks-random"
+/// non-zero u32; it shows up in BLAKE2, MurmurHash, and FxHash.
+const QLM_PHI32: u32 = 0x9E37_79B9;
+
+/// Multiplication constant inside `f`. Same source as the constant
+/// used in xxHash / MurmurHash finalisers.
+const QLM_PRIME32: u32 = 0x85EB_CA77;
+
+/// Rotation amounts. Picked so the rotations span a wide range of
+/// bit positions and aren't multiples of 8 (that would keep byte
+/// lanes aligned). Concrete values aren't load-bearing — any
+/// distinct, non-zero, non-byte-aligned trio works.
+const QLM_ROT_F1: u32 = 7;
+const QLM_ROT_F2: u32 = 13;
+const QLM_ROT_LM: u32 = 11;
+
+/// Initial state words. Independent "random-looking" 32-bit
+/// constants. Different from each other so the initial state isn't
+/// symmetric across the 2×2 grid.
+const QLM_IV_A: u32 = 0x9E37_79B9;
+const QLM_IV_B: u32 = 0x85EB_CA77;
+const QLM_IV_C: u32 = 0xC2B2_AE3D;
+const QLM_IV_D: u32 = 0x2767_F2D1;
+
+/// `F` mixer for the unpacked variant. Two ARX expressions xored
+/// together so the output bit depends on every input bit through
+/// two different paths.
+#[inline]
+const fn qlm_f(x: u32) -> u32 {
+    let a = x.rotate_left(QLM_ROT_F1).wrapping_add(QLM_PHI32);
+    let b = x.wrapping_mul(QLM_PRIME32).rotate_left(QLM_ROT_F2);
+    a ^ b
+}
+
+/// One Lai-Massey mix on a single `(L, R)` pair (unpacked variant).
+#[inline]
+const fn qlm_lm_mix(l: u32, r: u32) -> (u32, u32) {
+    let delta = qlm_f(l ^ r);
+    let l = l.wrapping_add(delta);
+    let r = r.wrapping_add(delta.rotate_left(QLM_ROT_LM));
+    (l, r)
+}
+
+/// One full round of the unpacked QLM permutation: row pair `(a, b)`
+/// → row pair `(c, d)` → column pair `(a, c)` → column pair `(b, d)`.
+#[inline]
+const fn qlm_round_unpacked(a: u32, b: u32, c: u32, d: u32) -> (u32, u32, u32, u32) {
+    let (a, b) = qlm_lm_mix(a, b);
+    let (c, d) = qlm_lm_mix(c, d);
+    let (a, c) = qlm_lm_mix(a, c);
+    let (b, d) = qlm_lm_mix(b, d);
+    (a, b, c, d)
+}
+
+/// Fold the 128-bit `(a, b, c, d)` state into a 64-bit output.
+/// Two cross-rotations + XOR to keep every input word's bits
+/// represented in the final 64-bit value.
+#[inline]
+const fn qlm_fold(a: u32, b: u32, c: u32, d: u32) -> u64 {
+    let high = a ^ c.rotate_left(17);
+    let low = b ^ d.rotate_left(23);
+    ((high as u64) << 32) | low as u64
+}
+
+/// Quad Lai-Massey hasher (unpacked variant). State is four 32-bit
+/// words; every byte triggers one full 4-word round.
+#[derive(Clone, Debug)]
+pub struct QLMHasher {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+
+impl QLMHasher {
+    /// Fresh hasher seeded with the QLM initial state.
+    pub const fn new() -> Self {
+        Self {
+            a: QLM_IV_A,
+            b: QLM_IV_B,
+            c: QLM_IV_C,
+            d: QLM_IV_D,
+        }
+    }
+}
+
+impl Default for QLMHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hasher for QLMHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.a ^= byte as u32;
+            let (a, b, c, d) = qlm_round_unpacked(self.a, self.b, self.c, self.d);
+            self.a = a;
+            self.b = b;
+            self.c = c;
+            self.d = d;
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        // Two finalisation rounds for avalanche, then fold 128 → 64.
+        let (a, b, c, d) = qlm_round_unpacked(self.a, self.b, self.c, self.d);
+        let (a, b, c, d) = qlm_round_unpacked(a, b, c, d);
+        qlm_fold(a, b, c, d)
+    }
+}
+
+// ===== SWAR (Within-A-Register) variant =====
+//
+// Same permutation, same constants, same final fold — only the
+// inner ADDs change. Two 32-bit words are packed into a single
+// `u64` so that one row's Lai-Massey mix and one column's mix can
+// share their ALU pipeline through a "carry-suppressed" addition.
+//
+// The compiler is free to issue 64-bit instructions for the
+// packed math; whether that actually beats the unpacked variant on
+// any real CPU is an empirical question. This crate ships both so
+// the choice is a benchmark away.
+
+/// Mask of the low 31 bits of each 32-bit lane in a packed `u64`.
+const SWAR_LANE_LO: u64 = 0x7FFF_FFFF_7FFF_FFFF;
+/// Mask of the high bit (bit 31) of each 32-bit lane.
+const SWAR_LANE_HI: u64 = 0x8000_0000_8000_0000;
+
+/// Carry-suppressed packed add: each 32-bit lane gets a modular
+/// add without bleeding into its neighbour.
+///
+/// `(x_lo + y_lo)` for each lane is computed by masking the top
+/// bit off both operands, doing the now-safe `wrapping_add`, then
+/// XORing back the top-bit contribution. The result matches what a
+/// real 32-bit `wrapping_add` would produce for each lane.
+#[inline]
+const fn swar_add(x: u64, y: u64) -> u64 {
+    let sum = (x & SWAR_LANE_LO).wrapping_add(y & SWAR_LANE_LO);
+    sum ^ ((x ^ y) & SWAR_LANE_HI)
+}
+
+/// Lane-wise rotate-left. Native `u64::rotate_left` would carry
+/// bits across the 32-bit boundary, so unpack → rotate-each →
+/// repack.
+#[inline]
+const fn swar_rotate_left(x: u64, n: u32) -> u64 {
+    let hi = ((x >> 32) as u32).rotate_left(n) as u64;
+    let lo = (x as u32).rotate_left(n) as u64;
+    (hi << 32) | lo
+}
+
+/// Lane-wise `wrapping_mul`. Native u64 mul would let the lanes
+/// cross-pollinate; do the multiplication per lane and repack.
+#[inline]
+const fn swar_mul(x: u64, y: u64) -> u64 {
+    let hi = ((x >> 32) as u32).wrapping_mul((y >> 32) as u32) as u64;
+    let lo = (x as u32).wrapping_mul(y as u32) as u64;
+    (hi << 32) | lo
+}
+
+/// SWAR-packed copies of the unpacked constants — one constant
+/// replicated into each 32-bit lane.
+const QLM_PHI32_PACKED: u64 = ((QLM_PHI32 as u64) << 32) | (QLM_PHI32 as u64);
+const QLM_PRIME32_PACKED: u64 = ((QLM_PRIME32 as u64) << 32) | (QLM_PRIME32 as u64);
+
+/// `F` mixer, SWAR variant. Identical algebra to [`qlm_f`] but
+/// applied to two 32-bit lanes in parallel.
+#[inline]
+const fn qlm_f_swar(x: u64) -> u64 {
+    let a = swar_add(swar_rotate_left(x, QLM_ROT_F1), QLM_PHI32_PACKED);
+    let b = swar_rotate_left(swar_mul(x, QLM_PRIME32_PACKED), QLM_ROT_F2);
+    a ^ b
+}
+
+/// One Lai-Massey mix on two `(L, R)` pairs in parallel.
+#[inline]
+const fn qlm_lm_mix_swar(l: u64, r: u64) -> (u64, u64) {
+    let delta = qlm_f_swar(l ^ r);
+    let l = swar_add(l, delta);
+    let r = swar_add(r, swar_rotate_left(delta, QLM_ROT_LM));
+    (l, r)
+}
+
+/// Pack `(low, high)` into a `u64` with `low` in the low 32 bits.
+#[inline]
+const fn swar_pack(low: u32, high: u32) -> u64 {
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Inverse of [`swar_pack`]. Returns `(low, high)`.
+#[inline]
+const fn swar_unpack(x: u64) -> (u32, u32) {
+    (x as u32, (x >> 32) as u32)
+}
+
+/// One full round of the SWAR-packed QLM permutation. Equivalent
+/// to [`qlm_round_unpacked`] — the row mix runs both `(a, b)` and
+/// `(c, d)` in one SWAR `lm_mix`, then the column mix runs both
+/// `(a, c)` and `(b, d)` in another. The state is unpacked between
+/// the two mixes because the lane layout has to flip.
+#[inline]
+const fn qlm_round_swar(a: u32, b: u32, c: u32, d: u32) -> (u32, u32, u32, u32) {
+    // Row layout: lane 0 = (a, b), lane 1 = (c, d).
+    //   packed_l = (a in lo, c in hi)
+    //   packed_r = (b in lo, d in hi)
+    let packed_l = swar_pack(a, c);
+    let packed_r = swar_pack(b, d);
+    let (packed_l, packed_r) = qlm_lm_mix_swar(packed_l, packed_r);
+    let (a, c) = swar_unpack(packed_l);
+    let (b, d) = swar_unpack(packed_r);
+
+    // Column layout: lane 0 = (a, c), lane 1 = (b, d).
+    //   packed_l = (a in lo, b in hi)
+    //   packed_r = (c in lo, d in hi)
+    let packed_l = swar_pack(a, b);
+    let packed_r = swar_pack(c, d);
+    let (packed_l, packed_r) = qlm_lm_mix_swar(packed_l, packed_r);
+    let (a, b) = swar_unpack(packed_l);
+    let (c, d) = swar_unpack(packed_r);
+
+    (a, b, c, d)
+}
+
+/// Quad Lai-Massey hasher (SWAR variant). Bit-exactly equivalent
+/// to [`QLMHasher`] — the two should always produce the same
+/// `finish()` for the same input — but the inner permutation does
+/// each pair of Lai-Massey mixes as one packed `u64` operation.
+#[derive(Clone, Debug)]
+pub struct SwarQLMHasher {
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+
+impl SwarQLMHasher {
+    /// Fresh hasher seeded with the QLM initial state.
+    pub const fn new() -> Self {
+        Self {
+            a: QLM_IV_A,
+            b: QLM_IV_B,
+            c: QLM_IV_C,
+            d: QLM_IV_D,
+        }
+    }
+}
+
+impl Default for SwarQLMHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hasher for SwarQLMHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.a ^= byte as u32;
+            let (a, b, c, d) = qlm_round_swar(self.a, self.b, self.c, self.d);
+            self.a = a;
+            self.b = b;
+            self.c = c;
+            self.d = d;
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        let (a, b, c, d) = qlm_round_swar(self.a, self.b, self.c, self.d);
+        let (a, b, c, d) = qlm_round_swar(a, b, c, d);
+        qlm_fold(a, b, c, d)
+    }
+}
+
 /// Upper bound on the number of consecutive reconstruct-retries
 /// during a single `insert`. Reaching this means the hasher is
 /// producing the same colliding chain even after fresh `recon`
@@ -1003,37 +1292,8 @@ mod tests {
     use alloc::string::{String, ToString};
     use core::hash::Hasher;
 
-    /// Tiny FxHash-style prototype hasher, just so the tests can
-    /// run without depending on `std::collections::DefaultHasher`.
-    /// **Not** a recommendation — `lightnht` exposes the hasher
-    /// choice to its caller, and the project's "pick a real hasher"
-    /// discussion is the next step. This is only here so the tests
-    /// in this file have *some* `H: Hasher + Clone + Default` to
-    /// drive the algorithm.
-    #[derive(Clone, Default)]
-    struct TestHasher {
-        state: u64,
-    }
-
-    impl Hasher for TestHasher {
-        fn finish(&self) -> u64 {
-            self.state
-        }
-        fn write(&mut self, bytes: &[u8]) {
-            // Fx-style rotate-and-mix. Adequate for tests; not for
-            // real workloads.
-            for &b in bytes {
-                self.state = self
-                    .state
-                    .rotate_left(5)
-                    .wrapping_add(b as u64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            }
-        }
-    }
-
-    type Map = LightNht<String, i32, TestHasher>;
-    type Set = LightNhtSet<String, TestHasher>;
+    type Map = LightNht<String, i32, QLMHasher>;
+    type Set = LightNhtSet<String, QLMHasher>;
 
     fn k(s: &str) -> String {
         s.to_string()
@@ -1297,6 +1557,106 @@ mod tests {
             alloc::collections::BTreeMap::new();
         round_trip(&mut light);
         round_trip(&mut btree);
+    }
+
+    // ===== QLM hasher: distribution + SWAR equivalence =====
+
+    fn hash_bytes_with<H: Hasher + Default>(input: &[u8]) -> u64 {
+        let mut h = H::default();
+        h.write(input);
+        h.finish()
+    }
+
+    #[test]
+    fn qlm_hasher_is_deterministic() {
+        let a = hash_bytes_with::<QLMHasher>(b"hello world");
+        let b = hash_bytes_with::<QLMHasher>(b"hello world");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn qlm_hasher_differs_on_one_bit_flip() {
+        let a = hash_bytes_with::<QLMHasher>(b"hello world");
+        let b = hash_bytes_with::<QLMHasher>(b"hello\0world"); // space → NUL
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn swar_qlm_matches_unpacked_qlm() {
+        // The SWAR variant is supposed to be bit-exactly equivalent
+        // to the unpacked one — only the inner ADDs change, the
+        // algebra is otherwise identical.
+        let inputs: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"abc",
+            b"the quick brown fox jumps over the lazy dog",
+            b"\x00\x00\x00\x00",
+            b"\xff\xff\xff\xff\xff\xff\xff\xff",
+            &[0u8; 256],
+        ];
+        for &input in inputs {
+            let unpacked = hash_bytes_with::<QLMHasher>(input);
+            let packed = hash_bytes_with::<SwarQLMHasher>(input);
+            assert_eq!(
+                unpacked, packed,
+                "QLMHasher / SwarQLMHasher diverge on input of length {}",
+                input.len()
+            );
+        }
+    }
+
+    #[test]
+    fn qlm_avalanche_sanity() {
+        // Two inputs differing in a single bit should disagree on
+        // *most* output bits. Not a real avalanche test — just a
+        // sanity check that the permutation actually mixes.
+        let a = hash_bytes_with::<QLMHasher>(b"input\x00");
+        let b = hash_bytes_with::<QLMHasher>(b"input\x01");
+        let diff_bits = (a ^ b).count_ones();
+        // For a well-mixed 64-bit hash we'd expect ~32; loosen the
+        // bound to [16, 48] so the test isn't flaky.
+        assert!(
+            (16..=48).contains(&diff_bits),
+            "diff_bits = {diff_bits} for one-bit input flip — mixing looks off",
+        );
+    }
+
+    #[test]
+    fn qlm_distribution_sanity_for_short_string_keys() {
+        // 1024 distinct short strings — count how many fall into
+        // each of 16 buckets via low 4 bits of the hash. Buckets
+        // should be roughly even; tolerate a 4× max/min spread.
+        let mut counts = [0u32; 16];
+        for i in 0..1024u32 {
+            let s = alloc::format!("entry-{i:04}");
+            let h = hash_bytes_with::<QLMHasher>(s.as_bytes());
+            counts[(h & 0xF) as usize] += 1;
+        }
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        let spread = max as f64 / min as f64;
+        assert!(
+            spread < 4.0,
+            "hash distribution too skewed: counts = {counts:?}",
+        );
+    }
+
+    #[test]
+    fn lightnht_runs_under_swar_hasher() {
+        // End-to-end smoke: lightnht parameterised by
+        // SwarQLMHasher should pass the same insert/get cycle as
+        // under QLMHasher. (The trees they produce are identical
+        // since the hashers are bit-equivalent.)
+        type SwarMap = LightNht<String, i32, SwarQLMHasher>;
+        let mut m: SwarMap = SwarMap::default();
+        for i in 0..50 {
+            m.insert(alloc::format!("k{i}"), i);
+        }
+        assert_eq!(m.len(), 50);
+        for i in 0..50 {
+            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&(i as i32)));
+        }
     }
 
     #[test]
