@@ -271,6 +271,22 @@ pub enum CompoundKind {
         /// Method implementations.
         items: Vec<InstanceMember>,
     },
+    /// A `venv NAME { … }` declaration. Locked in
+    /// `project_kash_venv.md` — a soft virtual-environment block
+    /// that bundles capability profile, env overlay, namespace
+    /// imports, and a body of statements as a single scoping unit.
+    /// The body sees its own frame (capabilities active, env / PATH
+    /// / imports applied) and the frame pops on exit, restoring
+    /// the caller's view. This commit ships the v.1 surface
+    /// (declaration + body section + push/pop frame); the
+    /// `capabilities`, `env`, `imports`, and `load-config` sections
+    /// land in follow-up stages.
+    VenvDecl {
+        /// Venv name (bare identifier, no embedded dots).
+        name: String,
+        /// Sections in source order.
+        sections: Vec<VenvSection>,
+    },
     /// A `mode` declaration. Three source forms, all carried by the
     /// [`ModeForm`] tag:
     ///
@@ -328,6 +344,21 @@ pub enum CompoundKind {
         captures: Option<Vec<String>>,
         /// Function body. Always a compound command.
         body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// One section inside a [`CompoundKind::VenvDecl`] body.
+/// Each variant maps to a `<keyword> { … }` block at venv-body
+/// position. v.1 only ships `Body`; future stages add
+/// `Capabilities`, `Env`, `Imports`, and `LoadConfig`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VenvSection {
+    /// `body { … }` — statements that run *inside* the venv frame.
+    /// All other sections configure the frame; this one is what
+    /// actually executes against it.
+    Body {
+        /// Statements to run under the venv frame.
+        statements: Vec<Statement>,
     },
 }
 

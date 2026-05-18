@@ -357,6 +357,9 @@ impl<'src> Parser<'src> {
         if self.peek_bare_word()? == Some("mode") {
             return self.parse_mode_decl().map(Command::Compound);
         }
+        if self.peek_bare_word()? == Some("venv") {
+            return self.parse_venv_decl().map(Command::Compound);
+        }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
         // error rather than tripping the `for` arm).
@@ -801,6 +804,88 @@ impl<'src> Parser<'src> {
             redirects,
             span: Span::new(start, end),
         })
+    }
+
+    // ---------- venv ----------
+
+    /// Parse `venv NAME { <section>... }`. Each section is a
+    /// `<keyword> { … }` block — v.1 ships only `body { … }`,
+    /// the only section that *runs* statements. Future stages
+    /// add `capabilities`, `env`, `imports`, and `load-config`.
+    fn parse_venv_decl(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?; // "venv"
+        let start = kw.span.start;
+        let name = self.expect_bare_identifier("venv name")?;
+        if name.contains('.') {
+            return Err(KashError::Parse(alloc::format!(
+                "venv name `{name}` must be a bare identifier"
+            )));
+        }
+        self.skip_newlines()?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            return Err(KashError::Parse(
+                "expected `{` after venv name".into(),
+            ));
+        }
+        self.bump()?;
+        let mut sections: Vec<crate::ast::VenvSection> = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `venv { … }` block".into(),
+                ));
+            }
+            let section = self.parse_venv_section()?;
+            sections.push(section);
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        let close = self.bump()?; // }
+        let redirects = self.parse_trailing_redirects()?;
+        let end = redirects.last().map_or(close.span.end, |r| r.span.end);
+        Ok(CompoundCommand {
+            kind: CompoundKind::VenvDecl { name, sections },
+            redirects,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parse one section inside a venv block. v.1 accepts only
+    /// `body { … }`; an unknown section keyword raises a
+    /// `KashError::Parse` so accidentally-misspelled section names
+    /// don't silently parse as commands.
+    fn parse_venv_section(&mut self) -> Result<crate::ast::VenvSection> {
+        let section_name = self.expect_bare_identifier("venv section name")?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            return Err(KashError::Parse(alloc::format!(
+                "expected `{{` after venv section `{section_name}`"
+            )));
+        }
+        self.bump()?; // {
+        match section_name.as_str() {
+            "body" => {
+                let statements = self.parse_brace_body()?;
+                if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                    return Err(KashError::Parse(
+                        "expected `}` to close `body { … }` section".into(),
+                    ));
+                }
+                self.bump()?;
+                Ok(crate::ast::VenvSection::Body { statements })
+            }
+            other => Err(KashError::Parse(alloc::format!(
+                "unknown venv section `{other}` — v.1 only supports `body`; \
+                 capabilities / env / imports / load-config are follow-up stages"
+            ))),
+        }
     }
 
     // ---------- namespace ----------

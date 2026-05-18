@@ -128,6 +128,21 @@ struct InstanceEntry {
     methods: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
 }
 
+/// One active virtual-environment frame. v.1 carries no
+/// configuration yet — it's a marker that says "we're inside a
+/// venv". v.2 attaches a capability set, v.3 an env / PATH
+/// overlay, v.6 namespace imports, etc.
+#[derive(Clone, Debug, Default)]
+struct VenvFrame {
+    // Future fields hang here in follow-up stages.
+}
+
+impl VenvFrame {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// One `use …` import in effect.
 #[derive(Clone, Debug)]
 enum ImportEntry {
@@ -214,6 +229,13 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// (each function carries the namespace path it was *defined* in
     /// so callers see the lexical view inside the body).
     namespace_path: Vec<String>,
+    /// Active virtual-environment frames, stacked outer-to-inner.
+    /// A frame is pushed on `venv NAME { … }` entry and popped on
+    /// exit; the body's `body { … }` section runs while the frame
+    /// is on top. v.1 ships an empty marker — capability sets,
+    /// env overlays, and namespace imports hang here in later
+    /// stages. Locked in `project_kash_venv.md`.
+    venv_stack: Vec<VenvFrame>,
     /// Active namespace imports, organised by function-frame stack.
     /// Each top-level / function-call frame gets its own slot in the
     /// outer `Vec`. A `use namespace foo` statement pushes onto the
@@ -280,6 +302,7 @@ impl<B: MapBackend> Evaluator<B> {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: <B::Map<String, FunctionEntry> as Default>::default(),
+            venv_stack: Vec::new(),
             namespace_path: Vec::new(),
             imports: alloc::vec![Vec::new()],
             function_mode_save: Vec::new(),
@@ -1702,7 +1725,36 @@ impl<B: MapBackend> Evaluator<B> {
                 Ok(Outcome::Status(0))
             }
             CompoundKind::ModeDecl { spec, form } => self.eval_mode_decl(spec, form),
+            CompoundKind::VenvDecl { name, sections } => {
+                self.eval_venv_decl(name, sections)
+            }
         }
+    }
+
+    /// Evaluate a `venv NAME { … }` block. v.1 semantics: push a
+    /// venv frame onto the stack, run the (at-most-one) `body { … }`
+    /// section's statements, then pop the frame. The frame is a
+    /// marker for now — future stages hang capability sets, env
+    /// overlays, and namespace imports off it.
+    fn eval_venv_decl(
+        &mut self,
+        _name: &str,
+        sections: &[crate::ast::VenvSection],
+    ) -> Result<Outcome> {
+        self.venv_stack.push(VenvFrame::new());
+        // v.1 surface: `body` is the only section; nothing else
+        // exists yet. Run it if present, fall through to a no-op
+        // 0-status outcome otherwise.
+        let body = sections
+            .iter()
+            .map(|crate::ast::VenvSection::Body { statements }| statements)
+            .next();
+        let result = match body {
+            Some(stmts) => self.eval_statements(stmts),
+            None => Ok(Outcome::Status(0)),
+        };
+        self.venv_stack.pop();
+        result
     }
 
     /// Apply a `mode` declaration. Parses the spec, gates against
@@ -7598,6 +7650,73 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== venv — v.1 surface =====
+
+    #[test]
+    fn venv_body_runs_statements() {
+        let (_, out, _) = run(
+            "venv myproj {\n\
+                 body {\n\
+                     echo inside\n\
+                 }\n\
+             }\n\
+             echo outside\n",
+        );
+        assert_eq!(out, "inside\noutside\n");
+    }
+
+    #[test]
+    fn venv_body_inherits_outer_scope() {
+        // v.1 is just a frame marker — there's no isolation yet,
+        // so outer bindings stay visible inside the body.
+        let (_, out, _) = run(
+            "x=visible\n\
+             venv myproj {\n\
+                 body { echo $x; }\n\
+             }\n",
+        );
+        assert_eq!(out, "visible\n");
+    }
+
+    #[test]
+    fn venv_block_without_body_is_noop() {
+        // A venv block with no `body` section just registers and
+        // unregisters the frame.
+        let (_, out, _) = run(
+            "echo before\n\
+             venv empty {}\n\
+             echo after\n",
+        );
+        assert_eq!(out, "before\nafter\n");
+    }
+
+    #[test]
+    fn venv_unknown_section_is_rejected() {
+        // v.1 surface is `body` only. Spelling `capabilities` or
+        // anything else must error out at parse time, not silently
+        // be interpreted as a command.
+        let src = "venv myproj { capabilities { profile basic; }; }\n";
+        let prog = parse(src);
+        assert!(prog.is_err());
+    }
+
+    #[test]
+    fn venv_name_with_embedded_dot_is_rejected() {
+        assert!(parse("venv foo.bar { body {} }\n").is_err());
+    }
+
+    #[test]
+    fn venv_keyword_not_reserved_as_command_name() {
+        // `venv` outside head position should still work as a
+        // regular argument.
+        let (_, out, _) = run(
+            "f() { :; }\n\
+             f venv arg\n\
+             echo done\n",
+        );
+        assert_eq!(out, "done\n");
     }
 
     // ===== mode declaration =====
