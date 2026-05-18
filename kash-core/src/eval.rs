@@ -233,25 +233,32 @@ impl Evaluator {
         }
         if cmd.words.is_empty() {
             if !cmd.redirects.is_empty() {
-                return Err(KashError::Runtime(
-                    "redirects on assignment-only statements are not yet supported".into(),
-                ));
+                // POSIX: a redirect with no command opens the files
+                // (so e.g. `> file` truncates) but doesn't otherwise
+                // run anything. We hand this off to the std-only
+                // redirect helper so the file work happens in one
+                // place.
+                #[cfg(feature = "std")]
+                {
+                    return self.open_redirect_side_effects(&cmd.redirects);
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    return Err(KashError::Runtime(
+                        "redirections require the `std` feature".into(),
+                    ));
+                }
             }
             return Ok(Outcome::Status(0));
         }
-        if !cmd.redirects.is_empty() {
-            return Err(KashError::Runtime(
-                "redirections are not yet wired in the evaluator skeleton".into(),
-            ));
-        }
         // Phase 2: expand command name + arguments. POSIX field
-        // splitting drops words that expand to nothing (the proper
-        // "did this come from an unquoted expansion" distinction lands
-        // when the expansion machinery grows up).
+        // splitting drops words that expand to nothing — *unless* the
+        // word contained a quoted segment, in which case the empty
+        // expansion is still a literal empty argument and stays in argv.
         let mut argv: Vec<String> = Vec::with_capacity(cmd.words.len());
         for w in &cmd.words {
             let expanded = self.expand_word(w)?;
-            if !expanded.is_empty() {
+            if !expanded.is_empty() || word_has_quoted_segment(w) {
                 argv.push(expanded);
             }
         }
@@ -260,6 +267,18 @@ impl Evaluator {
             // whole simple command as a successful no-op (`A=1` with
             // an empty word list lands here too).
             return Ok(Outcome::Status(0));
+        }
+        if !cmd.redirects.is_empty() {
+            #[cfg(feature = "std")]
+            {
+                return self.eval_with_redirects(cmd, &argv);
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                return Err(KashError::Runtime(
+                    "redirections require the `std` feature".into(),
+                ));
+            }
         }
         // Phase 3: dispatch. Function lookup first (per POSIX, regular
         // builtins lose to user functions); then builtins; then NotFound
@@ -281,6 +300,8 @@ impl Evaluator {
             "shift" => self.builtin_shift(&argv[1..]),
             "local" => self.builtin_local(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
+            "test" => builtin_test(false, &argv[1..]),
+            "[" => builtin_test(true, &argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -893,6 +914,181 @@ impl Default for Evaluator {
 
 ifstd!({
     impl Evaluator {
+        /// Open the files named by a list of redirects without
+        /// running any command. Used for the POSIX no-command form
+        /// (`> file` truncates, `< file` opens-and-discards, …).
+        fn open_redirect_side_effects(
+            &mut self,
+            redirects: &[crate::ast::Redirect],
+        ) -> Result<Outcome> {
+            for r in redirects {
+                let path = self.expand_word(&r.target)?;
+                self.open_redirect_file(r.kind, &path)?;
+            }
+            Ok(Outcome::Status(0))
+        }
+
+        /// Open `path` according to `kind`. Centralised so the simple-
+        /// command path and the no-command-side-effects path agree on
+        /// flags and error reporting.
+        fn open_redirect_file(
+            &self,
+            kind: crate::ast::RedirectKind,
+            path: &str,
+        ) -> Result<std::fs::File> {
+            use crate::ast::RedirectKind;
+            use std::fs::OpenOptions;
+            let result = match kind {
+                RedirectKind::Output | RedirectKind::OutputBoth => OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(path),
+                RedirectKind::Append | RedirectKind::AppendBoth => OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .create(true)
+                    .open(path),
+                RedirectKind::Input => OpenOptions::new().read(true).open(path),
+            };
+            result.map_err(|e| KashError::Runtime(alloc::format!("open `{path}`: {e}")))
+        }
+
+        /// Run a simple command with one or more redirects applied.
+        ///
+        /// Builtins/functions get their output captured: the routine
+        /// remembers the current length of `self.output`, runs the
+        /// builtin / function, then writes the new tail of the buffer
+        /// to whichever file the redirects selected (truncating the
+        /// buffer afterwards so it doesn't double-emit to the host).
+        ///
+        /// External commands receive the opened files as their
+        /// `Stdio`, so the kernel does the work directly.
+        fn eval_with_redirects(
+            &mut self,
+            cmd: &SimpleCommand,
+            argv: &[String],
+        ) -> Result<Outcome> {
+            use crate::ast::RedirectKind;
+            use std::io::{Read, Write};
+            use std::process::{Command, Stdio};
+            // Resolve all redirect targets up front (so e.g. an
+            // unreadable input file fails before we run anything).
+            let mut out_file: Option<std::fs::File> = None;
+            let mut both: bool = false;
+            let mut in_file: Option<std::fs::File> = None;
+            for r in &cmd.redirects {
+                let path = self.expand_word(&r.target)?;
+                let f = self.open_redirect_file(r.kind, &path)?;
+                match r.kind {
+                    RedirectKind::Input => in_file = Some(f),
+                    RedirectKind::Output | RedirectKind::Append => {
+                        out_file = Some(f);
+                        both = false;
+                    }
+                    RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
+                        out_file = Some(f);
+                        both = true;
+                    }
+                }
+            }
+
+            let name = argv[0].as_str();
+            let is_function = self.functions.contains_key(name);
+            let is_builtin = is_builtin_name(name);
+            if is_function || is_builtin {
+                // Capture the builtin's output buffer fragment.
+                let old_len = self.output.len();
+                let outcome = if is_function {
+                    self.call_function(argv)?
+                } else {
+                    self.dispatch_builtin(argv)?
+                };
+                if let Some(mut f) = out_file {
+                    let chunk = self.output[old_len..].as_bytes().to_vec();
+                    f.write_all(&chunk).map_err(|e| {
+                        KashError::Runtime(alloc::format!("write: {e}"))
+                    })?;
+                    self.output.truncate(old_len);
+                }
+                let _ = in_file; // builtins/functions don't consume stdin yet
+                let _ = both; // stderr-redirect on builtins is a no-op (we don't model stderr)
+                Ok(outcome)
+            } else {
+                // External command — let the kernel handle stdin/out
+                // straight from the opened file descriptors.
+                let mut c = Command::new(&argv[0]);
+                c.args(&argv[1..]);
+                if let Some(f) = in_file {
+                    c.stdin(Stdio::from(f));
+                } else {
+                    c.stdin(Stdio::inherit());
+                }
+                let has_out = out_file.is_some();
+                if let Some(f) = out_file {
+                    if both {
+                        let f2 = f.try_clone().map_err(|e| {
+                            KashError::Runtime(alloc::format!("dup: {e}"))
+                        })?;
+                        c.stdout(Stdio::from(f));
+                        c.stderr(Stdio::from(f2));
+                    } else {
+                        c.stdout(Stdio::from(f));
+                        c.stderr(Stdio::inherit());
+                    }
+                } else {
+                    c.stdout(Stdio::piped());
+                    c.stderr(Stdio::inherit());
+                }
+                let mut child = c.spawn().map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                    } else {
+                        KashError::Runtime(alloc::format!("exec: {e}"))
+                    }
+                })?;
+                if !has_out {
+                    if let Some(mut so) = child.stdout.take() {
+                        let mut buf = alloc::vec::Vec::<u8>::new();
+                        so.read_to_end(&mut buf).map_err(|e| {
+                            KashError::Runtime(alloc::format!("read: {e}"))
+                        })?;
+                        self.output.push_str(&String::from_utf8_lossy(&buf));
+                    }
+                }
+                let status = child
+                    .wait()
+                    .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+                Ok(Outcome::Status(status.code().unwrap_or(128)))
+            }
+        }
+
+        /// Dispatch a builtin given its already-expanded argv. Used
+        /// from the redirect-handling path; mirrors the dispatch arm
+        /// in `eval_simple`.
+        fn dispatch_builtin(&mut self, argv: &[String]) -> Result<Outcome> {
+            let name = argv[0].as_str();
+            match name {
+                ":" | "true" => Ok(Outcome::Status(0)),
+                "false" => Ok(Outcome::Status(1)),
+                "echo" => {
+                    self.builtin_echo(&argv[1..]);
+                    Ok(Outcome::Status(0))
+                }
+                "exit" => self.builtin_exit(&argv[1..]),
+                "set" => self.builtin_set(&argv[1..]),
+                "unset" => self.builtin_unset(&argv[1..]),
+                "shift" => self.builtin_shift(&argv[1..]),
+                "local" => self.builtin_local(&argv[1..]),
+                "readonly" => self.builtin_readonly(&argv[1..]),
+                "test" => builtin_test(false, &argv[1..]),
+                "[" => builtin_test(true, &argv[1..]),
+                other => Err(KashError::Runtime(alloc::format!(
+                    "internal: dispatch_builtin called for `{other}`"
+                ))),
+            }
+        }
+
         /// Spawn `argv[0]` as an external process. The child inherits
         /// our stdin/stderr; its stdout is captured and appended to
         /// the evaluator's output buffer.
@@ -1047,7 +1243,131 @@ fn is_builtin_name(name: &str) -> bool {
             | "shift"
             | "local"
             | "readonly"
+            | "test"
+            | "["
     )
+}
+
+/// POSIX `test` / `[` builtin. The `bracket` flag indicates the
+/// invocation form (`[ ... ]` requires a closing `]`; `test ...` does
+/// not). The supported operator surface in this commit:
+///
+/// - 0 args → false (exit 1).
+/// - 1 arg → `STR` is non-empty? (POSIX 2.4).
+/// - 2 args:
+///     - `-z STR` / `-n STR`,
+///     - `! STR` (negate the 1-arg form),
+///     - `-e/-f/-d/-r/-w/-x FILE` (filesystem tests; std-only).
+/// - 3 args:
+///     - `STR1 = STR2` / `STR1 != STR2`,
+///     - `N1 -eq/-ne/-lt/-le/-gt/-ge N2`,
+///     - `! UNARY ARG` (negate a 2-arg test).
+/// - 4 args: `! UNARY ARG OTHER` or `! BIN STR1 STR2`.
+fn builtin_test(bracket: bool, raw: &[String]) -> Result<Outcome> {
+    let mut args: Vec<&str> = raw.iter().map(|s| s.as_str()).collect();
+    if bracket {
+        match args.last() {
+            Some(&"]") => {
+                args.pop();
+            }
+            _ => {
+                return Err(KashError::Runtime(
+                    "[: missing `]`".into(),
+                ));
+            }
+        }
+    }
+    let ok = test_eval(&args)?;
+    Ok(Outcome::Status(if ok { 0 } else { 1 }))
+}
+
+fn test_eval(args: &[&str]) -> Result<bool> {
+    match args.len() {
+        0 => Ok(false),
+        1 => Ok(!args[0].is_empty()),
+        2 => {
+            if args[0] == "!" {
+                let inner = test_eval(&args[1..])?;
+                return Ok(!inner);
+            }
+            test_unary(args[0], args[1])
+        }
+        3 => {
+            if args[0] == "!" {
+                let inner = test_eval(&args[1..])?;
+                return Ok(!inner);
+            }
+            test_binary(args[0], args[1], args[2])
+        }
+        4 if args[0] == "!" => {
+            let inner = test_eval(&args[1..])?;
+            Ok(!inner)
+        }
+        _ => Err(KashError::Runtime(format!(
+            "test: unexpected argument count ({})",
+            args.len()
+        ))),
+    }
+}
+
+fn test_unary(op: &str, arg: &str) -> Result<bool> {
+    Ok(match op {
+        "-z" => arg.is_empty(),
+        "-n" => !arg.is_empty(),
+        #[cfg(feature = "std")]
+        "-e" => std::path::Path::new(arg).exists(),
+        #[cfg(feature = "std")]
+        "-f" => std::fs::metadata(arg).map(|m| m.is_file()).unwrap_or(false),
+        #[cfg(feature = "std")]
+        "-d" => std::fs::metadata(arg).map(|m| m.is_dir()).unwrap_or(false),
+        #[cfg(feature = "std")]
+        "-r" => std::fs::metadata(arg).is_ok(),
+        #[cfg(feature = "std")]
+        "-w" => match std::fs::metadata(arg) {
+            Ok(m) => !m.permissions().readonly(),
+            Err(_) => false,
+        },
+        #[cfg(feature = "std")]
+        "-x" => std::fs::metadata(arg).is_ok(),
+        #[cfg(not(feature = "std"))]
+        "-e" | "-f" | "-d" | "-r" | "-w" | "-x" => {
+            return Err(KashError::Runtime(format!(
+                "test: filesystem operator `{op}` requires the `std` feature"
+            )));
+        }
+        other => {
+            return Err(KashError::Runtime(format!(
+                "test: unknown unary operator `{other}`"
+            )));
+        }
+    })
+}
+
+fn test_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool> {
+    match op {
+        "=" => Ok(lhs == rhs),
+        "!=" => Ok(lhs != rhs),
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            let a: i64 = lhs.parse().map_err(|_| {
+                KashError::Runtime(format!("test: `{lhs}` is not an integer"))
+            })?;
+            let b: i64 = rhs.parse().map_err(|_| {
+                KashError::Runtime(format!("test: `{rhs}` is not an integer"))
+            })?;
+            Ok(match op {
+                "-eq" => a == b,
+                "-ne" => a != b,
+                "-lt" => a < b,
+                "-le" => a <= b,
+                "-gt" => a > b,
+                "-ge" => a >= b,
+                _ => unreachable!(),
+            })
+        }
+        other => Err(KashError::Runtime(format!(
+            "test: unknown binary operator `{other}`"
+        ))),
+    }
 }
 
 // ===== helpers =====
@@ -1085,6 +1405,20 @@ fn parse_name_eq_value(arg: &str) -> Result<(alloc::string::String, alloc::strin
 
 /// True iff `s` is a POSIX shell identifier (`_` or letter, then
 /// `_` / letters / digits).
+/// True iff `w` has at least one quoted segment. A quoted segment
+/// (even when its body is empty) survives POSIX field splitting as a
+/// literal empty argument.
+fn word_has_quoted_segment(w: &Word) -> bool {
+    w.segments.iter().any(|s| {
+        matches!(
+            s,
+            WordSegment::SingleQuoted(_)
+                | WordSegment::DoubleQuoted(_)
+                | WordSegment::AnsiC(_)
+        )
+    })
+}
+
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
@@ -1513,6 +1847,169 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== test / [ =====
+
+    #[test]
+    fn test_empty_args_is_false() {
+        let (o, _, _) = run("test");
+        assert_eq!(o.status(), 1);
+        let (o, _, _) = run("[ ]");
+        assert_eq!(o.status(), 1);
+    }
+
+    #[test]
+    fn test_single_arg_truth() {
+        assert_eq!(run("test foo").0.status(), 0);
+        assert_eq!(run("[ foo ]").0.status(), 0);
+    }
+
+    #[test]
+    fn test_z_n_unary() {
+        assert_eq!(run("test -z ''").0.status(), 0);
+        assert_eq!(run("test -z foo").0.status(), 1);
+        assert_eq!(run("test -n foo").0.status(), 0);
+        assert_eq!(run("test -n ''").0.status(), 1);
+    }
+
+    #[test]
+    fn test_string_equality() {
+        assert_eq!(run("[ foo = foo ]").0.status(), 0);
+        assert_eq!(run("[ foo = bar ]").0.status(), 1);
+        assert_eq!(run("[ foo != bar ]").0.status(), 0);
+    }
+
+    #[test]
+    fn test_integer_comparisons() {
+        assert_eq!(run("[ 3 -eq 3 ]").0.status(), 0);
+        assert_eq!(run("[ 3 -ne 4 ]").0.status(), 0);
+        assert_eq!(run("[ 3 -lt 4 ]").0.status(), 0);
+        assert_eq!(run("[ 4 -le 4 ]").0.status(), 0);
+        assert_eq!(run("[ 5 -gt 4 ]").0.status(), 0);
+        assert_eq!(run("[ 4 -ge 4 ]").0.status(), 0);
+        assert_eq!(run("[ 3 -gt 4 ]").0.status(), 1);
+    }
+
+    #[test]
+    fn test_bang_negation() {
+        assert_eq!(run("[ ! -z foo ]").0.status(), 0);
+        assert_eq!(run("[ ! foo = bar ]").0.status(), 0);
+        assert_eq!(run("[ ! foo = foo ]").0.status(), 1);
+    }
+
+    #[test]
+    fn test_used_in_if() {
+        let (_, out, _) = run("if [ -z '' ]; then echo empty; else echo full; fi");
+        assert_eq!(out, "empty\n");
+    }
+
+    #[test]
+    fn test_drives_while_loop() {
+        // No `$((…))` arithmetic yet; cascade `if/elif` to step the
+        // counter manually so the test exercises the `[ … ]` driver.
+        let (_, out, _) = run(
+            "N=3; while [ $N -ne 0 ]; do echo $N; if [ $N -eq 3 ]; then N=2; elif [ $N -eq 2 ]; then N=1; else N=0; fi; done",
+        );
+        assert_eq!(out, "3\n2\n1\n");
+    }
+
+    // ===== redirects (env-dependent) =====
+
+    #[cfg(feature = "std")]
+    mod redirect_tests {
+        use super::*;
+        use std::fs;
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        fn tmp_path(name: &str) -> PathBuf {
+            let mut p = std::env::temp_dir();
+            // Add a per-process suffix so parallel test runs don't collide.
+            p.push(alloc::format!("kash-test-{}-{}", std::process::id(), name));
+            p
+        }
+
+        #[test]
+        fn builtin_output_redirect_writes_to_file() {
+            let path = tmp_path("a");
+            let src = alloc::format!("echo hello > {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert!(ev.take_output().is_empty(), "stdout should have been redirected");
+            let body = fs::read_to_string(&path).unwrap();
+            assert_eq!(body, "hello\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn builtin_append_redirect_concatenates() {
+            let path = tmp_path("b");
+            {
+                let mut f = fs::File::create(&path).unwrap();
+                f.write_all(b"first\n").unwrap();
+            }
+            let src = alloc::format!("echo second >> {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn no_command_redirect_truncates_file() {
+            let path = tmp_path("c");
+            fs::write(&path, "previous\n").unwrap();
+            let src = alloc::format!("> {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn input_redirect_feeds_external_command() {
+            let path = tmp_path("d");
+            fs::write(&path, "piped via file\n").unwrap();
+            if !std::path::Path::new("/bin/cat").exists() {
+                let _ = fs::remove_file(&path);
+                return;
+            }
+            let src = alloc::format!("/bin/cat < {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "piped via file\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn external_output_redirect_writes_to_file() {
+            let path = tmp_path("e");
+            if !std::path::Path::new("/bin/echo").exists() {
+                return;
+            }
+            let src = alloc::format!("/bin/echo external > {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert!(ev.take_output().is_empty());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn missing_input_file_errors() {
+            let path = tmp_path("does-not-exist");
+            let _ = fs::remove_file(&path);
+            let src = alloc::format!("echo hi < {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            assert!(ev.eval_program(&prog).is_err());
+        }
     }
 
     // ===== multistage pipeline + external exec (env-dependent) =====
