@@ -1424,6 +1424,45 @@ impl<B: MapBackend> Evaluator<B> {
                 self.instances.insert(key, InstanceEntry { methods });
                 Ok(Outcome::Status(0))
             }
+            CompoundKind::ModeDecl { spec, form } => self.eval_mode_decl(spec, form),
+        }
+    }
+
+    /// Apply a `mode` declaration. Parses the spec, runs the
+    /// modifier-monotonicity check against the current mode, then
+    /// installs the new mode according to the form.
+    fn eval_mode_decl(
+        &mut self,
+        spec: &str,
+        form: &crate::ast::ModeForm,
+    ) -> Result<Outcome> {
+        let new_mode = Mode::<B>::parse(spec).map_err(|e| match e {
+            KashError::Mode(m) => KashError::Mode(m),
+            other => other,
+        })?;
+        if !new_mode.modifiers_satisfy(&self.mode) {
+            return Err(KashError::Mode(alloc::format!(
+                "mode `{spec}` would drop a modifier active in the enclosing mode `{}`; modifiers may only be added by an inner declaration",
+                self.mode
+            )));
+        }
+        match form {
+            crate::ast::ModeForm::Block { body } => {
+                let saved = core::mem::replace(&mut self.mode, new_mode);
+                let result = self.eval_statements(body);
+                self.mode = saved;
+                result
+            }
+            crate::ast::ModeForm::Unbounded | crate::ast::ModeForm::Lexical => {
+                // Scope-bound auto-restore (the Lexical form) is
+                // wired alongside function / namespace frame
+                // capture in a later stage. For now both forms set
+                // the active mode and leave it set; that's correct
+                // at file scope (the common case) and merely less
+                // strict elsewhere.
+                self.mode = new_mode;
+                Ok(Outcome::Status(0))
+            }
         }
     }
 
@@ -1981,6 +2020,16 @@ impl<B: MapBackend> Evaluator<B> {
     /// - `${NAME?WORD}` / `${NAME:?WORD}` — error if unset/null
     /// - `${NAME+WORD}` / `${NAME:+WORD}` — alternate
     fn expand_braced(&mut self, body: &str) -> Result<String> {
+        // `.sh.*` introspection variables. Resolved first so the
+        // dotted reserved namespace never falls into the regular
+        // identifier-parsing path (which would reject the leading
+        // `.`). Per `project_shell_mode_syntax.md`, `.sh.mode` is
+        // structured: bare gives the full mode string, `.base`
+        // returns the base bucket, `.modifiers` returns the
+        // space-joined modifier list.
+        if let Some(out) = self.expand_dot_sh(body)? {
+            return Ok(out);
+        }
         // `${#NAME[subscript]}` / `${#NAME[@]}` — length forms. Have
         // to be checked before the operator-split because `#` here
         // is *not* a modifier-op.
@@ -2138,6 +2187,32 @@ impl<B: MapBackend> Evaluator<B> {
             }
             other => Err(KashError::Parse(format!(
                 "unsupported modifier `{other}` in `${{{body}}}`"
+            ))),
+        }
+    }
+
+    /// Resolve a `.sh.*` reserved-namespace variable inside `${…}`.
+    /// Returns `Ok(Some(value))` on a hit, `Ok(None)` if `body`
+    /// doesn't start with `.sh.`, and `Err` for malformed members.
+    fn expand_dot_sh(&self, body: &str) -> Result<Option<String>> {
+        let Some(rest) = body.strip_prefix(".sh.") else {
+            return Ok(None);
+        };
+        match rest {
+            "mode" => Ok(Some(alloc::format!("{}", self.mode))),
+            "mode.base" => Ok(Some(self.mode.base.as_str().to_string())),
+            "mode.modifiers" => {
+                let mut out = String::new();
+                for (i, m) in self.mode.modifiers.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(m.as_str());
+                }
+                Ok(Some(out))
+            }
+            other => Err(KashError::Parse(alloc::format!(
+                "unknown `.sh.{other}` introspection variable"
             ))),
         }
     }
@@ -6475,6 +6550,91 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== mode declaration =====
+
+    #[test]
+    fn mode_block_temporarily_changes_mode() {
+        let (_, out, _) = run(
+            "echo before=${.sh.mode}\n\
+             mode default-secure { echo inside=${.sh.mode}; }\n\
+             echo after=${.sh.mode}\n",
+        );
+        assert_eq!(
+            out,
+            "before=default\ninside=default-secure\nafter=default\n"
+        );
+    }
+
+    #[test]
+    fn mode_unbounded_persists_after_declaration() {
+        let (_, out, _) = run(
+            "echo a=${.sh.mode}\n\
+             mode default-secure\n\
+             echo b=${.sh.mode}\n",
+        );
+        assert_eq!(out, "a=default\nb=default-secure\n");
+    }
+
+    #[test]
+    fn mode_introspection_base_and_modifiers() {
+        let (_, out, _) = run(
+            "mode default-secure { echo base=${.sh.mode.base} mods=${.sh.mode.modifiers}; }\n",
+        );
+        assert_eq!(out, "base=default mods=secure\n");
+    }
+
+    #[test]
+    fn mode_unknown_name_errors() {
+        let src = "mode no-such-mode\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[test]
+    fn mode_inner_cannot_drop_outer_modifier() {
+        // `-secure` is active in the outer block; the inner `mode
+        // default` would drop it, so the declaration is rejected.
+        let src = "mode default-secure { mode default { :; }; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("modifier"), "got: {msg}");
+    }
+
+    #[test]
+    fn mode_inner_may_add_modifier() {
+        let (_, out, _) = run(
+            "mode default-secure {\n\
+                 mode default-secure {\n\
+                     echo nested=${.sh.mode}\n\
+                 }\n\
+             }\n",
+        );
+        assert_eq!(out, "nested=default-secure\n");
+    }
+
+    #[test]
+    fn mode_dash_l_form_parses() {
+        // `mode -L` is parser-only at this stage; just confirm it
+        // doesn't error and the mode value is reflected.
+        let (_, out, _) = run("mode -L default-secure\necho ${.sh.mode}\n");
+        assert_eq!(out, "default-secure\n");
+    }
+
+    #[test]
+    fn mode_keyword_not_reserved_as_command_name() {
+        // Outside head position the word `mode` is still usable as a
+        // function name — make sure parsing doesn't get confused.
+        let (_, out, _) = run(
+            "do_things() { :; }\n\
+             do_things mode arg2\n\
+             echo done\n",
+        );
+        assert_eq!(out, "done\n");
     }
 
     // ===== parameter expansion — strip / fold / replace / substring =====

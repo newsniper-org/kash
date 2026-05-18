@@ -347,6 +347,9 @@ impl<'src> Parser<'src> {
         if self.peek_bare_word()? == Some("namespace") {
             return self.parse_namespace_def().map(Command::Compound);
         }
+        if self.peek_bare_word()? == Some("mode") {
+            return self.parse_mode_decl().map(Command::Compound);
+        }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
         // error rather than tripping the `for` arm).
@@ -659,6 +662,65 @@ impl<'src> Parser<'src> {
 
     fn lexer_mut(&mut self) -> &mut Lexer<'src> {
         &mut self.lexer
+    }
+
+    // ---------- mode declaration ----------
+
+    /// Parse the three forms of `mode` declaration. The mode-name
+    /// token is taken verbatim and validated at run time by
+    /// `Mode::parse`; this keeps the parser oblivious to the set of
+    /// known bases / modifiers.
+    fn parse_mode_decl(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?; // "mode"
+        let start = kw.span.start;
+        // Optional `-L` flag — must come *before* the name.
+        let lexical = if self.peek_bare_word()? == Some("-L") {
+            self.bump()?;
+            true
+        } else {
+            false
+        };
+        let spec = match self.peek_bare_word()? {
+            Some(s) => s.to_string(),
+            None => {
+                return Err(KashError::Parse(
+                    "expected a mode name after `mode`".into(),
+                ));
+            }
+        };
+        self.bump()?;
+        // Block form? Detection is single-token only — the `{` must
+        // appear on the same line as the name. A `mode NAME\n{ … }`
+        // sequence is treated as an *unbounded* declaration followed
+        // by an unrelated brace group, matching how shell already
+        // treats statement boundaries elsewhere.
+        let form = if matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            if lexical {
+                return Err(KashError::Parse(
+                    "`mode -L NAME { … }` is not a valid form — pick either the block form `mode NAME { … }` or the lexical form `mode -L NAME`".into(),
+                ));
+            }
+            self.bump()?;
+            let body = self.parse_brace_body()?;
+            if !matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                return Err(KashError::Parse(
+                    "expected `}` to close `mode NAME { … }` block".into(),
+                ));
+            }
+            self.bump()?;
+            crate::ast::ModeForm::Block { body }
+        } else if lexical {
+            crate::ast::ModeForm::Lexical
+        } else {
+            crate::ast::ModeForm::Unbounded
+        };
+        let redirects = self.parse_trailing_redirects()?;
+        let end = redirects.last().map_or(start, |r| r.span.end);
+        Ok(CompoundCommand {
+            kind: CompoundKind::ModeDecl { spec, form },
+            redirects,
+            span: Span::new(start, end),
+        })
     }
 
     // ---------- namespace ----------

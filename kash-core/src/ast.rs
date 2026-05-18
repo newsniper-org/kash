@@ -271,6 +271,30 @@ pub enum CompoundKind {
         /// Method implementations.
         items: Vec<InstanceMember>,
     },
+    /// A `mode` declaration. Three source forms, all carried by the
+    /// [`ModeForm`] tag:
+    ///
+    ///   * `mode <name>` — unbounded; takes effect from the
+    ///     declaration's lexical position to the end of the
+    ///     enclosing scope, but does *not* auto-restore on scope
+    ///     exit. Idiomatic at file top.
+    ///   * `mode -L <name>` — lexical; takes effect from the
+    ///     declaration to the end of the enclosing scope and
+    ///     restores on scope exit. Idiomatic inside functions.
+    ///   * `mode <name> { body }` — block; runs `body` under the new
+    ///     mode and restores on block exit.
+    ///
+    /// The `spec` is the literal mode-name string as it appeared in
+    /// source (e.g. `"default-secure"`); the evaluator parses it
+    /// against `Mode::parse` at run time so unknown mode names
+    /// surface their error at the declaration site, not at parse.
+    /// Locked in `project_shell_mode_syntax.md`.
+    ModeDecl {
+        /// Raw mode-name string as written.
+        spec: String,
+        /// Source form (unbounded / lexical / block).
+        form: ModeForm,
+    },
     /// A namespace block. Source form: `namespace NAME { body }`.
     /// `NAME` is a single bare identifier (no embedded dots); to
     /// nest, write the namespace declarations nested. The body is a
@@ -304,6 +328,20 @@ pub enum CompoundKind {
         captures: Option<Vec<String>>,
         /// Function body. Always a compound command.
         body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// The three source forms of [`CompoundKind::ModeDecl`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModeForm {
+    /// `mode <name>` — no automatic restore on scope exit.
+    Unbounded,
+    /// `mode -L <name>` — automatic restore on enclosing-scope exit.
+    Lexical,
+    /// `mode <name> { body }` — automatic restore at end of block.
+    Block {
+        /// Statements that run under the temporarily-installed mode.
+        body: Vec<Statement>,
     },
 }
 
