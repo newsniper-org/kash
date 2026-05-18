@@ -189,24 +189,25 @@ impl<B: MapBackend> Scope<B> {
     /// described in the module docs.
     pub fn assign(&mut self, name: &str, value: Value) -> Result<()> {
         for frame in &self.frames {
-            if let Some(b) = frame.bindings.get(name) {
-                if b.readonly {
-                    return Err(KashError::Readonly(name.into()));
-                }
+            if let Some(b) = frame.bindings.get(name)
+                && b.readonly
+            {
+                return Err(KashError::Readonly(name.into()));
             }
         }
-        if let Some(top) = self.frames.last() {
-            if top.is_function_frame && top.static_scope {
-                let top = self.frames.last_mut().expect("just checked");
-                top.bindings.insert(
-                    name.to_string(),
-                    Binding {
-                        value,
-                        readonly: false,
-                    },
-                );
-                return Ok(());
-            }
+        if let Some(top) = self.frames.last()
+            && top.is_function_frame
+            && top.static_scope
+        {
+            let top = self.frames.last_mut().expect("just checked");
+            top.bindings.insert(
+                name.to_string(),
+                Binding {
+                    value,
+                    readonly: false,
+                },
+            );
+            return Ok(());
         }
         for i in (0..self.frames.len()).rev() {
             if self.frames[i].bindings.contains_key(name) {
@@ -235,10 +236,10 @@ impl<B: MapBackend> Scope<B> {
     /// frame, shadowing any outer binding.
     pub fn assign_local(&mut self, name: &str, value: Value) -> Result<()> {
         let top = self.frames.last_mut().expect("at least one frame");
-        if let Some(b) = top.bindings.get(name) {
-            if b.readonly {
-                return Err(KashError::Readonly(name.into()));
-            }
+        if let Some(b) = top.bindings.get(name)
+            && b.readonly
+        {
+            return Err(KashError::Readonly(name.into()));
         }
         top.bindings.insert(
             name.to_string(),
@@ -296,10 +297,10 @@ impl<B: MapBackend> Scope<B> {
     #[must_use]
     pub fn is_readonly(&self, name: &str) -> bool {
         for frame in &self.frames {
-            if let Some(b) = frame.bindings.get(name) {
-                if b.readonly {
-                    return true;
-                }
+            if let Some(b) = frame.bindings.get(name)
+                && b.readonly
+            {
+                return true;
             }
         }
         false

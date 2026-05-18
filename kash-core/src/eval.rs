@@ -288,10 +288,11 @@ impl<B: MapBackend> Evaluator<B> {
             // ERR trap fires on a non-zero status whenever it would
             // also trigger `errexit` — i.e. anywhere outside an
             // explicitly-checked context (condition list, etc.).
-            if !outcome.success() && self.errexit_active {
-                if let Some(cmd) = self.traps.get("ERR").cloned() {
-                    let _ = self.run_trap_command(&cmd);
-                }
+            if !outcome.success()
+                && self.errexit_active
+                && let Some(cmd) = self.traps.get("ERR").cloned()
+            {
+                let _ = self.run_trap_command(&cmd);
             }
             if self.options.errexit && self.errexit_active && !outcome.success() {
                 return Ok(Outcome::Exit(outcome.status()));
@@ -1570,18 +1571,18 @@ impl<B: MapBackend> Evaluator<B> {
         if name == "#" {
             return self.positionals.len().to_string();
         }
-        if name.len() == 1 {
-            if let Some(d) = name.chars().next().and_then(|c| c.to_digit(10)) {
-                let n = d as usize;
-                if n == 0 {
-                    return String::new();
-                }
-                return self
-                    .positionals
-                    .get(n - 1)
-                    .cloned()
-                    .unwrap_or_default();
+        if name.len() == 1
+            && let Some(d) = name.chars().next().and_then(|c| c.to_digit(10))
+        {
+            let n = d as usize;
+            if n == 0 {
+                return String::new();
             }
+            return self
+                .positionals
+                .get(n - 1)
+                .cloned()
+                .unwrap_or_default();
         }
         self.scope
             .get(name)
@@ -1602,18 +1603,18 @@ impl<B: MapBackend> Evaluator<B> {
         if name == "#" {
             return Ok(self.positionals.len().to_string());
         }
-        if name.len() == 1 {
-            if let Some(d) = name.chars().next().and_then(|c| c.to_digit(10)) {
-                let n = d as usize;
-                if n == 0 {
-                    return Ok(String::new());
-                }
-                return Ok(self
-                    .positionals
-                    .get(n - 1)
-                    .cloned()
-                    .unwrap_or_default());
+        if name.len() == 1
+            && let Some(d) = name.chars().next().and_then(|c| c.to_digit(10))
+        {
+            let n = d as usize;
+            if n == 0 {
+                return Ok(String::new());
             }
+            return Ok(self
+                .positionals
+                .get(n - 1)
+                .cloned()
+                .unwrap_or_default());
         }
         match self.scope.get(name) {
             Some(v) => Ok(v.to_scalar_string()),
@@ -3132,7 +3133,7 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
     fn try_read_identifier(&mut self) -> Option<String> {
         self.skip_ws();
         let start = self.pos;
-        let Some(c) = self.peek() else { return None };
+        let c = self.peek()?;
         if !(c == '_' || c.is_ascii_alphabetic()) {
             return None;
         }
@@ -3272,12 +3273,12 @@ fn read_backtick_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) ->
             return Ok(body);
         }
         if c == '\\' {
-            if let Some(&n) = chars.peek() {
-                if matches!(n, '$' | '`' | '\\') {
-                    chars.next();
-                    body.push(n);
-                    continue;
-                }
+            if let Some(&n) = chars.peek()
+                && matches!(n, '$' | '`' | '\\')
+            {
+                chars.next();
+                body.push(n);
+                continue;
             }
             body.push('\\');
             continue;
@@ -3403,12 +3404,11 @@ fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
     // ksh93 / bash extglob: `?(p)` / `*(p)` / `+(p)` / `@(p)` / `!(p)`.
     if matches!(p0, Some(b'?' | b'*' | b'+' | b'@' | b'!'))
         && pat.get(1) == Some(&b'(')
+        && let Some((inner, rest_off)) = extglob_split(pat)
     {
-        if let Some((inner, rest_off)) = extglob_split(pat) {
-            let head = pat[0];
-            let rest = &pat[rest_off..];
-            return extglob_match(head, &inner, rest, s);
-        }
+        let head = pat[0];
+        let rest = &pat[rest_off..];
+        return extglob_match(head, &inner, rest, s);
     }
     match (p0, s0) {
         (None, None) => true,
@@ -3510,9 +3510,7 @@ fn extglob_alternatives(body: &[u8]) -> Vec<Vec<u8>> {
                 current.push(b);
             }
             b')' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 current.push(b);
             }
             b'[' => {
@@ -3553,10 +3551,10 @@ fn extglob_match(head: u8, inner: &[u8], rest: &[u8], s: &[u8]) -> bool {
                 return true;
             }
             for alt in &alts {
-                if let Some(after) = consume_once(alt, s) {
-                    if glob_match_bytes(rest, after) {
-                        return true;
-                    }
+                if let Some(after) = consume_once(alt, s)
+                    && glob_match_bytes(rest, after)
+                {
+                    return true;
                 }
             }
             false
@@ -3564,10 +3562,10 @@ fn extglob_match(head: u8, inner: &[u8], rest: &[u8], s: &[u8]) -> bool {
         b'@' => {
             // Exactly one occurrence.
             for alt in &alts {
-                if let Some(after) = consume_once(alt, s) {
-                    if glob_match_bytes(rest, after) {
-                        return true;
-                    }
+                if let Some(after) = consume_once(alt, s)
+                    && glob_match_bytes(rest, after)
+                {
+                    return true;
                 }
             }
             false

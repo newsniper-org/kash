@@ -173,13 +173,8 @@ impl<'src> Parser<'src> {
     /// statements inside a compound body. Returns whether we just ate
     /// a `&` — callers use this to override the trailing terminator.
     fn skip_statement_separators(&mut self) -> Result<()> {
-        loop {
-            match self.peek_kind()? {
-                TokenKind::Newline | TokenKind::Op(Op::Semi) => {
-                    self.bump()?;
-                }
-                _ => break,
-            }
+        while let TokenKind::Newline | TokenKind::Op(Op::Semi) = self.peek_kind()? {
+            self.bump()?;
         }
         Ok(())
     }
@@ -873,10 +868,10 @@ impl<'src> Parser<'src> {
         let mut out = Vec::new();
         loop {
             self.skip_newlines()?;
-            if let Some(r) = self.peek_reserved()? {
-                if enders.contains(&r) {
-                    return Ok(out);
-                }
+            if let Some(r) = self.peek_reserved()?
+                && enders.contains(&r)
+            {
+                return Ok(out);
             }
             if matches!(self.peek_kind()?, TokenKind::Eof) {
                 return Err(KashError::Parse(format!(

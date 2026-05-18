@@ -633,11 +633,11 @@ impl<'src> Lexer<'src> {
                     // single parameter reference. The trailing byte is
                     // *not* a word-byte on its own (`#` would start a
                     // comment, etc.), so absorb it explicitly here.
-                    if let Some(n) = self.peek_at(1) {
-                        if matches!(n, b'?' | b'#' | b'$' | b'!' | b'@' | b'*' | b'0'..=b'9') {
-                            self.pos += 2;
-                            continue;
-                        }
+                    if let Some(n) = self.peek_at(1)
+                        && matches!(n, b'?' | b'#' | b'$' | b'!' | b'@' | b'*' | b'0'..=b'9')
+                    {
+                        self.pos += 2;
+                        continue;
                     }
                 }
                 self.pos += 1;
