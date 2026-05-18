@@ -412,6 +412,19 @@ impl<'src> Parser<'src> {
 
         // Phase 2: command name + arguments + redirects.
         loop {
+            // FD-prefix redirect: `2>file`, `1>&2`, etc. A bare-Word
+            // token consisting entirely of decimal digits, followed
+            // *adjacently* (no whitespace) by a redirect operator,
+            // becomes a redirect whose `fd` field is the digits.
+            if let Some(fd) = self.peek_fd_prefix()? {
+                let fd_tok = self.bump()?;
+                let mut r = self.parse_redirect()?;
+                r.fd = Some(fd);
+                r.span = Span::new(fd_tok.span.start, r.span.end);
+                end = r.span.end;
+                redirects.push(r);
+                continue;
+            }
             match self.peek_kind()? {
                 TokenKind::Word(_)
                 | TokenKind::SingleQuoted(_)
@@ -450,6 +463,40 @@ impl<'src> Parser<'src> {
             return Ok(false);
         };
         Ok(looks_like_assignment(s))
+    }
+
+    /// If the next token is a bare all-digits Word and is immediately
+    /// followed (no whitespace) by a redirect operator, return the
+    /// digit value to attach as the redirect's `fd`. Otherwise
+    /// returns `Ok(None)`.
+    fn peek_fd_prefix(&mut self) -> Result<Option<i32>> {
+        // Materialise the first two tokens up front so the rest of
+        // this function can inspect them without nested mutable
+        // borrows of `self`.
+        self.peek_at(0)?;
+        self.peek_at(1)?;
+        let t0 = &self.peeked[0];
+        let TokenKind::Word(s) = &t0.kind else {
+            return Ok(None);
+        };
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let w_end = t0.span.end;
+        let t1 = &self.peeked[1];
+        if t1.span.start != w_end {
+            return Ok(None);
+        }
+        let TokenKind::Op(op) = t1.kind else {
+            return Ok(None);
+        };
+        if !is_redirect_op(op) {
+            return Ok(None);
+        }
+        let fd: i32 = s
+            .parse()
+            .map_err(|_| KashError::Parse(format!("invalid fd prefix `{s}`")))?;
+        Ok(Some(fd))
     }
 
     /// Parse a single word, absorbing any adjacent word-like tokens
@@ -501,6 +548,8 @@ impl<'src> Parser<'src> {
             Op::AmpGt => RedirectKind::OutputBoth,
             Op::AmpGtGt => RedirectKind::AppendBoth,
             Op::TripleLt => RedirectKind::HereString,
+            Op::GtAmp => RedirectKind::DupOutput,
+            Op::LtAmp => RedirectKind::DupInput,
             other => {
                 return Err(KashError::Parse(format!(
                     "unsupported redirect operator {other:?}"
@@ -1205,6 +1254,8 @@ const fn is_redirect_op(op: Op) -> bool {
             | Op::TripleLt
             | Op::DoubleLt
             | Op::DoubleLtDash
+            | Op::GtAmp
+            | Op::LtAmp
     )
 }
 

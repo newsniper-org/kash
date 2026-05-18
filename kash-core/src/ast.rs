@@ -68,6 +68,12 @@ pub enum RedirectKind {
     OutputBoth,
     /// `&>>file` — both stdout and stderr to `file`, append.
     AppendBoth,
+    /// `[n]>&m` — duplicate fd `m` onto fd `n` for the command's
+    /// duration. `target` carries the right-hand side as a word
+    /// (typically a single decimal number, or `-` to close).
+    DupOutput,
+    /// `[n]<&m` — duplicate fd `m` onto fd `n` (input side).
+    DupInput,
     /// `<<<word` — feed `word` (plus a trailing newline) as stdin.
     /// `target` carries the word.
     HereString,

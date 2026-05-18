@@ -1145,10 +1145,13 @@ ifstd!({
             use crate::ast::RedirectKind;
             for r in redirects {
                 match r.kind {
-                    RedirectKind::HereString | RedirectKind::HereDoc { .. } => {
-                        // Inline-body redirects with no command name
-                        // have nothing to feed to — POSIX says they
-                        // simply succeed.
+                    RedirectKind::HereString
+                    | RedirectKind::HereDoc { .. }
+                    | RedirectKind::DupOutput
+                    | RedirectKind::DupInput => {
+                        // Inline-body and fd-dup redirects with no
+                        // command name have nothing to feed to —
+                        // POSIX says they simply succeed.
                     }
                     _ => {
                         let path = self.expand_word(&r.target)?;
@@ -1181,11 +1184,15 @@ ifstd!({
                     .create(true)
                     .open(path),
                 RedirectKind::Input => OpenOptions::new().read(true).open(path),
-                RedirectKind::HereString | RedirectKind::HereDoc { .. } => {
-                    // Caller is expected to route inline-body redirects
-                    // through the in_inline path, not the file path.
+                RedirectKind::HereString
+                | RedirectKind::HereDoc { .. }
+                | RedirectKind::DupOutput
+                | RedirectKind::DupInput => {
+                    // Caller is expected to route inline-body and
+                    // fd-dup redirects through their own paths, not
+                    // the file path.
                     return Err(KashError::Runtime(
-                        "internal: open_redirect_file called for an inline-body redirect".into(),
+                        "internal: open_redirect_file called for a non-file redirect".into(),
                     ));
                 }
             };
@@ -1211,42 +1218,112 @@ ifstd!({
             use crate::ast::RedirectKind;
             use std::io::{Read, Write};
             use std::process::{Command, Stdio};
-            // Resolve all redirect targets up front (so e.g. an
-            // unreadable input file fails before we run anything).
-            let mut out_file: Option<std::fs::File> = None;
-            let mut both: bool = false;
+            // Resolved per-fd routing. Built up by walking the
+            // redirect list in source order: each entry either opens
+            // a file, redirects an inline payload, or duplicates one
+            // of the standard streams onto another.
+            let mut stdout_file: Option<std::fs::File> = None;
+            let mut stderr_file: Option<std::fs::File> = None;
             let mut in_file: Option<std::fs::File> = None;
-            // Inline stdin payload from `<<<` / `<<DELIM`. Mutually
-            // exclusive with `in_file` — the later form wins, matching
-            // POSIX "last redirect to a stream replaces previous ones".
             let mut in_inline: Option<alloc::vec::Vec<u8>> = None;
+            // Cross-stream dup flags. `stderr_follows_stdout` covers
+            // `2>&1` *and* the `&>` / `&>>` forms; `stdout_follows_stderr`
+            // covers `1>&2`. The order of writes through the redirect
+            // list resets these as needed.
+            let mut stderr_follows_stdout: bool = false;
+            let mut stdout_follows_stderr: bool = false;
             for r in &cmd.redirects {
+                let fd_hint = r.fd.unwrap_or_else(|| default_fd_for(r.kind));
                 match r.kind {
-                    RedirectKind::Input
-                    | RedirectKind::Output
-                    | RedirectKind::Append
-                    | RedirectKind::OutputBoth
-                    | RedirectKind::AppendBoth => {
+                    RedirectKind::Input => {
                         let path = self.expand_word(&r.target)?;
                         let f = self.open_redirect_file(r.kind, &path)?;
-                        match r.kind {
-                            RedirectKind::Input => {
-                                in_file = Some(f);
-                                in_inline = None;
+                        if fd_hint != 0 {
+                            return Err(KashError::Runtime(alloc::format!(
+                                "redirecting fd {fd_hint} for input isn't supported yet"
+                            )));
+                        }
+                        in_file = Some(f);
+                        in_inline = None;
+                    }
+                    RedirectKind::Output | RedirectKind::Append => {
+                        let path = self.expand_word(&r.target)?;
+                        let f = self.open_redirect_file(r.kind, &path)?;
+                        match fd_hint {
+                            1 => {
+                                stdout_file = Some(f);
+                                stdout_follows_stderr = false;
                             }
-                            RedirectKind::Output | RedirectKind::Append => {
-                                out_file = Some(f);
-                                both = false;
+                            2 => {
+                                stderr_file = Some(f);
+                                stderr_follows_stdout = false;
                             }
-                            RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
-                                out_file = Some(f);
-                                both = true;
+                            other => {
+                                return Err(KashError::Runtime(alloc::format!(
+                                    "redirecting fd {other} isn't supported yet"
+                                )));
                             }
-                            _ => unreachable!(),
                         }
                     }
+                    RedirectKind::OutputBoth | RedirectKind::AppendBoth => {
+                        let path = self.expand_word(&r.target)?;
+                        let f = self.open_redirect_file(r.kind, &path)?;
+                        stdout_file = Some(f);
+                        stderr_follows_stdout = true;
+                        stdout_follows_stderr = false;
+                    }
+                    RedirectKind::DupOutput => {
+                        let target = self.expand_word(&r.target)?;
+                        if target == "-" {
+                            // `[n]>&-` close — collapse the sink to
+                            // /dev/null by clearing any file routing.
+                            // Approximate: route to inherit, which is
+                            // visually identical for most uses.
+                            match fd_hint {
+                                1 => {
+                                    stdout_file = None;
+                                    stdout_follows_stderr = false;
+                                }
+                                2 => {
+                                    stderr_file = None;
+                                    stderr_follows_stdout = false;
+                                }
+                                other => {
+                                    return Err(KashError::Runtime(alloc::format!(
+                                        "closing fd {other} isn't supported yet"
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
+                        let src_fd: i32 = target.parse().map_err(|_| {
+                            KashError::Runtime(alloc::format!(
+                                "`{target}` is not a valid file descriptor"
+                            ))
+                        })?;
+                        match (fd_hint, src_fd) {
+                            (2, 1) => {
+                                stderr_follows_stdout = true;
+                                stderr_file = None;
+                            }
+                            (1, 2) => {
+                                stdout_follows_stderr = true;
+                                stdout_file = None;
+                            }
+                            (a, b) if a == b => { /* self-dup is a no-op */ }
+                            _ => {
+                                return Err(KashError::Runtime(alloc::format!(
+                                    "fd dup {fd_hint}>&{src_fd} isn't supported yet"
+                                )));
+                            }
+                        }
+                    }
+                    RedirectKind::DupInput => {
+                        return Err(KashError::Runtime(
+                            "input-side fd duplication isn't supported yet".into(),
+                        ));
+                    }
                     RedirectKind::HereString => {
-                        // `<<<word` — expansion + a trailing newline.
                         let text = self.expand_word(&r.target)?;
                         let mut bytes = text.into_bytes();
                         bytes.push(b'\n');
@@ -1254,11 +1331,6 @@ ifstd!({
                         in_inline = Some(bytes);
                     }
                     RedirectKind::HereDoc { strip_tabs: _ } => {
-                        // The parser stored the body verbatim in the
-                        // first segment of `target`. A `Bare` segment
-                        // means "subject to expansion"; a quoted
-                        // segment means "verbatim". `expand_word`
-                        // already honours that distinction.
                         let text = self.expand_word(&r.target)?;
                         let bytes = text.into_bytes();
                         in_file = None;
@@ -1266,6 +1338,12 @@ ifstd!({
                     }
                 }
             }
+            // Compatibility shim with the older two-flag layout the
+            // rest of this function used: `out_file` / `both` from the
+            // pre-fd-routing world.
+            let out_file = stdout_file;
+            let both = stderr_follows_stdout;
+            let stderr_routed_file = stderr_file;
 
             let name = argv[0].as_str();
             let is_function = self.functions.contains_key(name);
@@ -1304,21 +1382,63 @@ ifstd!({
                 } else {
                     c.stdin(Stdio::inherit());
                 }
+                // Resolve stdout / stderr sinks from the fd-routing
+                // state we built up above.
                 let has_out = out_file.is_some();
-                if let Some(f) = out_file {
-                    if both {
-                        let f2 = f.try_clone().map_err(|e| {
-                            KashError::Runtime(alloc::format!("dup: {e}"))
-                        })?;
-                        c.stdout(Stdio::from(f));
-                        c.stderr(Stdio::from(f2));
-                    } else {
-                        c.stdout(Stdio::from(f));
-                        c.stderr(Stdio::inherit());
+                let stderr_file_clone = stderr_routed_file
+                    .as_ref()
+                    .map(|f| {
+                        f.try_clone()
+                            .map_err(|e| KashError::Runtime(alloc::format!("dup: {e}")))
+                    })
+                    .transpose()?;
+                match out_file {
+                    Some(f) => {
+                        if both {
+                            let f2 = f.try_clone().map_err(|e| {
+                                KashError::Runtime(alloc::format!("dup: {e}"))
+                            })?;
+                            c.stdout(Stdio::from(f));
+                            c.stderr(Stdio::from(f2));
+                        } else {
+                            c.stdout(Stdio::from(f));
+                            // stderr follows whatever its own routing says.
+                            if let Some(ef) = stderr_routed_file {
+                                c.stderr(Stdio::from(ef));
+                            } else {
+                                c.stderr(Stdio::inherit());
+                            }
+                        }
                     }
-                } else {
-                    c.stdout(Stdio::piped());
-                    c.stderr(Stdio::inherit());
+                    None => {
+                        if stdout_follows_stderr {
+                            // `1>&2` with no stdout file routing.
+                            // If stderr was sent to a file, send
+                            // stdout to a clone of that handle;
+                            // otherwise fall back to inheriting (real
+                            // dup of the terminal — both end up at
+                            // the same tty).
+                            if let Some(ef) = stderr_file_clone {
+                                c.stdout(Stdio::from(ef));
+                            } else {
+                                c.stdout(Stdio::inherit());
+                            }
+                            if let Some(ef) = stderr_routed_file {
+                                c.stderr(Stdio::from(ef));
+                            } else {
+                                c.stderr(Stdio::inherit());
+                            }
+                        } else {
+                            // No stdout file routing — capture into
+                            // the evaluator's output buffer.
+                            c.stdout(Stdio::piped());
+                            if let Some(ef) = stderr_routed_file {
+                                c.stderr(Stdio::from(ef));
+                            } else {
+                                c.stderr(Stdio::inherit());
+                            }
+                        }
+                    }
                 }
                 let mut child = c.spawn().map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
@@ -1516,6 +1636,20 @@ ifstd!({
         }
     }
 });
+
+/// Default file descriptor for a redirect whose operator doesn't
+/// carry an explicit `N>` prefix. POSIX:
+/// stdout for output-side ops, stdin for input-side ops, stderr for
+/// `2>&1`-shaped dups that omit their fd (the dup target stays in
+/// the right-hand-side word).
+const fn default_fd_for(kind: crate::ast::RedirectKind) -> i32 {
+    use crate::ast::RedirectKind::*;
+    match kind {
+        Input | HereString | HereDoc { .. } | DupInput => 0,
+        Output | Append | OutputBoth | AppendBoth => 1,
+        DupOutput => 1,
+    }
+}
 
 fn is_builtin_name(name: &str) -> bool {
     matches!(
@@ -2615,6 +2749,102 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== fd-prefixed redirects + fd dups =====
+
+    #[cfg(feature = "std")]
+    mod fd_redirect_tests {
+        use super::*;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        fn have(p: &str) -> bool {
+            Path::new(p).exists()
+        }
+
+        fn tmp(name: &str) -> PathBuf {
+            let mut p = std::env::temp_dir();
+            p.push(alloc::format!(
+                "kash-fd-{}-{}",
+                std::process::id(),
+                name
+            ));
+            p
+        }
+
+        #[test]
+        fn fd_prefix_2_redirects_stderr() {
+            // /bin/sh -c 'echo err 1>&2' writes "err" to stderr.
+            // Redirecting fd 2 to a file should capture it; stdout
+            // should be empty.
+            if !have("/bin/sh") {
+                return;
+            }
+            let path = tmp("a.err");
+            let src = alloc::format!(
+                "/bin/sh -c 'echo err 1>&2' 2> {}",
+                path.display()
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert!(ev.take_output().is_empty());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "err\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn stderr_to_stdout_dup_then_file() {
+            if !have("/bin/sh") {
+                return;
+            }
+            // `cmd > file 2>&1` — both streams routed to `file`.
+            let path = tmp("b.both");
+            let src = alloc::format!(
+                "/bin/sh -c 'echo out; echo err 1>&2' > {} 2>&1",
+                path.display()
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let body = fs::read_to_string(&path).unwrap();
+            assert!(body.contains("out\n"), "got: {body:?}");
+            assert!(body.contains("err\n"), "got: {body:?}");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn fd_prefix_1_explicit_stdout_redirect() {
+            if !have("/bin/echo") {
+                return;
+            }
+            let path = tmp("c.out");
+            let src = alloc::format!("/bin/echo explicit 1> {}", path.display());
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "explicit\n");
+            let _ = fs::remove_file(&path);
+        }
+
+        #[test]
+        fn fd_prefix_2_append() {
+            if !have("/bin/sh") {
+                return;
+            }
+            let path = tmp("d.append");
+            fs::write(&path, "previous\n").unwrap();
+            let src = alloc::format!(
+                "/bin/sh -c 'echo err 1>&2' 2>> {}",
+                path.display()
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "previous\nerr\n");
+            let _ = fs::remove_file(&path);
+        }
     }
 
     // ===== glob enhancements =====
