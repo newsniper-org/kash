@@ -494,10 +494,15 @@ impl<B: MapBackend> Evaluator<B> {
                 ));
             }
         }
-        // Phase 3: dispatch. Function lookup first (per POSIX, regular
-        // builtins lose to user functions); then builtins; then NotFound
-        // until external exec lands.
+        // Phase 3: dispatch. Try the typeclass explicit-dispatch
+        // form first (`Typeclass::Type::method` lexes as one Word, so
+        // a regular function name can never match it), then function
+        // lookup (POSIX: regular builtins lose to user functions),
+        // then builtins, then external exec.
         let name = argv[0].as_str();
+        if let Some(out) = self.try_dispatch_typeclass(name, &argv)? {
+            return Ok(out);
+        }
         if self.functions.contains_key(name) {
             return self.call_function(&argv);
         }
@@ -1016,6 +1021,62 @@ impl<B: MapBackend> Evaluator<B> {
     }
 
     // ---------- function call ----------
+
+    /// Explicit typeclass dispatch. Recognises a command name of the
+    /// `Typeclass::Type::method` shape and routes the call into the
+    /// matching instance's method body — falling back to the
+    /// typeclass's default body if the instance doesn't override the
+    /// method.
+    ///
+    /// Returns `Ok(None)` when the name doesn't fit the shape or the
+    /// typeclass simply isn't registered, so the caller can fall
+    /// through to ordinary function / builtin / external dispatch.
+    /// Returns `Ok(Some(_))` if the dispatch found a body and ran it,
+    /// or an error if a typeclass-shaped name matched a known
+    /// typeclass but no method body was available.
+    fn try_dispatch_typeclass(
+        &mut self,
+        name: &str,
+        argv: &[String],
+    ) -> Result<Option<Outcome>> {
+        let parts: alloc::vec::Vec<&str> = name.splitn(3, "::").collect();
+        if parts.len() != 3 {
+            return Ok(None);
+        }
+        let (tc, ty, method) = (parts[0], parts[1], parts[2]);
+        if !self.typeclasses.contains_key(tc) {
+            return Ok(None);
+        }
+        // Resolution: instance method beats typeclass default.
+        let instance_body = self
+            .instances
+            .get(&(tc.to_string(), ty.to_string()))
+            .and_then(|i| i.methods.get(method))
+            .cloned();
+        let body = match instance_body {
+            Some(b) => b,
+            None => self
+                .typeclasses
+                .get(tc)
+                .and_then(|t| t.defaults.get(method))
+                .cloned()
+                .ok_or_else(|| {
+                    KashError::NotFound(alloc::format!(
+                        "typeclass method `{tc}::{ty}::{method}`"
+                    ))
+                })?,
+        };
+        // Run the body like a function call: swap positionals, push
+        // a static-scope function frame, eval, restore.
+        let saved = core::mem::replace(&mut self.positionals, argv[1..].to_vec());
+        self.positionals_stack.push(saved);
+        self.scope.push_function_frame(true);
+        let result = self.eval_compound(&body);
+        self.scope.pop();
+        let restored = self.positionals_stack.pop().expect("just pushed");
+        self.positionals = restored;
+        result.map(Some)
+    }
 
     fn call_function(&mut self, argv: &[String]) -> Result<Outcome> {
         let entry = self
@@ -5409,6 +5470,72 @@ mod tests {
     #[test]
     fn instance_requires_for_keyword() {
         assert!(parse("instance Eq Int { foo() { :; } }").is_err());
+    }
+
+    // ===== typeclass / instance — stage 2: explicit dispatch =====
+
+    #[test]
+    fn explicit_dispatch_finds_instance_method() {
+        let (_, out, _) = run(
+            "typeclass Greeter { hello() { echo default; }; }\n\
+             instance Greeter for Int { hello() { echo from_int; }; }\n\
+             Greeter::Int::hello\n",
+        );
+        assert_eq!(out, "from_int\n");
+    }
+
+    #[test]
+    fn explicit_dispatch_falls_back_to_default_method() {
+        // No instance for String — should hit the default body.
+        let (_, out, _) = run(
+            "typeclass Greeter { hello() { echo default_hello; }; }\n\
+             Greeter::String::hello\n",
+        );
+        assert_eq!(out, "default_hello\n");
+    }
+
+    #[test]
+    fn explicit_dispatch_args_become_positionals() {
+        let (_, out, _) = run(
+            "typeclass Add { go() { echo \"sum is $1 $2\"; }; }\n\
+             instance Add for Int { go() { echo \"int sum: $1+$2\"; }; }\n\
+             Add::Int::go 3 4\n",
+        );
+        assert_eq!(out, "int sum: 3+4\n");
+    }
+
+    #[test]
+    fn unknown_typeclass_falls_through_to_not_found() {
+        // No registered typeclass `Nope` — should produce a
+        // NotFound (the regular external-command-not-found path).
+        let prog = parse("Nope::Int::run").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn typeclass_without_method_errors() {
+        // Typeclass exists but the method name doesn't.
+        let prog = parse(
+            "typeclass Eq { eq() { :; } }; Eq::Int::compare",
+        )
+        .unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    #[test]
+    fn explicit_dispatch_uses_instance_over_default() {
+        // Both default and instance are present — instance wins.
+        let (_, out, _) = run(
+            "typeclass Pick { choose() { echo default; }; }\n\
+             instance Pick for Int { choose() { echo instance; }; }\n\
+             Pick::Int::choose\n\
+             Pick::Other::choose\n",
+        );
+        assert_eq!(out, "instance\ndefault\n");
     }
 
     // ===== arrays + typeset =====
