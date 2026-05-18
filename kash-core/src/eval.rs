@@ -185,10 +185,11 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// (each function carries the namespace path it was *defined* in
     /// so callers see the lexical view inside the body).
     namespace_path: Vec<String>,
-    /// Mode-restoration stack, one entry per active function call.
-    /// `Some(saved_mode)` means "restore this on exit"; `None` means
-    /// "an unbounded `mode` declaration inside this function has
-    /// asked the change to propagate to the caller — don't restore".
+    /// Mode-restoration stack, one entry per active mode-scoping
+    /// frame (function call or `mode <name> { … }` block).
+    /// `Some(saved_mode)` means "restore this on exit"; `None`
+    /// means an unbounded `mode` declaration has propagated through
+    /// this frame and the corresponding restore must be skipped.
     /// Locked by `project_shell_mode_syntax.md`.
     function_mode_save: Vec<Option<Mode<B>>>,
     /// Typeclass registry: typeclass name → default methods. Filled
@@ -1477,27 +1478,34 @@ impl<B: MapBackend> Evaluator<B> {
         }
         match form {
             crate::ast::ModeForm::Block { body } => {
-                let saved = core::mem::replace(&mut self.mode, new_mode);
+                // A block frame pushes a save slot of its own so
+                // an inner unbounded `mode` declaration can walk
+                // *through* the block to reach the caller (the
+                // unbounded arm below clears every slot in the
+                // stack, not just the topmost one).
+                self.function_mode_save.push(Some(self.mode.clone()));
+                self.mode = new_mode;
                 let result = self.eval_statements(body);
-                self.mode = saved;
+                if let Some(Some(saved)) = self.function_mode_save.pop() {
+                    self.mode = saved;
+                }
                 result
             }
             crate::ast::ModeForm::Lexical => {
                 // Scope-bound: the change lasts until the enclosing
-                // function frame pops. At file scope (no function
-                // frame), it persists for the rest of the file —
+                // function frame (or block frame) pops. At file
+                // scope, persists for the rest of the file —
                 // identical to the unbounded form there.
                 self.mode = new_mode;
                 Ok(Outcome::Status(0))
             }
             crate::ast::ModeForm::Unbounded => {
-                // Unbounded: change persists past the enclosing
-                // function frame, propagating to the caller. We
-                // signal that by clearing the topmost mode-save
-                // slot (if any) so the function-exit restore is a
-                // no-op.
+                // Unbounded: change persists past every enclosing
+                // scope frame, propagating outward to the file
+                // scope. We clear every save slot on the stack so
+                // none of the frames will restore on exit.
                 self.mode = new_mode;
-                if let Some(slot) = self.function_mode_save.last_mut() {
+                for slot in self.function_mode_save.iter_mut() {
                     *slot = None;
                 }
                 Ok(Outcome::Status(0))
@@ -6704,6 +6712,45 @@ mod tests {
              echo ${.sh.mode}\n",
         );
         assert_eq!(out, "default-secure\n");
+    }
+
+    #[test]
+    fn mode_unbounded_propagates_through_block() {
+        // Per `project_shell_mode_syntax.md`: unbounded "현재 scope
+        // 끝까지 + 바깥으로도 전파". The block must not restore
+        // when the inner unbounded form has marked propagation.
+        let (_, out, _) = run(
+            "mode default { mode default-secure; echo inner=${.sh.mode}; }\n\
+             echo outer=${.sh.mode}\n",
+        );
+        assert_eq!(out, "inner=default-secure\nouter=default-secure\n");
+    }
+
+    #[test]
+    fn mode_unbounded_propagates_through_block_inside_function() {
+        // Same as above but nested in a function. The propagation
+        // must reach the function's caller, too.
+        let (_, out, _) = run(
+            "function f { mode default { mode default-secure; }; }\n\
+             f\n\
+             echo ${.sh.mode}\n",
+        );
+        assert_eq!(out, "default-secure\n");
+    }
+
+    #[test]
+    fn mode_dash_l_inside_block_does_not_escape_block() {
+        // `-L` is scope-bound, so the block's auto-restore on
+        // exit cancels the change as expected — even though
+        // function_mode_save now also covers blocks.
+        let (_, out, _) = run(
+            "mode default {\n\
+                 mode -L default-secure\n\
+                 echo a=${.sh.mode}\n\
+             }\n\
+             echo b=${.sh.mode}\n",
+        );
+        assert_eq!(out, "a=default-secure\nb=default\n");
     }
 
     #[test]
