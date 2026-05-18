@@ -8,19 +8,23 @@
 //!
 //! Feature flags:
 //!
-//! - `std` *(default)* — pulls in the full standard library. Required for
-//!   anything that touches the filesystem, environment, threads, signals
-//!   or terminal I/O.
-//! - `alloc` — heap-allocated containers without the rest of `std`.
-//!   Implied by `std`. Lets the language core (parser, AST, evaluator on
-//!   in-memory values, mode system, typeclass dispatch) run in `no_std`
-//!   targets that nonetheless have a heap allocator.
+//! - `alloc` *(default)* — heap-allocated containers without the rest of
+//!   `std`. Lets the language core (parser, AST, evaluator on in-memory
+//!   values, mode system, typeclass dispatch) run in `no_std` targets
+//!   that have a heap allocator.
+//! - `std` — pulls in the full standard library. Required for anything
+//!   that touches the filesystem, environment, threads, signals, or
+//!   terminal I/O. Implies `alloc`.
 //!
-//! `--no-default-features` (neither `std` nor `alloc`) is not a supported
-//! configuration: the engine fundamentally needs a heap.
+//! `--no-default-features` (neither feature) is rejected by a
+//! `compile_error!` — the engine fundamentally needs a heap.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
+// Several engine modules are placeholders in this commit. Silence the
+// resulting dead-code/unused-imports lints crate-wide until each module
+// gains real content; the lints come back as content lands.
+#![allow(dead_code, unused_imports)]
 
 #[cfg(not(feature = "alloc"))]
 compile_error!(
@@ -31,6 +35,15 @@ compile_error!(
 extern crate alloc;
 
 use kash_macros::ifstd;
+
+pub mod error;
+pub mod mode;
+pub mod value;
+mod ast;
+mod eval;
+mod lexer;
+mod parser;
+mod scope;
 
 /// Semantic version of this crate, as in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
