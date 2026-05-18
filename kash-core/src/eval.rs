@@ -3037,6 +3037,54 @@ impl<B: MapBackend> Evaluator<B> {
         }
     }
 
+    /// Compose `$<name>` against the active venv `env { … }`
+    /// overlays. Returns `Some(value)` only if at least one venv
+    /// frame on the stack actually wrote to (or transformed) the
+    /// entry; `None` means callers should fall through to the
+    /// regular scope lookup. The walk is outer-to-inner so a
+    /// `PathPrepend` in an inner venv ends up first.
+    fn venv_env_value(&self, name: &str) -> Option<String> {
+        use crate::ast::EnvDirective;
+        let mut value: Option<String> = None;
+        for frame in &self.venv_stack {
+            for d in &frame.env_directives {
+                match d {
+                    EnvDirective::Set { name: n, value: v } if n == name => {
+                        value = Some(v.clone());
+                    }
+                    EnvDirective::PathPrepend { dir } if name == "PATH" => {
+                        let base = value.clone().unwrap_or_else(|| self.scope_path());
+                        value = Some(if base.is_empty() {
+                            dir.clone()
+                        } else {
+                            alloc::format!("{dir}:{base}")
+                        });
+                    }
+                    EnvDirective::PathAppend { dir } if name == "PATH" => {
+                        let base = value.clone().unwrap_or_else(|| self.scope_path());
+                        value = Some(if base.is_empty() {
+                            dir.clone()
+                        } else {
+                            alloc::format!("{base}:{dir}")
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        value
+    }
+
+    /// Read `PATH` from the regular variable scope (no venv
+    /// overlay). Used as the base for `PATH-prepend` / `PATH-append`
+    /// accumulation when no inner venv has already set it.
+    fn scope_path(&self) -> String {
+        self.resolve_var_name("PATH")
+            .and_then(|n| self.scope.get(&n))
+            .map(|v| v.to_scalar_string())
+            .unwrap_or_default()
+    }
+
     /// Like [`lookup_param`](Self::lookup_param) but never triggers
     /// `nounset`. Used by modifier forms (`${VAR:-…}`, `${VAR:+…}`,
     /// …) that explicitly handle the unset case themselves.
@@ -3059,6 +3107,12 @@ impl<B: MapBackend> Evaluator<B> {
                 .get(n - 1)
                 .cloned()
                 .unwrap_or_default();
+        }
+        // venv env overlay wins over the regular scope — that's
+        // what makes `echo $PYTHONHOME` inside a venv see the
+        // overlay value, not the parent shell's.
+        if let Some(v) = self.venv_env_value(name) {
+            return v;
         }
         match self.resolve_var_name(name) {
             Some(resolved) => self
@@ -3095,6 +3149,10 @@ impl<B: MapBackend> Evaluator<B> {
                 .get(n - 1)
                 .cloned()
                 .unwrap_or_default());
+        }
+        // venv overlay first.
+        if let Some(v) = self.venv_env_value(name) {
+            return Ok(v);
         }
         let resolved = self.resolve_var_name(name);
         match resolved.as_ref().and_then(|n| self.scope.get(n)) {
@@ -8274,6 +8332,75 @@ mod tests {
             "mode posix-aware\nvenv x { body { echo ok; }; }\n",
         );
         assert_eq!(out, "ok\n");
+    }
+
+    // ===== venv — env overlay visible inside kash =====
+
+    #[test]
+    fn venv_env_set_visible_to_kash_lookup() {
+        let (_, out, _) = run(
+            "venv proj { env { FOO=bar } body { echo $FOO; } }\n",
+        );
+        assert_eq!(out, "bar\n");
+    }
+
+    #[test]
+    fn venv_env_overlay_invisible_after_pop() {
+        let (_, out, _) = run(
+            "venv proj { env { FOO=bar } body { echo $FOO; } }\n\
+             echo \"[$FOO]\"\n",
+        );
+        assert_eq!(out, "bar\n[]\n");
+    }
+
+    #[test]
+    fn venv_env_path_prepend_visible_to_kash_lookup() {
+        let (_, out, _) = run(
+            "PATH=/usr/bin\n\
+             venv proj { env { PATH-prepend /opt/venv/bin } body { echo $PATH; } }\n",
+        );
+        assert_eq!(out, "/opt/venv/bin:/usr/bin\n");
+    }
+
+    #[test]
+    fn venv_env_path_append_visible_to_kash_lookup() {
+        let (_, out, _) = run(
+            "PATH=/usr/bin\n\
+             venv proj { env { PATH-append /opt/extra/bin } body { echo $PATH; } }\n",
+        );
+        assert_eq!(out, "/usr/bin:/opt/extra/bin\n");
+    }
+
+    #[test]
+    fn venv_env_inner_shadows_outer_for_set() {
+        let (_, out, _) = run(
+            "venv outer { env { X=outer } body {\n\
+                 echo $X\n\
+                 venv inner { env { X=inner } body { echo $X; } }\n\
+                 echo $X\n\
+             } }\n",
+        );
+        assert_eq!(out, "outer\ninner\nouter\n");
+    }
+
+    #[test]
+    fn venv_env_path_prepends_stack_inside_out() {
+        let (_, out, _) = run(
+            "PATH=/usr/bin\n\
+             venv outer { env { PATH-prepend /outer/bin } body {\n\
+                 echo $PATH\n\
+                 venv inner { env { PATH-prepend /inner/bin } body { echo $PATH; } }\n\
+                 echo $PATH\n\
+             } }\n",
+        );
+        // outer adds /outer/bin in front; inner adds /inner/bin in
+        // front of the outer view; outer restored on exit.
+        assert_eq!(
+            out,
+            "/outer/bin:/usr/bin\n\
+             /inner/bin:/outer/bin:/usr/bin\n\
+             /outer/bin:/usr/bin\n"
+        );
     }
 
     // ===== venv — v.1 surface =====
