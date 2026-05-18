@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "kash-core",
+    "kash-gadt",
     "kash-macros",
 ]
 # `kash-line-editor` is a submodule with its own `[workspace]` (because it

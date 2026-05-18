@@ -1,0 +1,16 @@
+[package]
+name = "kash-gadt"
+description = "GAT-based map/set storage abstraction for the kash shell engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Project-wide policy: kash workspace crates default to no_std + alloc.
+# Downstream pulls in `std` only when its backend implementation needs it
+# (e.g. an `std::collections::HashMap` impl would gate behind `std`).
+default = ["alloc"]
+alloc = []
+std = ["alloc"]

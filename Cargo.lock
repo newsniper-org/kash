@@ -6,8 +6,13 @@ version = 4
 name = "kash-core"
 version = "0.1.0-posix2024-pre"
 dependencies = [
+ "kash-gadt",
  "kash-macros",
 ]
+
+[[package]]
+name = "kash-gadt"
+version = "0.1.0-posix2024-pre"
 
 [[package]]
 name = "kash-macros"

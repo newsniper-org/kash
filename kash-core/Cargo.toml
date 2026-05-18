@@ -12,12 +12,13 @@ repository.workspace = true
 # Consumers (kash-bin, downstream embedders) explicitly opt into `std`
 # when they need filesystem, environment, threads, signals, terminal IO.
 default = ["alloc"]
-std = ["alloc"]
+std = ["alloc", "kash-gadt/std"]
 # `alloc` enables heap-allocated containers (Vec/String/Box/etc.) without
 # requiring the rest of the standard library. The engine fundamentally
 # needs a heap, so bare-`no_std` (neither feature) is rejected by a
 # `compile_error!` in lib.rs.
-alloc = []
+alloc = ["kash-gadt/alloc"]
 
 [dependencies]
+kash-gadt = { path = "../kash-gadt", default-features = false }
 kash-macros = { path = "../kash-macros", default-features = false }
