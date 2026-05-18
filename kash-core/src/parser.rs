@@ -603,42 +603,59 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Handle `<<DELIM` / `<<-DELIM`. Reads the delimiter word, then
-    /// (after the line's terminating newline) pulls the body text
-    /// from the lexer's raw buffer up to the closing delimiter line.
+    /// Handle `<<DELIM` / `<<-DELIM`. Reads the delimiter word and
+    /// then any *introducer-line trailing tokens* (so forms like
+    /// `cat <<EOF | wc -l` work) by buffering them aside. The
+    /// terminating newline of the introducer line is consumed, the
+    /// here-doc body is pulled from the lexer's raw buffer, and the
+    /// buffered tokens are pushed back onto the parser's lookahead
+    /// queue so the caller continues parsing as if they'd appeared
+    /// on a new line.
     fn parse_heredoc(&mut self, op_start: usize, op: Op) -> Result<Redirect> {
         let strip_tabs = matches!(op, Op::DoubleLtDash);
-        // Delimiter word.
         let delim_word = self.parse_word()?;
         let (delim_text, quoted) = extract_heredoc_delim(&delim_word);
-        // POSIX permits the rest of the introducer line to carry
-        // additional tokens, but the minimal here-doc path supports
-        // exactly `<<DELIM<newline>` — bail out cleanly otherwise.
-        match self.peek_kind()? {
-            TokenKind::Newline => {
-                self.bump()?;
-            }
-            TokenKind::Eof => {
-                return Err(KashError::Parse(
-                    "here-doc body missing — input ended right after delimiter".into(),
-                ));
-            }
-            other => {
-                return Err(KashError::Parse(format!(
-                    "here-doc minimal form requires a newline immediately after `<<{delim_text}`, got {other:?}"
-                )));
+        // Collect everything from the introducer line that comes
+        // *after* the delimiter, up to (and consuming) the
+        // line-terminating newline. These tokens belong to whatever
+        // pipeline / list construct surrounds the redirect; we'll
+        // re-insert them into the lookahead queue after reading the
+        // body.
+        let mut trailing: Vec<Token> = Vec::new();
+        loop {
+            match self.peek_kind()? {
+                TokenKind::Newline => {
+                    self.bump()?; // consume the newline
+                    break;
+                }
+                TokenKind::Eof => {
+                    return Err(KashError::Parse(
+                        "here-doc body missing — input ended before the body could start".into(),
+                    ));
+                }
+                _ => {
+                    trailing.push(self.bump()?);
+                }
             }
         }
-        // Drain any tokens the lexer pre-buffered before the newline.
-        self.peeked.clear();
+        // Body lives in the lexer's raw byte stream, *immediately*
+        // after the line we just consumed.
+        debug_assert!(
+            self.peeked.is_empty(),
+            "all introducer-line tokens should have been drained into `trailing`"
+        );
         let body_start = self.lexer_pos();
         let body = self
             .lexer_mut()
             .read_heredoc_body(&delim_text, strip_tabs)?;
         let body_end = self.lexer_pos();
-        // The captured body becomes the redirect's `target` Word.
-        // `Bare` payload → expansion happens at eval time; quoted →
-        // pass through verbatim.
+        // Push the buffered introducer-line tokens back onto the
+        // lookahead queue so the surrounding parser sees them.
+        // They were collected in source order; insert in reverse at
+        // the front so the order is preserved.
+        for tok in trailing.into_iter().rev() {
+            self.peeked.insert(0, tok);
+        }
         let segment = if quoted {
             WordSegment::SingleQuoted(body)
         } else {
