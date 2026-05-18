@@ -212,6 +212,12 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// that wants to route it elsewhere (a real `stderr` fd, a debug
     /// pane, …) can drain just this buffer.
     trace_output: String,
+    /// Stderr-style diagnostic buffer for shell-emitted messages
+    /// like `kash: cmd: command not found` and capability-denied
+    /// notices. Distinct from `trace_output` (xtrace) because the
+    /// host typically wants to route the two to different sinks.
+    /// CLI entry points drain it via [`Evaluator::take_stderr`].
+    stderr_output: String,
     /// Currently active mode. Not yet consulted (mode declarations
     /// aren't wired in), but threaded so callers can construct an
     /// evaluator under e.g. `default-secure`.
@@ -304,6 +310,7 @@ impl<B: MapBackend> Evaluator<B> {
             last_status: 0,
             output: String::new(),
             trace_output: String::new(),
+            stderr_output: String::new(),
             mode,
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
@@ -759,10 +766,49 @@ impl<B: MapBackend> Evaluator<B> {
         self.eval_command(&pipe.stages[0])
     }
 
+    /// Buffer an error message destined for stderr. CLI entry
+    /// points flush `take_stderr()` into the real stderr after
+    /// `eval_program` returns; embedders see the buffer directly.
+    fn report_to_stderr(&mut self, msg: &str) {
+        self.stderr_output.push_str(msg);
+        self.stderr_output.push('\n');
+    }
+
+    /// Drain the buffered stderr output. Returns whatever was
+    /// written through `report_to_stderr` since the last drain.
+    pub fn take_stderr(&mut self) -> String {
+        core::mem::take(&mut self.stderr_output)
+    }
+
     fn eval_command(&mut self, cmd: &Command) -> Result<Outcome> {
-        match cmd {
+        let result = match cmd {
             Command::Simple(s) => self.eval_simple(s),
             Command::Compound(c) => self.eval_compound(c),
+        };
+        // POSIX 2.8.2: an external command-not-found surfaces as
+        // exit status 127, *not* a shell-fatal error. `||` / `&&`
+        // / `if … then` / explicit status checks all rely on that.
+        // Capability-denied (kash extension) maps to 126 — POSIX
+        // "command found but not invocable" — for the same reason.
+        // Generic `KashError::NotFound` (typeclass / instance
+        // declarations against undefined names, etc.) keeps
+        // propagating — those are declarative errors, not command
+        // dispatch failures.
+        match result {
+            Ok(o) => Ok(o),
+            Err(KashError::ExternalNotFound(name)) => {
+                self.report_to_stderr(&alloc::format!(
+                    "kash: {name}: command not found"
+                ));
+                Ok(Outcome::Status(127))
+            }
+            Err(KashError::CapabilityDenied(msg)) => {
+                self.report_to_stderr(&alloc::format!(
+                    "kash: capability denied: {msg}"
+                ));
+                Ok(Outcome::Status(126))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -922,7 +968,7 @@ impl<B: MapBackend> Evaluator<B> {
         }
         #[cfg(not(feature = "std"))]
         {
-            Err(KashError::NotFound(format!("command `{}`", argv[0])))
+            Err(KashError::ExternalNotFound(argv[0].clone()))
         }
     }
 
@@ -3653,7 +3699,7 @@ ifstd!({
                 }
                 let mut child = c.spawn().map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                        KashError::ExternalNotFound(argv[0].clone())
                     } else {
                         KashError::Runtime(alloc::format!("exec: {e}"))
                     }
@@ -3732,7 +3778,7 @@ ifstd!({
             cmd.stderr(Stdio::inherit());
             let mut child = cmd.spawn().map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                    KashError::ExternalNotFound(argv[0].clone())
                 } else {
                     KashError::Runtime(alloc::format!("exec `{}`: {e}", argv[0]))
                 }
@@ -3864,7 +3910,7 @@ ifstd!({
 
                 let mut child = cmd.spawn().map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                        KashError::ExternalNotFound(argv[0].clone())
                     } else {
                         KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
                     }
@@ -6658,8 +6704,8 @@ mod tests {
     fn unalias_removes_entry() {
         let prog = parse("alias foo='echo hi'; unalias foo; foo").unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
-        assert_eq!(err.exit_code(), 127);
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 127);
     }
 
     #[test]
@@ -7342,27 +7388,25 @@ mod tests {
         #[test]
         fn venv_revoking_fs_write_blocks_output_redirect() {
             let tmp = std::env::temp_dir().join("kash-venv-fs.txt");
+            // Pre-emptively remove any stray file from a previous
+            // run so the existence check after the venv body is
+            // definitive.
+            let _ = std::fs::remove_file(&tmp);
             let path = tmp.to_str().unwrap();
             let src = alloc::format!(
                 "venv tight {{ capabilities {{ profile basic }} body {{ echo data >{path}; }} }}\n"
             );
-            // `basic` profile has fs-read + exec-spawn but *not*
-            // fs-write — so `>file` must fail.
             let prog = parse(&src).unwrap();
             let mut ev = Evaluator::new();
-            let err = ev.eval_program(&prog).unwrap_err();
-            assert_eq!(err.exit_code(), 126);
-            let msg = alloc::format!("{err}");
-            assert!(msg.contains("fs-write"), "got: {msg}");
-            // And no file got created (the open call failed before
-            // any data was written).
+            let outcome = ev.eval_program(&prog).unwrap();
+            assert_eq!(outcome.status(), 126);
+            let err = ev.take_stderr();
+            assert!(err.contains("fs-write"), "got: {err}");
             assert!(!tmp.exists(), "file should not exist");
         }
 
         #[test]
         fn venv_revoking_fs_read_blocks_input_redirect() {
-            // Write a file we then can't read from inside a tight
-            // venv. Profile `none` strips fs-read.
             let tmp = std::env::temp_dir().join("kash-venv-fs-read.txt");
             std::fs::write(&tmp, "secret\n").unwrap();
             let path = tmp.to_str().unwrap();
@@ -7371,10 +7415,10 @@ mod tests {
             );
             let prog = parse(&src).unwrap();
             let mut ev = Evaluator::new();
-            let err = ev.eval_program(&prog).unwrap_err();
-            assert_eq!(err.exit_code(), 126);
-            let msg = alloc::format!("{err}");
-            assert!(msg.contains("fs-read"), "got: {msg}");
+            let outcome = ev.eval_program(&prog).unwrap();
+            assert_eq!(outcome.status(), 126);
+            let err = ev.take_stderr();
+            assert!(err.contains("fs-read"), "got: {err}");
             let _ = std::fs::remove_file(&tmp);
         }
 
@@ -7646,12 +7690,13 @@ mod tests {
 
     #[test]
     fn unknown_typeclass_falls_through_to_not_found() {
-        // No registered typeclass `Nope` — should produce a
-        // NotFound (the regular external-command-not-found path).
+        // No registered typeclass `Nope` — dispatch falls through
+        // to external-command lookup which also misses, surfacing
+        // POSIX exit status 127.
         let prog = parse("Nope::Int::run").unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
-        assert_eq!(err.exit_code(), 127);
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 127);
     }
 
     #[test]
@@ -7737,8 +7782,8 @@ mod tests {
     fn inferred_dispatch_unknown_typeclass_falls_through() {
         let prog = parse("Nope::run 1 2 3").unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
-        assert_eq!(err.exit_code(), 127);
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 127);
     }
 
     // ===== typeclass / instance — stage 4: signature-only members =====
@@ -7856,10 +7901,10 @@ mod tests {
                    hello\n";
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
+        let outcome = ev.eval_program(&prog).unwrap();
         // Without an external exec path in --lib tests, an
-        // unresolved bare name surfaces as a 127.
-        assert_eq!(err.exit_code(), 127);
+        // unresolved bare name surfaces as POSIX status 127.
+        assert_eq!(outcome.status(), 127);
     }
 
     #[test]
@@ -8175,8 +8220,11 @@ mod tests {
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
         // Outside the namespace and without a `use`, the bare
-        // `Sayer` isn't resolvable.
-        assert!(ev.eval_program(&prog).is_err());
+        // `Sayer::Int::say` isn't resolvable — dispatch falls
+        // through to external lookup which also misses, surfacing
+        // POSIX status 127.
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 127);
     }
 
     #[test]
@@ -8334,6 +8382,51 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== command-not-found / capability-denied → status =====
+
+    #[test]
+    fn unknown_command_lets_or_continue() {
+        // The whole point of mapping ExternalNotFound to status
+        // 127: `||` and friends can recover from it.
+        let (_, out, _) = run("nope_xyz || echo recovered\n");
+        assert_eq!(out, "recovered\n");
+    }
+
+    #[test]
+    fn unknown_command_stderr_message_buffered() {
+        let prog = parse("nope_xyz || true").unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let err = ev.take_stderr();
+        assert!(err.contains("nope_xyz: command not found"), "got: {err}");
+    }
+
+    #[test]
+    fn capability_denied_lets_or_continue() {
+        let src = "venv tight { capabilities { profile none } body {\n\
+                       /bin/ls || echo recovered\n\
+                   } }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        ev.eval_program(&prog).unwrap();
+        let out = ev.take_output();
+        assert!(out.contains("recovered"), "got: {out}");
+    }
+
+    #[test]
+    fn unknown_command_with_errexit_still_aborts() {
+        // POSIX errexit: a non-zero status from the *first*
+        // command of the list (no `||`, no `&&`, no `if`) aborts.
+        let prog = parse("set -e\nnope_xyz\necho should-not-run\n").unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        // The evaluator returns Outcome::Exit(127) on errexit; the
+        // `echo` line never runs.
+        assert!(outcome.status() == 127 || outcome.is_exit_request());
+        let out = ev.take_output();
+        assert!(!out.contains("should-not-run"), "got: {out}");
     }
 
     // ===== double-quote backslash escape =====
@@ -8615,17 +8708,19 @@ mod tests {
     #[test]
     fn venv_revoking_exec_spawn_blocks_external_command() {
         // `profile none` denies everything, including exec-spawn.
-        // The external `/bin/ls` call should be capability-denied.
+        // The external `/bin/ls` call surfaces as POSIX status 126
+        // (kash's capability-denied mapping); the rationale goes
+        // out through the stderr buffer.
         let src = "venv tight {\n\
                        capabilities { profile none }\n\
                        body { /bin/ls /tmp; }\n\
                    }\n";
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
-        assert_eq!(err.exit_code(), 126);
-        let msg = alloc::format!("{err}");
-        assert!(msg.contains("exec-spawn"), "got: {msg}");
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 126);
+        let err = ev.take_stderr();
+        assert!(err.contains("exec-spawn"), "got: {err}");
     }
 
     #[test]
@@ -8638,10 +8733,10 @@ mod tests {
                    }\n";
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
-        let err = ev.eval_program(&prog).unwrap_err();
-        assert_eq!(err.exit_code(), 126);
-        let msg = alloc::format!("{err}");
-        assert!(msg.contains("allow-cmd"), "got: {msg}");
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 126);
+        let err = ev.take_stderr();
+        assert!(err.contains("allow-cmd"), "got: {err}");
     }
 
     #[test]
@@ -9303,10 +9398,16 @@ mod tests {
     }
 
     #[test]
-    fn substitution_propagates_runtime_error() {
-        let prog = parse("X=$(false; nope_not_a_real_cmd_xyzzy)").unwrap();
+    fn substitution_external_not_found_does_not_propagate() {
+        // POSIX 2.6.3: command substitution captures stdout; a
+        // command-not-found inside the substitution doesn't abort
+        // the host shell — it just leaves the captured value
+        // possibly-empty and surfaces as the assignment's own
+        // status (`X=...` is always success).
+        let prog = parse("X=$(false; nope_not_a_real_cmd_xyzzy); echo done").unwrap();
         let mut ev = Evaluator::new();
-        assert!(ev.eval_program(&prog).is_err());
+        assert!(ev.eval_program(&prog).is_ok());
+        assert!(ev.take_output().contains("done"));
     }
 
     // ===== IFS field splitting =====
@@ -9540,12 +9641,16 @@ mod tests {
     #[cfg(not(feature = "std"))]
     #[test]
     fn external_command_unknown_in_alloc_only() {
+        // POSIX status 127 — but propagated through the
+        // `eval_command` recovery, so it's an `Ok(Status(127))`
+        // outcome, not a `KashError`. The original "command not
+        // found" message lands in the stderr buffer.
         let prog = parse("definitely_not_a_real_command").unwrap();
         let mut ev = Evaluator::new();
-        assert_eq!(
-            ev.eval_program(&prog).unwrap_err().exit_code(),
-            127
-        );
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 127);
+        let err = ev.take_stderr();
+        assert!(err.contains("command not found"), "got: {err}");
     }
 
     #[cfg(feature = "std")]
@@ -9596,8 +9701,10 @@ mod tests {
         fn external_unknown_is_not_found() {
             let prog = parse("definitely_not_a_real_command_xyzzy_42").unwrap();
             let mut ev = Evaluator::new();
-            let err = ev.eval_program(&prog).unwrap_err();
-            assert_eq!(err.exit_code(), 127);
+            let outcome = ev.eval_program(&prog).unwrap();
+            assert_eq!(outcome.status(), 127);
+            let err = ev.take_stderr();
+            assert!(err.contains("command not found"), "got: {err}");
         }
 
         #[test]

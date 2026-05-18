@@ -56,6 +56,13 @@ pub enum KashError {
     /// because the variant carries a `std::io::Error`.
     #[cfg(feature = "std")]
     Io(std::io::Error),
+    /// External command name didn't resolve at spawn time
+    /// (executable not on PATH, or not on the venv's PATH overlay).
+    /// Distinct from generic [`KashError::NotFound`] because POSIX
+    /// requires this specific case to surface as exit status `127`
+    /// rather than abort the shell — `||`, `&&`, `if`, and explicit
+    /// status checks all rely on that.
+    ExternalNotFound(String),
     /// venv capability check denied an operation. Carries a
     /// human-readable description of what was attempted and which
     /// capability / allow-list rule blocked it. POSIX exit code
@@ -83,7 +90,7 @@ impl KashError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Parse(_) | Self::Mode(_) => 2,
-            Self::NotFound(_) => 127,
+            Self::NotFound(_) | Self::ExternalNotFound(_) => 127,
             Self::CapabilityDenied(_) => 126,
             Self::LeakyJobs(_) => 3,
             Self::Runtime(_)
@@ -108,6 +115,7 @@ impl fmt::Display for KashError {
             }
             Self::AssertionFailed(msg) => write!(f, "assertion failed: {msg}"),
             Self::NotFound(name) => write!(f, "not found: {name}"),
+            Self::ExternalNotFound(name) => write!(f, "{name}: command not found"),
             Self::Readonly(name) => write!(f, "read-only: {name}"),
             Self::SecureViolation(msg) => write!(f, "-secure violation: {msg}"),
             Self::Mode(msg) => write!(f, "mode error: {msg}"),

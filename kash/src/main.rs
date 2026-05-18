@@ -86,6 +86,13 @@ fn main() -> ExitCode {
     let captured = ev.take_output();
     print!("{captured}");
     let _ = io::stdout().flush();
+    // Drain the evaluator's stderr buffer (command-not-found
+    // notices, capability-denied notices, …) to the real stderr.
+    let err_buf = ev.take_stderr();
+    if !err_buf.is_empty() {
+        eprint!("{err_buf}");
+        let _ = io::stderr().flush();
+    }
     match outcome {
         Ok(o) => ExitCode::from(clamp_status(o.status())),
         Err(e) => {
