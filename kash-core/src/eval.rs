@@ -730,8 +730,15 @@ impl Evaluator {
             };
             let value = if next == '(' {
                 chars.next();
-                let body = read_paren_body(&mut chars)?;
-                self.run_command_substitution(&body)?
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let body = read_arith_body(&mut chars)?;
+                    let v = self.eval_arith(&body)?;
+                    alloc::format!("{v}")
+                } else {
+                    let body = read_paren_body(&mut chars)?;
+                    self.run_command_substitution(&body)?
+                }
             } else if next == '{' {
                 chars.next();
                 let mut depth = 1usize;
@@ -809,6 +816,23 @@ impl Evaluator {
         }
     }
 
+    /// Evaluate a POSIX integer arithmetic expression. `$VAR`-style
+    /// references inside the body are expanded *before* the parser
+    /// runs (so e.g. `$((`X` + `$X`))` both work); bare names are
+    /// looked up directly during parsing.
+    fn eval_arith(&mut self, src: &str) -> Result<i64> {
+        let mut expanded = String::new();
+        self.expand_dollar(src, &mut expanded)?;
+        let mut parser = ArithParser {
+            src: &expanded,
+            pos: 0,
+            ev: self,
+        };
+        let v = parser.parse_expr()?;
+        parser.expect_end()?;
+        Ok(v)
+    }
+
     /// Parse `src` as kash source, run it in a fresh subshell-style
     /// context (environment snapshot + isolated output buffer), then
     /// return the captured stdout with trailing newlines stripped.
@@ -857,9 +881,16 @@ impl Evaluator {
             };
             if next == '(' {
                 chars.next();
-                let body = read_paren_body(&mut chars)?;
-                let value = self.run_command_substitution(&body)?;
-                out.push_str(&value);
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let body = read_arith_body(&mut chars)?;
+                    let v = self.eval_arith(&body)?;
+                    out.push_str(&alloc::format!("{v}"));
+                } else {
+                    let body = read_paren_body(&mut chars)?;
+                    let value = self.run_command_substitution(&body)?;
+                    out.push_str(&value);
+                }
             } else if next == '{' {
                 chars.next(); // consume `{`
                 let mut depth = 1usize;
@@ -1592,6 +1623,291 @@ fn parse_name_eq_value(arg: &str) -> Result<(alloc::string::String, alloc::strin
 
 /// True iff `s` is a POSIX shell identifier (`_` or letter, then
 /// `_` / letters / digits).
+/// Read the body of an arithmetic expansion `$((…))` up to and
+/// including the matching `))`. The caller has already consumed the
+/// leading `$((`. Tracks balanced inner parens so that
+/// `$((a + (b - c)))` reads `a + (b - c)` for the body.
+fn read_arith_body(chars: &mut core::iter::Peekable<core::str::Chars<'_>>) -> Result<String> {
+    let mut depth = 0usize;
+    let mut body = String::new();
+    while let Some(c) = chars.next() {
+        if c == '(' {
+            depth += 1;
+            body.push(c);
+        } else if c == ')' {
+            if depth > 0 {
+                depth -= 1;
+                body.push(c);
+            } else if chars.peek() == Some(&')') {
+                chars.next();
+                return Ok(body);
+            } else {
+                return Err(KashError::Parse(
+                    "expected `))` to close `$((`".into(),
+                ));
+            }
+        } else {
+            body.push(c);
+        }
+    }
+    Err(KashError::Parse(
+        "unterminated `$((...))` arithmetic expansion".into(),
+    ))
+}
+
+/// Recursive-descent arithmetic parser. Operates on a string buffer
+/// (already through `$VAR` substitution) and looks up bare
+/// identifiers via the evaluator's scope.
+///
+/// Supported surface (POSIX-baseline subset):
+///
+/// - integer literals (decimal),
+/// - bare identifiers (looked up in scope; unset/empty → 0),
+/// - parenthesised groups,
+/// - unary `+ - !`,
+/// - binary `* / %`, `+ -`, `< <= > >=`, `== !=`, `&&`, `||`.
+///
+/// Not yet wired: bitwise (`& | ^ ~ << >>`), assignment (`= += …`),
+/// pre/post `++ --`, ternary `?:`, comma operator, octal/hex literals.
+/// They land when the arithmetic story grows past the bare minimum.
+struct ArithParser<'a, 'e> {
+    src: &'a str,
+    pos: usize,
+    ev: &'e mut Evaluator,
+}
+
+impl<'a, 'e> ArithParser<'a, 'e> {
+    fn parse_expr(&mut self) -> Result<i64> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_and()?;
+        while self.try_consume("||") {
+            let rhs = self.parse_and()?;
+            lhs = (lhs != 0 || rhs != 0) as i64;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_eq()?;
+        while self.try_consume("&&") {
+            let rhs = self.parse_eq()?;
+            lhs = (lhs != 0 && rhs != 0) as i64;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_eq(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_rel()?;
+        loop {
+            if self.try_consume("==") {
+                let rhs = self.parse_rel()?;
+                lhs = (lhs == rhs) as i64;
+            } else if self.try_consume("!=") {
+                let rhs = self.parse_rel()?;
+                lhs = (lhs != rhs) as i64;
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_rel(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            // `<=` / `>=` must beat the single-char forms.
+            if self.try_consume("<=") {
+                let rhs = self.parse_add()?;
+                lhs = (lhs <= rhs) as i64;
+            } else if self.try_consume(">=") {
+                let rhs = self.parse_add()?;
+                lhs = (lhs >= rhs) as i64;
+            } else if self.try_consume("<") {
+                let rhs = self.parse_add()?;
+                lhs = (lhs < rhs) as i64;
+            } else if self.try_consume(">") {
+                let rhs = self.parse_add()?;
+                lhs = (lhs > rhs) as i64;
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_add(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_mul()?;
+        loop {
+            self.skip_ws();
+            if self.try_consume("+") {
+                let rhs = self.parse_mul()?;
+                lhs = lhs
+                    .checked_add(rhs)
+                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+            } else if self.try_consume("-") {
+                let rhs = self.parse_mul()?;
+                lhs = lhs
+                    .checked_sub(rhs)
+                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_mul(&mut self) -> Result<i64> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            self.skip_ws();
+            if self.try_consume("*") {
+                let rhs = self.parse_unary()?;
+                lhs = lhs
+                    .checked_mul(rhs)
+                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+            } else if self.try_consume("/") {
+                let rhs = self.parse_unary()?;
+                if rhs == 0 {
+                    return Err(KashError::Runtime("arithmetic: divide by zero".into()));
+                }
+                lhs /= rhs;
+            } else if self.try_consume("%") {
+                let rhs = self.parse_unary()?;
+                if rhs == 0 {
+                    return Err(KashError::Runtime("arithmetic: modulo by zero".into()));
+                }
+                lhs %= rhs;
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<i64> {
+        self.skip_ws();
+        if self.try_consume("+") {
+            return self.parse_unary();
+        }
+        if self.try_consume("-") {
+            let v = self.parse_unary()?;
+            return v
+                .checked_neg()
+                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()));
+        }
+        if self.try_consume("!") {
+            // Defend against the `!=` lookahead: `try_consume("!=")` is
+            // handled above; here `!` alone is logical-NOT.
+            let v = self.parse_unary()?;
+            return Ok((v == 0) as i64);
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<i64> {
+        self.skip_ws();
+        if self.try_consume("(") {
+            let v = self.parse_expr()?;
+            self.skip_ws();
+            if !self.try_consume(")") {
+                return Err(KashError::Parse(
+                    "arithmetic: expected `)`".into(),
+                ));
+            }
+            return Ok(v);
+        }
+        if let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_digit() {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let lit = &self.src[start..self.pos];
+                return lit
+                    .parse::<i64>()
+                    .map_err(|_| KashError::Parse(alloc::format!("arithmetic: invalid integer `{lit}`")));
+            }
+            if c == '_' || c.is_ascii_alphabetic() {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c == '_' || c.is_ascii_alphanumeric() {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let name = self.src[start..self.pos].to_string();
+                let value = self
+                    .ev
+                    .scope
+                    .get(&name)
+                    .map(|v| v.to_scalar_string())
+                    .unwrap_or_default();
+                if value.is_empty() {
+                    return Ok(0);
+                }
+                return value.trim().parse::<i64>().map_err(|_| {
+                    KashError::Runtime(alloc::format!(
+                        "arithmetic: `{name}`'s value `{value}` is not a number"
+                    ))
+                });
+            }
+        }
+        Err(KashError::Parse(alloc::format!(
+            "arithmetic: unexpected character at position {}",
+            self.pos
+        )))
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn try_consume(&mut self, s: &str) -> bool {
+        self.skip_ws();
+        if self.src[self.pos..].starts_with(s) {
+            self.pos += s.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
+
+    fn advance(&mut self) {
+        if let Some(c) = self.peek() {
+            self.pos += c.len_utf8();
+        }
+    }
+
+    fn expect_end(&mut self) -> Result<()> {
+        self.skip_ws();
+        if self.pos < self.src.len() {
+            return Err(KashError::Parse(alloc::format!(
+                "arithmetic: trailing input `{}`",
+                &self.src[self.pos..]
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Read a `$( … )` body up to and including the matching `)`. The
 /// leading `$(` is expected to have already been consumed. Returns
 /// the raw body between the parens (without the parens themselves).
@@ -2128,6 +2444,92 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== arithmetic expansion =====
+
+    #[test]
+    fn arith_basic_add() {
+        let (_, out, _) = run("echo $((1 + 2))");
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn arith_precedence() {
+        let (_, out, _) = run("echo $((2 + 3 * 4))");
+        assert_eq!(out, "14\n");
+        let (_, out, _) = run("echo $(((2 + 3) * 4))");
+        assert_eq!(out, "20\n");
+    }
+
+    #[test]
+    fn arith_division_and_modulo() {
+        let (_, out, _) = run("echo $((10 / 3))");
+        assert_eq!(out, "3\n");
+        let (_, out, _) = run("echo $((10 % 3))");
+        assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn arith_unary_minus_and_negation() {
+        let (_, out, _) = run("echo $((-5))");
+        assert_eq!(out, "-5\n");
+        let (_, out, _) = run("echo $((!0))");
+        assert_eq!(out, "1\n");
+        let (_, out, _) = run("echo $((!7))");
+        assert_eq!(out, "0\n");
+    }
+
+    #[test]
+    fn arith_comparisons() {
+        let (_, out, _) = run("echo $((3 < 5)) $((3 > 5)) $((5 == 5)) $((5 != 5))");
+        assert_eq!(out, "1 0 1 0\n");
+    }
+
+    #[test]
+    fn arith_logical_ops() {
+        let (_, out, _) = run("echo $((1 && 0)) $((1 && 1)) $((0 || 0)) $((0 || 3))");
+        assert_eq!(out, "0 1 0 1\n");
+    }
+
+    #[test]
+    fn arith_reads_bare_name_from_scope() {
+        let (_, out, _) = run("N=5; echo $((N + 1))");
+        assert_eq!(out, "6\n");
+    }
+
+    #[test]
+    fn arith_reads_dollar_var_from_scope() {
+        let (_, out, _) = run("N=5; echo $(($N + 1))");
+        assert_eq!(out, "6\n");
+    }
+
+    #[test]
+    fn arith_unset_var_is_zero() {
+        let (_, out, _) = run("echo $((MISSING + 7))");
+        assert_eq!(out, "7\n");
+    }
+
+    #[test]
+    fn arith_non_numeric_var_errors() {
+        let prog = parse("X=hello; echo $((X + 1))").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[test]
+    fn arith_divide_by_zero_errors() {
+        let prog = parse("echo $((1 / 0))").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[test]
+    fn arith_drives_for_loop_counter() {
+        let (_, out, _) = run(
+            "N=3; while [ $N -gt 0 ]; do echo $N; N=$((N - 1)); done",
+        );
+        assert_eq!(out, "3\n2\n1\n");
     }
 
     // ===== command substitution =====
