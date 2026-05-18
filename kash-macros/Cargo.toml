@@ -7,11 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[features]
-# Pass-through features so this crate's doc-tests can exercise both branches
-# of `ifstd!`/`ifalloc!`. Production crates that use these macros declare
-# their own `std` / `alloc` features; the macro expands a `cfg(feature = ...)`
-# attribute that is evaluated in the invoking crate's context.
-default = ["std"]
-std = ["alloc"]
-alloc = []
+# This crate has no features of its own. The `ifstd!`/`ifalloc!` macros
+# emit `#[cfg(feature = "std")]` / `#[cfg(feature = "alloc")]` attributes
+# that are evaluated in the *invoking* crate's context. Doc-tests are
+# written to be std/alloc-agnostic.

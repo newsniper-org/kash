@@ -39,7 +39,8 @@
 ///
 /// # Examples
 ///
-/// Two-branch form:
+/// Two-branch form (one of the two functions is emitted depending on
+/// whether the calling crate has the `std` feature on):
 ///
 /// ```
 /// # use kash_macros::ifstd;
@@ -48,19 +49,19 @@
 /// } else {
 ///     pub fn platform_name() -> &'static str { "no_std" }
 /// });
-/// # assert!(!platform_name().is_empty());
+/// # assert!(matches!(platform_name(), "std" | "no_std"));
 /// ```
 ///
-/// Single-branch form (no `else`) when only `std`-specific items are
-/// needed:
+/// Single-branch form (no `else`) when only `std`-only items are needed.
+/// `pub fn enabled` is present iff the invoking crate has `std`; in this
+/// doc-test the test crate has no `std` feature so `enabled` is absent
+/// and the function is never referenced:
 ///
 /// ```
 /// # use kash_macros::ifstd;
 /// ifstd!({
-///     pub fn pid() -> u32 { std::process::id() }
+///     pub fn enabled() -> bool { true }
 /// });
-/// # // Only emitted in std builds; under `--no-default-features` the body
-/// # // is dropped and `pid` simply doesn't exist.
 /// ```
 #[macro_export]
 macro_rules! ifstd {
@@ -81,14 +82,13 @@ macro_rules! ifstd {
 /// # Examples
 ///
 /// ```
-/// # extern crate alloc;
 /// # use kash_macros::ifalloc;
 /// ifalloc!({
-///     pub fn empty_owned() -> alloc::vec::Vec<u8> { alloc::vec::Vec::new() }
+///     pub fn tag() -> &'static str { "alloc" }
 /// } else {
-///     pub fn empty_owned() -> &'static [u8] { &[] }
+///     pub fn tag() -> &'static str { "no_alloc" }
 /// });
-/// # assert!(empty_owned().is_empty());
+/// # assert!(matches!(tag(), "alloc" | "no_alloc"));
 /// ```
 #[macro_export]
 macro_rules! ifalloc {

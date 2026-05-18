@@ -8,14 +8,15 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-# `std` implies `alloc`, plus full standard-library functionality (filesystem,
-# environment, threads, signals, terminal IO). This is what production shells
-# need; it's the default.
-default = ["std"]
+# Project-wide policy: kash workspace crates default to no_std + alloc.
+# Consumers (kash-bin, downstream embedders) explicitly opt into `std`
+# when they need filesystem, environment, threads, signals, terminal IO.
+default = ["alloc"]
 std = ["alloc"]
 # `alloc` enables heap-allocated containers (Vec/String/Box/etc.) without
-# requiring the rest of the standard library. Intermediate tier between `std`
-# and pure no_std.
+# requiring the rest of the standard library. The engine fundamentally
+# needs a heap, so bare-`no_std` (neither feature) is rejected by a
+# `compile_error!` in lib.rs.
 alloc = []
 
 [dependencies]
