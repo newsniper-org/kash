@@ -1228,6 +1228,20 @@ impl<B: MapBackend> Evaluator<B> {
             .get(&resolved)
             .cloned()
             .expect("just resolved");
+        // Snapshot the capture list *before* pushing the new
+        // function frame so the lookup sees the caller's view. Per
+        // `project_shell_function_scope.md`, the `function f(a,b) …`
+        // form binds exactly the listed names by-ref and read-only;
+        // a missing caller binding snapshots as empty.
+        let capture_snapshot: Vec<(String, Value)> = entry
+            .captures
+            .as_ref()
+            .map(|caps| {
+                caps.iter()
+                    .map(|n| (n.clone(), self.scope.get(n).cloned().unwrap_or_default()))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Swap in the function's positional arguments.
         let saved = core::mem::replace(&mut self.positionals, argv[1..].to_vec());
         self.positionals_stack.push(saved);
@@ -1245,11 +1259,18 @@ impl<B: MapBackend> Evaluator<B> {
         // `project_shell_function_scope.md` rule.
         let static_scope = matches!(entry.scope, FunctionScope::Static);
         self.scope.push_function_frame(static_scope);
-        // Capture list enforcement (read-only by-ref binding for the
-        // names in `entry.captures`) lights up when the typeset
-        // attribute machinery lands — until then the parser records
-        // the list, the evaluator ignores it.
-        let _ = &entry.captures;
+        // Bind the captured values into the new frame as readonly.
+        // Errors here would only surface against a binding that
+        // *already* existed in the new frame — impossible, we just
+        // pushed it — so any failure is genuinely fatal.
+        for (n, v) in capture_snapshot {
+            self.scope.assign_local(&n, v)?;
+            let readonly_attr = crate::scope::AttrSet {
+                readonly: true,
+                ..crate::scope::AttrSet::default()
+            };
+            self.scope.apply_attrs(&n, &readonly_attr)?;
+        }
         let result = self.eval_compound(&entry.body);
         self.scope.pop();
         self.namespace_path = saved_ns;
@@ -6034,6 +6055,85 @@ mod tests {
     #[test]
     fn namespace_name_with_embedded_dot_is_rejected() {
         assert!(parse("namespace foo.bar { x() { :; }; }\n").is_err());
+    }
+
+    // ===== function capture list — read-only by-ref =====
+
+    #[test]
+    fn capture_list_binds_named_caller_value() {
+        let (_, out, _) = run(
+            "x=outer-value\n\
+             function f(x) { echo \"$x\"; }\n\
+             f\n",
+        );
+        assert_eq!(out, "outer-value\n");
+    }
+
+    #[test]
+    fn capture_list_with_missing_caller_binding_snapshots_empty() {
+        let (_, out, _) = run("function f(x) { echo \"[$x]\"; }\nf\n");
+        assert_eq!(out, "[]\n");
+    }
+
+    #[test]
+    fn capture_list_is_readonly_inside_body() {
+        let src = "x=ok\n\
+                   function f(x) { x=changed; }\n\
+                   f\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("read-only") || msg.to_lowercase().contains("readonly"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn capture_list_overrides_outer_with_call_time_snapshot() {
+        // A captured name is bound *locally* in the function frame
+        // with the value seen at call time. Even if a later reassign
+        // in the caller would have been visible via static-scope
+        // fallback, the local capture binding shadows it.
+        let (_, out, _) = run(
+            "x=before\n\
+             function f(x) { echo \"$x\"; }\n\
+             f\n\
+             echo \"after=$x\"\n",
+        );
+        // First call: capture takes "before"; outer is unchanged
+        // after the call (the binding was a local copy).
+        assert_eq!(out, "before\nafter=before\n");
+    }
+
+    #[test]
+    fn capture_snapshot_is_taken_at_call_time() {
+        // The capture binds the *value at the call*, not at the
+        // definition — reassigning `x` between def and call must
+        // be reflected.
+        let (_, out, _) = run(
+            "x=first\n\
+             function f(x) { echo \"$x\"; }\n\
+             x=second\n\
+             f\n",
+        );
+        assert_eq!(out, "second\n");
+    }
+
+    #[test]
+    fn capture_list_readonly_is_local_only() {
+        // Capture-driven readonly lives in the function frame and
+        // disappears when the frame pops — the caller can still
+        // reassign after the call.
+        let (_, out, _) = run(
+            "x=one\n\
+             function f(x) { :; }\n\
+             f\n\
+             x=two\n\
+             echo \"$x\"\n",
+        );
+        assert_eq!(out, "two\n");
     }
 
     #[test]
