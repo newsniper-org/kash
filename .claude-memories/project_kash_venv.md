@@ -150,6 +150,6 @@ advisory model이라 "체크 없이도 동작"하는 경로는 그대로 통과 
 ## 미결
 
 v2+:
-- Hard sandbox (Linux namespaces / seccomp / cgroup) — kash 자체 process 단의 격리 도입 시점
+- ~~Hard sandbox~~ — *sibling project로 분리* (`project_kash_sandbox.md`). kash 본체는 soft / advisory 그대로 유지. OS-enforced 격리는 `kash-sandbox` / `sh-sandbox` / `ksh-sandbox` 별도 binary가 담당.
 - Persistent venv state (Python `.venv/` directory 같은) — interactive shell의 enter/exit 모델
 - venv 간 inheritance — venv A가 venv B를 base로 derive

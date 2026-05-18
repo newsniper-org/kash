@@ -36,3 +36,5 @@
 - [kash — async/await syntax는 POSIX 채택 전까지 영구 보류](feedback_no_async_await_until_posix.md) — async/await류 키워드 도입 제안 금지. POSIX 정식 채택 시까지 검토 자체 안 함.
 - [lightnht 후속 최적화 후보 (미적용)](project_lightnht_optimizations.md) — depth_coord 3-layer 최적화(stack 배열 + position offset + u32 packing) + hasher 교체 후보. BTreeBackend 우세 bench 결과의 개선 idea.
 - [무한루프 의심 시 테스트를 하나씩 돌리기](feedback_one_test_at_a_time_when_hang_suspected.md) — hang/deadlock 위험 있는 변경(spawn/pipe/IO loop 등) 직후엔 `cargo test` 일괄 실행 금지. 새 테스트별 개별 + timeout으로 격리.
+- [kash — venv 시스템 (committed)](project_kash_venv.md) — soft scoped venv block + fine-grained capability + coarse profile + 외부 config는 데이터-only(TOML), 7 stage 구현 계획.
+- [kash hard-sandbox는 sibling project로 분리 (committed)](project_kash_sandbox.md) — `kash-sandbox` / `sh-sandbox` / `ksh-sandbox` / `ksh93-sandbox` binary, mode 무관, OS-level enforcement (Landlock / pledge+unveil / Capsicum / sandbox_init / Job Object).
