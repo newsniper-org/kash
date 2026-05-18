@@ -123,6 +123,17 @@ pub struct Evaluator {
     /// Function registry: name → definition. Functions live in a flat
     /// table for now; namespace scoping lights up later.
     functions: BTreeMap<String, FunctionEntry>,
+    /// Trap action registry: signal name → command source. Names are
+    /// normalised to upper-case without a `SIG` prefix
+    /// (`INT`, `TERM`, `EXIT`, …). The pseudo-signals `EXIT` / `ERR`
+    /// are wired to fire at the appropriate points in evaluation; the
+    /// real OS signals are accepted into the table but not yet
+    /// delivered (that lands with the unix-only signal layer).
+    traps: BTreeMap<String, String>,
+    /// Re-entrancy guard for trap actions — a trap that itself fires
+    /// the same trap (e.g. `trap 'false' ERR` invoking ERR again on
+    /// the `false`) would otherwise loop forever.
+    in_trap: bool,
     /// Active `set -o` / short-form options.
     options: ShellOptions,
     /// When `false`, the statement loop suppresses `errexit` even if
@@ -150,6 +161,8 @@ impl Evaluator {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: BTreeMap::new(),
+            traps: BTreeMap::new(),
+            in_trap: false,
             options: ShellOptions::default(),
             errexit_active: true,
         }
@@ -188,9 +201,38 @@ impl Evaluator {
 
     /// Evaluate a full program. The returned [`Outcome`] is the *last*
     /// statement's outcome; an `exit N` short-circuits and is reported
-    /// as the final outcome.
+    /// as the final outcome. The `EXIT` trap, if registered, runs
+    /// before this function returns — even on error, even on
+    /// `Outcome::Exit`.
     pub fn eval_program(&mut self, prog: &Program) -> Result<Outcome> {
-        self.eval_statements(&prog.statements)
+        let result = self.eval_statements(&prog.statements);
+        if let Some(cmd) = self.traps.get("EXIT").cloned() {
+            // Don't let a failing EXIT trap mask the real outcome.
+            let _ = self.run_trap_command(&cmd);
+        }
+        result
+    }
+
+    /// Run a trap action. Parses and evaluates `cmd` as a small shell
+    /// program inside the current environment, guarded against
+    /// re-entry (a trap that fires the same trap doesn't recurse).
+    /// Errors from the trap body are swallowed — POSIX leaves trap
+    /// failure mostly invisible.
+    fn run_trap_command(&mut self, cmd: &str) -> Result<Outcome> {
+        if self.in_trap {
+            return Ok(Outcome::Status(0));
+        }
+        self.in_trap = true;
+        let prog = match crate::parser::parse(cmd) {
+            Ok(p) => p,
+            Err(_) => {
+                self.in_trap = false;
+                return Ok(Outcome::Status(0));
+            }
+        };
+        let res = self.eval_statements(&prog.statements);
+        self.in_trap = false;
+        res
     }
 
     fn eval_statements(&mut self, stmts: &[Statement]) -> Result<Outcome> {
@@ -199,6 +241,14 @@ impl Evaluator {
             outcome = self.eval_statement(stmt)?;
             if outcome.is_exit_request() {
                 return Ok(outcome);
+            }
+            // ERR trap fires on a non-zero status whenever it would
+            // also trigger `errexit` — i.e. anywhere outside an
+            // explicitly-checked context (condition list, etc.).
+            if !outcome.success() && self.errexit_active {
+                if let Some(cmd) = self.traps.get("ERR").cloned() {
+                    let _ = self.run_trap_command(&cmd);
+                }
             }
             if self.options.errexit && self.errexit_active && !outcome.success() {
                 return Ok(Outcome::Exit(outcome.status()));
@@ -348,6 +398,7 @@ impl Evaluator {
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
+            "trap" => self.builtin_trap(&argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -500,6 +551,54 @@ impl Evaluator {
         for arg in args {
             let (name, value) = parse_name_eq_value(arg)?;
             self.scope.assign_local(&name, Value::Scalar(value))?;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// `trap [ACTION] SIGNAL …` builtin.
+    ///
+    /// Argument forms (POSIX):
+    ///
+    /// - `trap` — list the currently-registered traps.
+    /// - `trap ACTION SIGNAL …` — install `ACTION` for every signal.
+    /// - `trap '' SIGNAL …` — install an empty action (no-op handler).
+    /// - `trap - SIGNAL …` — reset / un-register.
+    /// - `trap NUMBER` — treat a single numeric arg as a signal name
+    ///   to reset (POSIX old form).
+    ///
+    /// Signal names are normalised to upper-case sans `SIG` prefix
+    /// (`INT`, `TERM`, …). The pseudo-signals `EXIT` and `ERR` fire
+    /// at the appropriate points in evaluation; real OS signals are
+    /// recorded into the table but not yet delivered.
+    fn builtin_trap(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.is_empty() {
+            // `trap` with no args: emit the table in stable order.
+            for (sig, cmd) in &self.traps {
+                self.output.push_str(&alloc::format!(
+                    "trap -- '{cmd}' {sig}\n"
+                ));
+            }
+            return Ok(Outcome::Status(0));
+        }
+        // `trap NUMBER` — reset the named signal (POSIX old form).
+        if args.len() == 1 && args[0].chars().all(|c| c.is_ascii_digit()) {
+            let sig = normalize_signal(&args[0]);
+            self.traps.remove(&sig);
+            return Ok(Outcome::Status(0));
+        }
+        if args.len() < 2 {
+            return Err(KashError::Runtime(
+                "trap: needs an action and at least one signal".into(),
+            ));
+        }
+        let action = &args[0];
+        for sig_raw in &args[1..] {
+            let sig = normalize_signal(sig_raw);
+            if action == "-" {
+                self.traps.remove(&sig);
+            } else {
+                self.traps.insert(sig, action.clone());
+            }
         }
         Ok(Outcome::Status(0))
     }
@@ -1648,6 +1747,7 @@ ifstd!({
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
+                "trap" => self.builtin_trap(&argv[1..]),
                 other => Err(KashError::Runtime(alloc::format!(
                     "internal: dispatch_builtin called for `{other}`"
                 ))),
@@ -1837,7 +1937,19 @@ fn is_builtin_name(name: &str) -> bool {
             | "readonly"
             | "test"
             | "["
+            | "trap"
     )
+}
+
+/// Normalise a signal name to upper-case without a `SIG` prefix.
+/// Numeric inputs pass through unchanged.
+fn normalize_signal(s: &str) -> String {
+    let upper = s.to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix("SIG") {
+        rest.into()
+    } else {
+        upper
+    }
 }
 
 /// POSIX `test` / `[` builtin. The `bracket` flag indicates the
@@ -2921,6 +3033,60 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== trap / exit handler =====
+
+    #[test]
+    fn exit_trap_fires_on_program_end() {
+        let (_, out, _) = run("trap 'echo bye' EXIT; echo hi");
+        assert_eq!(out, "hi\nbye\n");
+    }
+
+    #[test]
+    fn exit_trap_fires_on_exit_request() {
+        let (o, out, _) = run("trap 'echo cleanup' EXIT; exit 2");
+        assert_eq!(o, Outcome::Exit(2));
+        assert_eq!(out, "cleanup\n");
+    }
+
+    #[test]
+    fn err_trap_fires_on_failed_command() {
+        let (_, out, _) = run("trap 'echo trap_fired' ERR; false");
+        assert_eq!(out, "trap_fired\n");
+    }
+
+    #[test]
+    fn err_trap_does_not_fire_in_condition() {
+        let (_, out, _) = run("trap 'echo trap_fired' ERR; if false; then :; fi; echo done");
+        assert_eq!(out, "done\n");
+    }
+
+    #[test]
+    fn trap_reset_with_dash_removes_handler() {
+        let (_, out, _) = run("trap 'echo a' EXIT; trap - EXIT; echo done");
+        assert_eq!(out, "done\n");
+    }
+
+    #[test]
+    fn trap_listing_emits_registered_handlers() {
+        let (_, out, _) = run("trap 'echo bye' EXIT; trap 'echo err' ERR; trap");
+        assert!(out.contains("trap -- 'echo bye' EXIT"), "got: {out:?}");
+        assert!(out.contains("trap -- 'echo err' ERR"), "got: {out:?}");
+    }
+
+    #[test]
+    fn trap_sig_prefix_normalised() {
+        let (_, out, _) = run("trap 'echo got' SIGINT; trap");
+        // The SIG prefix is stripped — the listing shows just `INT`.
+        assert!(out.contains(" INT\n"), "got: {out:?}");
+    }
+
+    #[test]
+    fn trap_does_not_recurse_on_itself() {
+        // ERR trap calling `false` would otherwise infinitely recurse.
+        let (_, out, _) = run("trap 'echo err; false' ERR; false");
+        assert_eq!(out, "err\n");
     }
 
     // ===== set options: errexit / nounset / pipefail =====
