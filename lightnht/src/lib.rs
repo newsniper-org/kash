@@ -1229,8 +1229,9 @@ impl<H> core::fmt::Debug for LightnhtBackend<H> {
 }
 
 impl<H> Clone for LightnhtBackend<H> {
+    #[inline]
     fn clone(&self) -> Self {
-        Self(core::marker::PhantomData)
+        *self
     }
 }
 
@@ -1453,12 +1454,12 @@ mod tests {
         let mut m: Map = Map::default();
         for i in 0..100 {
             let key = alloc::format!("k{i}");
-            assert_eq!(m.insert(key, i as i32), None);
+            assert_eq!(m.insert(key, i), None);
         }
         assert_eq!(m.len(), 100);
         for i in 0..100 {
             let key = alloc::format!("k{i}");
-            assert_eq!(m.get(&key), Some(&(i as i32)));
+            assert_eq!(m.get(&key), Some(&i));
         }
         assert!(m.get("k100").is_none());
     }
@@ -1488,14 +1489,14 @@ mod tests {
     fn reconstruct_preserves_contents() {
         let mut m: Map = Map::default();
         for i in 0..30 {
-            m.insert(alloc::format!("k{i}"), i as i32);
+            m.insert(alloc::format!("k{i}"), i);
         }
         let recon_before = m.recon();
         m.reconstruct();
         assert_eq!(m.recon(), recon_before + 1);
         assert_eq!(m.len(), 30);
         for i in 0..30 {
-            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&(i as i32)));
+            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&i));
         }
     }
 
@@ -1778,7 +1779,7 @@ mod tests {
         }
         assert_eq!(m.len(), 50);
         for i in 0..50 {
-            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&(i as i32)));
+            assert_eq!(m.get(&alloc::format!("k{i}")), Some(&i));
         }
     }
 
@@ -1838,13 +1839,13 @@ mod tests {
         // sub-tables get promoted. Then verify all are reachable.
         let mut m: Map = Map::default();
         for i in 0..1000 {
-            m.insert(alloc::format!("entry-{i:04}"), i as i32);
+            m.insert(alloc::format!("entry-{i:04}"), i);
         }
         assert_eq!(m.len(), 1000);
         for i in 0..1000 {
             assert_eq!(
                 m.get(&alloc::format!("entry-{i:04}")),
-                Some(&(i as i32)),
+                Some(&i),
             );
         }
     }
