@@ -251,16 +251,11 @@ impl Evaluator {
             }
             return Ok(Outcome::Status(0));
         }
-        // Phase 2: expand command name + arguments. POSIX field
-        // splitting drops words that expand to nothing — *unless* the
-        // word contained a quoted segment, in which case the empty
-        // expansion is still a literal empty argument and stays in argv.
+        // Phase 2: expand command name + arguments with POSIX field
+        // splitting (`expand_word_to_fields` does the work).
         let mut argv: Vec<String> = Vec::with_capacity(cmd.words.len());
         for w in &cmd.words {
-            let expanded = self.expand_word(w)?;
-            if !expanded.is_empty() || word_has_quoted_segment(w) {
-                argv.push(expanded);
-            }
+            argv.extend(self.expand_word_to_fields(w)?);
         }
         if argv.is_empty() {
             // All command words vanished after expansion — treat the
@@ -568,9 +563,12 @@ impl Evaluator {
     ) -> Result<Outcome> {
         let items: Vec<String> = match words {
             Some(ws) => {
+                // `for x in $LIST` should expand `$LIST` with field
+                // splitting — that's what gives `for w in $ws` its
+                // word-by-word iteration semantics.
                 let mut out = Vec::with_capacity(ws.len());
                 for w in ws {
-                    out.push(self.expand_word(w)?);
+                    out.extend(self.expand_word_to_fields(w)?);
                 }
                 out
             }
@@ -635,6 +633,10 @@ impl Evaluator {
 
     // ---------- word / parameter expansion ----------
 
+    /// Expand a [`Word`] to a *single* string, gluing every segment's
+    /// expansion together with no field splitting. Used wherever the
+    /// shell wants exactly one value: assignment right-hand sides,
+    /// `case` subjects, redirect targets, modifier-word bodies.
     fn expand_word(&mut self, w: &Word) -> Result<String> {
         let mut out = String::new();
         for seg in &w.segments {
@@ -646,13 +648,149 @@ impl Evaluator {
                     // SingleQuoted: verbatim. AnsiC: the escape pass
                     // (`\n`, `\xHH`, …) lands with the full expansion
                     // story; for the skeleton we treat the body as
-                    // verbatim. That's wrong but it's also harmless for
-                    // strings without escapes.
+                    // verbatim. That's wrong but it's also harmless
+                    // for strings without escapes.
                     out.push_str(s);
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Expand a [`Word`] to *zero or more* fields, honouring POSIX
+    /// field splitting on `IFS`. Used when building argv for a simple
+    /// command, the iteration set of a `for` loop, etc.
+    ///
+    /// Splitting only applies to the *value* of an unquoted parameter
+    /// expansion — literal bare-segment bytes go into the current
+    /// field as-is, and any segment that is single-quoted, AnsiC, or
+    /// double-quoted is non-splitting (the double-quoted body still
+    /// gets `$VAR` substituted, just without splitting). A word with
+    /// at least one quoted segment always produces at least one
+    /// field, even if everything inside expanded to empty.
+    fn expand_word_to_fields(&mut self, w: &Word) -> Result<Vec<String>> {
+        let ifs = self.lookup_ifs();
+        let mut fields: Vec<String> = alloc::vec![String::new()];
+        for seg in &w.segments {
+            match seg {
+                WordSegment::Bare(s) => {
+                    self.expand_into_fields(s, &mut fields, Some(&ifs))?;
+                }
+                WordSegment::DoubleQuoted(s) => {
+                    self.expand_into_fields(s, &mut fields, None)?;
+                }
+                WordSegment::SingleQuoted(s) | WordSegment::AnsiC(s) => {
+                    fields.last_mut().expect("fields invariant").push_str(s);
+                }
+            }
+        }
+        if !word_has_quoted_segment(w)
+            && fields.len() == 1
+            && fields[0].is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        Ok(fields)
+    }
+
+    /// Walk `text` (a single segment's payload) and append it to
+    /// `fields`. `split_ifs` is `Some(IFS)` to make `$expansion`
+    /// results IFS-splittable; `None` keeps everything in the current
+    /// field (used for double-quoted segments).
+    fn expand_into_fields(
+        &mut self,
+        text: &str,
+        fields: &mut Vec<String>,
+        split_ifs: Option<&str>,
+    ) -> Result<()> {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '$' {
+                fields.last_mut().expect("fields invariant").push(c);
+                continue;
+            }
+            // `$` followed by an expansion form. Read the expanded
+            // value into `value`, then append it with or without
+            // splitting depending on `split_ifs`.
+            let Some(&next) = chars.peek() else {
+                fields.last_mut().expect("fields invariant").push('$');
+                continue;
+            };
+            let value = if next == '{' {
+                chars.next();
+                let mut depth = 1usize;
+                let mut body = String::new();
+                for c in chars.by_ref() {
+                    if c == '{' {
+                        depth += 1;
+                        body.push(c);
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        body.push(c);
+                    } else {
+                        body.push(c);
+                    }
+                }
+                if depth != 0 {
+                    return Err(KashError::Parse(
+                        "unterminated `${...}` parameter expansion".into(),
+                    ));
+                }
+                self.expand_braced(&body)?
+            } else if next == '?' {
+                chars.next();
+                self.last_status.to_string()
+            } else if next == '#' {
+                chars.next();
+                self.positionals.len().to_string()
+            } else if next == '$' {
+                chars.next();
+                "0".into()
+            } else if next.is_ascii_digit() {
+                chars.next();
+                let n = next.to_digit(10).expect("ascii digit") as usize;
+                if n == 0 {
+                    String::new()
+                } else {
+                    self.positionals.get(n - 1).cloned().unwrap_or_default()
+                }
+            } else if is_name_start(next) {
+                let mut name = String::new();
+                while let Some(&c) = chars.peek() {
+                    if is_name_continue(c) {
+                        name.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match self.scope.get(&name) {
+                    Some(v) => v.to_scalar_string(),
+                    None => String::new(),
+                }
+            } else {
+                // Bare `$` — emit verbatim.
+                fields.last_mut().expect("fields invariant").push('$');
+                continue;
+            };
+            match split_ifs {
+                Some(ifs) => append_split(&value, ifs, fields),
+                None => fields.last_mut().expect("fields invariant").push_str(&value),
+            }
+        }
+        Ok(())
+    }
+
+    /// Current value of `IFS`. Falls back to the POSIX default
+    /// `" \t\n"` if `IFS` is unset.
+    fn lookup_ifs(&self) -> String {
+        match self.scope.get("IFS") {
+            Some(v) => v.to_scalar_string(),
+            None => " \t\n".into(),
+        }
     }
 
     /// Walk `text` and append it to `out`, substituting `$NAME`,
@@ -1153,10 +1291,7 @@ ifstd!({
                 }
                 let mut argv = alloc::vec::Vec::with_capacity(simple.words.len());
                 for w in &simple.words {
-                    let s = self.expand_word(w)?;
-                    if !s.is_empty() {
-                        argv.push(s);
-                    }
+                    argv.extend(self.expand_word_to_fields(w)?);
                 }
                 if argv.is_empty() {
                     return Err(KashError::Runtime(
@@ -1405,6 +1540,46 @@ fn parse_name_eq_value(arg: &str) -> Result<(alloc::string::String, alloc::strin
 
 /// True iff `s` is a POSIX shell identifier (`_` or letter, then
 /// `_` / letters / digits).
+/// Append `value` to `fields`, splitting on IFS bytes. Matches the
+/// POSIX rule "unquoted expansion results undergo field splitting"
+/// with a minimal-but-correct-for-the-common-case implementation:
+///
+/// - An empty `value` produces no fields (the unquoted empty
+///   expansion vanishes).
+/// - Otherwise the value is split on any byte in `ifs`, and runs of
+///   empty fields are dropped. That matches the POSIX "whitespace
+///   IFS chars are collapsed" rule for the default IFS of
+///   `" \t\n"`; non-whitespace IFS chars don't yet get their strict-
+///   separator treatment.
+/// - The first non-empty part is appended to the current field; each
+///   subsequent part starts a new field.
+fn append_split(value: &str, ifs: &str, fields: &mut Vec<String>) {
+    if value.is_empty() {
+        return;
+    }
+    if ifs.is_empty() {
+        fields
+            .last_mut()
+            .expect("fields invariant")
+            .push_str(value);
+        return;
+    }
+    let parts: Vec<&str> = value
+        .split(|c| ifs.contains(c))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return;
+    }
+    fields
+        .last_mut()
+        .expect("fields invariant")
+        .push_str(parts[0]);
+    for p in &parts[1..] {
+        fields.push((*p).into());
+    }
+}
+
 /// True iff `w` has at least one quoted segment. A quoted segment
 /// (even when its body is empty) survives POSIX field splitting as a
 /// literal empty argument.
@@ -1847,6 +2022,61 @@ mod tests {
             "rec() { echo $1; case $1 in 0) :;; 1) rec 0;; 2) rec 1;; esac; }; rec 2",
         );
         assert_eq!(out, "2\n1\n0\n");
+    }
+
+    // ===== IFS field splitting =====
+
+    #[test]
+    fn unquoted_expansion_splits_on_default_ifs() {
+        let (_, out, _) = run("X='a b c'; for w in $X; do echo $w; done");
+        assert_eq!(out, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn quoted_expansion_does_not_split() {
+        let (_, out, _) = run("X='a b c'; for w in \"$X\"; do echo $w; done");
+        assert_eq!(out, "a b c\n");
+    }
+
+    #[test]
+    fn double_quoted_dollar_keeps_internal_spaces() {
+        let (_, out, _) = run("X='multi word'; echo \"$X\"");
+        assert_eq!(out, "multi word\n");
+    }
+
+    #[test]
+    fn argv_field_split_passes_three_args() {
+        let (_, out, _) = run("X='a b c'; echo $X");
+        // `echo` with 3 args joined with one space.
+        assert_eq!(out, "a b c\n");
+    }
+
+    #[test]
+    fn custom_ifs_splits_on_comma() {
+        let (_, out, _) = run("IFS=,; X=a,b,c; for w in $X; do echo $w; done");
+        assert_eq!(out, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn empty_unquoted_expansion_yields_no_field() {
+        // The empty `$X` between `cat` and `dog` should disappear so
+        // we end up calling echo with two args.
+        let (_, out, _) = run("X=; echo cat $X dog");
+        assert_eq!(out, "cat dog\n");
+    }
+
+    #[test]
+    fn empty_quoted_expansion_keeps_a_field() {
+        // `"$X"` is a single (empty) field even when X is empty, so
+        // echo sees three args.
+        let (_, out, _) = run("X=; echo cat \"$X\" dog");
+        assert_eq!(out, "cat  dog\n");
+    }
+
+    #[test]
+    fn assignment_value_does_not_split() {
+        let (_, _, ev) = run("Y='one two three'; X=$Y");
+        assert_eq!(ev.scope().get("X").unwrap().to_scalar_string(), "one two three");
     }
 
     // ===== test / [ =====
