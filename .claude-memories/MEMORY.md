@@ -34,3 +34,4 @@
 - [kash — quote handling (committed)](project_shell_quote_handling.md) — POSIX 그대로 + `$'...'` ANSI-C (bash+ksh93 superset) 모든 모드. `$"..."`는 transpiler gettext plugin.
 - [kash — arithmetic and numeric types (committed)](project_shell_arithmetic.md) — POSIX/ksh93 산술 + 확장 primitive numeric types (int8-128, uint8-128, float16/32/64/128, bfloat16, complex32/64/128/256, bcomplex32), complex 산술, math library, `warn-integer-overflow`.
 - [kash — async/await syntax는 POSIX 채택 전까지 영구 보류](feedback_no_async_await_until_posix.md) — async/await류 키워드 도입 제안 금지. POSIX 정식 채택 시까지 검토 자체 안 함.
+- [lightnht 후속 최적화 후보 (미적용)](project_lightnht_optimizations.md) — depth_coord 3-layer 최적화(stack 배열 + position offset + u32 packing) + hasher 교체 후보. BTreeBackend 우세 bench 결과의 개선 idea.
