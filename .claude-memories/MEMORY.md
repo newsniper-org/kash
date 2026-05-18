@@ -1,0 +1,36 @@
+- [New shell design project](project_shell_design.md) — POSIX-compliant 신규 쉘 설계 중. 베이스: ksh93u+m 문법, 위에 zsh 기능 포팅. POSIX > ksh93 > zsh 순으로 우선.
+- [New shell is a redesign, not a ksh93 reproduction](feedback_not_a_remake.md) — ksh93의 quirks/bugs/bad design을 보존할지 묻지 말고 그냥 더 나은 쪽으로 설계할 것.
+- [New shell — emulation modes design (committed)](project_shell_modes.md) — 모드 4종(POSIX-strict/POSIX-aware/ksh93u-strict/default), lexical scope, file/function/block 3단계 스코핑.
+- [New shell — function scope and capture (committed)](project_shell_function_scope.md) — `f()` dynamic, `function f` static, `function f(a,b)` static+read-only by-ref capture.
+- [New shell — array and associative array semantics (committed)](project_shell_arrays.md) — 0-based, sparse, ksh-style 선언/슬라이싱, nested compound 보존, 모드별 가용성 확정.
+- [New shell — compound variables and member access (committed)](project_shell_compound_vars.md) — `.` 와 `[]` 둘 다 (compound), assoc은 `[]`만, strict typing, discipline functions 보존, `.sh.*` 유지.
+- [New shell — zsh-style parameter expansion flags (committed)](project_shell_expansion_flags.md) — zsh flag 전체 채택, zsh 평가 순서, compound 확장(k/v/t), `-secure` modifier로 `(e)` 통제, long-form alias 문법 reserve.
+- [New shell — glob and pattern matching (committed)](project_shell_glob_pattern.md) — extglob/`**`/zsh 확장 syntax 기본 on, qualifier는 `(#q...)` 강제, brace step, case `;&`/`;;&`, ERE, null glob은 default/-secure에서 fail.
+- [New shell — mode declaration syntax (committed)](project_shell_mode_syntax.md) — `mode` 키워드 + 3 form (unbounded/-L/block), modifier monotonic, `${.sh.mode}` introspection, `sh`/`ksh` symlinks (CLI 호환까지).
+- [New shell — typeset attributes and user-defined types (committed)](project_shell_typeset.md) — ksh93 전체 attribute + zsh `-U`, `typeset -T` 코어, OOP 확장 3종 (constructor/private/static; inheritance는 typeclass로 대체).
+- [New shell — typeclass system (committed)](project_shell_typeclass.md) — Scala 3 inspired, lexical dispatch, type inference + assertion, inheritance 폐기.
+- [New shell — namespace system (committed)](project_shell_namespace.md) — ksh93 baseline + `use namespace` import + typeclass instance namespace-scoping + reopening.
+- [New shell (kash) — subshell, pipeline, coprocess, process substitution (committed)](project_shell_subshell_pipeline.md) — `|&` = coprocess (모든 모드), pipeline 마지막 cmd는 모드별 차등, coproc 두 form, process subst 채택, subshell은 POSIX 의미론.
+- [kash — bash→kash transpiler and transpiling REPL (committed)](project_shell_transpiler.md) — 쉘 이름 kash 확정 ("Korn Again SHell"). bash 4.3+ → kash transpiler + transpiling REPL.
+- [kash — I/O redirection (committed)](project_shell_io_redirection.md) — POSIX baseline + `&>`/auto-fd 채택, MULTIOS 거부, 네트워크는 first-party utility로.
+- [First-party utility CLI naming/interface stability rule](feedback_first_party_util_stability.md) — kash 자체 제공 utility(tcp-connect 등)의 naming/interface는 한번 정해지면 stable contract. 임의 변경 금지.
+- [kash — first-party utility CLIs (committed, locked interfaces)](project_kash_first_party_utils.md) — 초기 네트워크 4종(tcp-connect/-listen, udp-send/-recv), `<도메인>-<동작>` naming, common flag conv, 모든 모드 가용, in-process builtin + symlink multicall architecture.
+- [kash — set options (committed)](project_shell_set_options.md) — POSIX core + ksh/bash 확장, 단일 `set -o` 인터페이스, 신규 warn-* 4종, `-secure` 강제 on/lock 항목 확정.
+- [kash — trap and signal handling (committed)](project_shell_trap_signal.md) — POSIX trap + pseudo-signals(EXIT/DEBUG/ERR/RETURN), trap stacking 신규, `.sh.*` context vars, signal masking 보류.
+- [kash — job control (committed)](project_shell_job_control.md) — POSIX jobs/fg/bg/wait/kill/disown + 확장, `wait -f` 채택, leaky-jobs 3-option MX 패밀리, monitor mode POSIX 기본.
+- [kash — builtin command set (committed)](project_shell_builtins.md) — POSIX + ksh93/bash 확장, `read --prompt`, `echo/print/printf` 정책, `local=typeset`, 신규 `die/assert/usage`. try는 first-party util로 처리 (interface lock됨, first-party utils 메모리 참조).
+- [kash — implementation language and key dependencies (committed)](project_kash_implementation.md) — 구현 언어 Rust 확정, line editor는 rustyline (포크 가능).
+- [kash — interactive layer (committed)](project_kash_interactive.md) — rustyline line editor, fish-style canonical completion + bind, bash/zsh 호환은 *전적으로 transpiler가 담당* (runtime shim 없음).
+- [kash — config layout and file conventions (committed)](project_kash_config.md) — `.kashrc` + `.kashrc.d/*.kash`, `.kash` 확장자 표준, 시스템/사용자 config load 순서.
+- [kash — prompt system (committed)](project_kash_prompt.md) — fish-style canonical function-based (`.kash.prompt`/`.right_prompt`/`.precmd`/`.preexec`/`.chpwd`), PS1 compat fallback, bash/zsh escape는 transpiler.
+- [kash — history system (committed)](project_kash_history.md) — JSONL format, XDG state location, incremental shared append, `!` 기본 off, fish-style `history` subcommand, default unlimited size.
+- [kash — OOP extensions for typeset -T (committed)](project_kash_oop_extensions.md) — Dunder는 lifecycle 2종만(__init/__del), 모든 capability는 typeclass로, private/static 키워드.
+- [kash — Shellshock-class vulnerability prevention policy (committed)](project_kash_security_policy.md) — 5원칙 (env 비-함수화, Rust 메모리 안전, 외부 데이터 묵시 eval 금지, function source-only, TLS default ON). `-secure`에 `eval` 차단 추가.
+- [kash — versioning and compatibility policy (committed)](project_kash_versioning.md) — `v<semver>-posix<연도>` 표기, vN→v(N+2) 호환 보장, POSIX 개정은 별도 트랙.
+- [kash — standard typeclass library (committed)](project_kash_std_typeclasses.md) — `.kash.std` prelude 6종 (Eq/Ord/Showable/Hashable/Iterable/Callable), built-in type 자동 instance, `yield` 키워드 도입 (generator-only, async와 분리).
+- [kash — v1 sweep of accumulated 미결 items (committed)](project_kash_sweep_v1.md) — 누적 미결 ~75개 일괄 해소. 카테고리 B(simple) ~60개 + C(decided) 6개 + D(v2/impl defer) 나머지. 각 메모리 미결 section에서 해소된 항목 제거.
+- [kash — fish-style abbreviations (committed)](project_kash_abbreviations.md) — visible inline expansion, fish subcommand canonical, 모든 모드 가용 (visible expansion은 interactive shell에서만).
+- [kash — module resolution convention (committed)](project_kash_module_resolution.md) — path → namespace 자동 매핑, search path 우선순위, source vs use 분리, manifest는 frontend 책임 (Slackware-style 수동 관리).
+- [kash — quote handling (committed)](project_shell_quote_handling.md) — POSIX 그대로 + `$'...'` ANSI-C (bash+ksh93 superset) 모든 모드. `$"..."`는 transpiler gettext plugin.
+- [kash — arithmetic and numeric types (committed)](project_shell_arithmetic.md) — POSIX/ksh93 산술 + 확장 primitive numeric types (int8-128, uint8-128, float16/32/64/128, bfloat16, complex32/64/128/256, bcomplex32), complex 산술, math library, `warn-integer-overflow`.
+- [kash — async/await syntax는 POSIX 채택 전까지 영구 보류](feedback_no_async_await_until_posix.md) — async/await류 키워드 도입 제안 금지. POSIX 정식 채택 시까지 검토 자체 안 함.

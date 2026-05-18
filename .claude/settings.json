@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.claude-memories\" && jq -r '.session_id // empty' > \"$CLAUDE_PROJECT_DIR/.claude-memories/last-session-id\" && cd \"$CLAUDE_PROJECT_DIR\" && just mirror-memory >&2"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,3 @@
+[submodule "kash-line-editor"]
+	path = kash-line-editor
+	url = https://github.com/newsniper-org/rustyline.git
