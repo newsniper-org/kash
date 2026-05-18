@@ -35,6 +35,7 @@ pub enum BaseMode {
 
 impl BaseMode {
     /// Canonical lowercase name (`"default"`, `"posix-strict"`, …).
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -81,6 +82,7 @@ pub enum Modifier {
 
 impl Modifier {
     /// Canonical name without the leading `-` (e.g. `"secure"`).
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -119,6 +121,7 @@ pub struct Mode {
 
 impl Mode {
     /// Mode with the given base and no modifiers.
+    #[inline]
     #[must_use]
     pub const fn new(base: BaseMode) -> Self {
         Self {
@@ -129,6 +132,7 @@ impl Mode {
 
     /// `default` — the implicit mode at script top when no `mode`
     /// declaration, shebang flag, or symlink invocation overrides it.
+    #[inline]
     #[must_use]
     pub const fn default_mode() -> Self {
         Self::new(BaseMode::Default)
@@ -137,6 +141,7 @@ impl Mode {
     /// True if `self` has every modifier of `outer`. Used by the
     /// modifier-monotonicity guard: an inner `mode` declaration can
     /// only *add* modifiers, never drop them.
+    #[inline]
     #[must_use]
     pub fn modifiers_satisfy(&self, outer: &Self) -> bool {
         outer.modifiers.is_subset(&self.modifiers)

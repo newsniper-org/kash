@@ -61,6 +61,7 @@ pub struct Scope {
 
 impl Scope {
     /// New scope with a single (non-function) root frame.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -70,6 +71,7 @@ impl Scope {
 
     /// Push a fresh non-function frame (e.g. for a brace group or
     /// subshell isolation).
+    #[inline]
     pub fn push(&mut self) {
         self.frames.push(Frame::default());
     }
@@ -78,6 +80,7 @@ impl Scope {
     /// `function`-form functions (kash inherits this rule per
     /// `project_shell_function_scope.md`), `false` for POSIX
     /// `name()`-form functions.
+    #[inline]
     pub fn push_function_frame(&mut self, static_scope: bool) {
         self.frames.push(Frame {
             bindings: BTreeMap::new(),
@@ -87,6 +90,7 @@ impl Scope {
     }
 
     /// Pop the topmost frame. The root frame is never popped.
+    #[inline]
     pub fn pop(&mut self) {
         if self.frames.len() > 1 {
             self.frames.pop();
@@ -94,12 +98,14 @@ impl Scope {
     }
 
     /// Number of frames currently on the stack (always `>= 1`).
+    #[inline]
     #[must_use]
     pub fn depth(&self) -> usize {
         self.frames.len()
     }
 
     /// True iff the topmost frame is a function frame.
+    #[inline]
     #[must_use]
     pub fn in_function(&self) -> bool {
         self.frames
@@ -109,6 +115,7 @@ impl Scope {
 
     /// Look up a name, walking top → bottom and returning the first
     /// hit.
+    #[inline]
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> {
         for frame in self.frames.iter().rev() {
@@ -246,6 +253,7 @@ impl Scope {
 
     /// True iff `name` is currently bound as `readonly` anywhere on
     /// the stack.
+    #[inline]
     #[must_use]
     pub fn is_readonly(&self, name: &str) -> bool {
         for frame in &self.frames {

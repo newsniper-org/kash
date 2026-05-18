@@ -34,6 +34,7 @@ pub enum Value {
 
 impl Value {
     /// Construct a scalar from anything `String`-convertible.
+    #[inline]
     #[must_use]
     pub fn scalar<S: Into<String>>(s: S) -> Self {
         Self::Scalar(s.into())
@@ -41,6 +42,7 @@ impl Value {
 
     /// Render the value to a single string for `"$var"`-style scalar
     /// contexts. Arrays render their first element (POSIX rule).
+    #[inline]
     #[must_use]
     pub fn to_scalar_string(&self) -> String {
         match self {
@@ -52,6 +54,7 @@ impl Value {
 
     /// `true` if the value is considered empty / unset for the
     /// purposes of `${var:-}` and similar defaulting forms.
+    #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -63,12 +66,14 @@ impl Value {
 }
 
 impl From<String> for Value {
+    #[inline]
     fn from(s: String) -> Self {
         Self::Scalar(s)
     }
 }
 
 impl From<&str> for Value {
+    #[inline]
     fn from(s: &str) -> Self {
         Self::Scalar(s.to_string())
     }

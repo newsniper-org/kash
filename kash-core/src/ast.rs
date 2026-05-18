@@ -153,6 +153,7 @@ pub enum Command {
 
 impl Command {
     /// Source span of this command.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> Span {
         match self {

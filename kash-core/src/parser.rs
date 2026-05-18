@@ -43,6 +43,7 @@ pub struct Parser<'src> {
 }
 
 /// One-shot convenience: parse a complete source unit.
+#[inline]
 pub fn parse(source: &str) -> Result<Program> {
     Parser::new(source).parse_program()
 }
@@ -111,6 +112,7 @@ impl Reserved {
 
 impl<'src> Parser<'src> {
     /// New parser over `source`. Does not advance the lexer.
+    #[inline]
     #[must_use]
     pub fn new(source: &'src str) -> Self {
         Self {

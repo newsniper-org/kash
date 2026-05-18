@@ -72,6 +72,7 @@ impl KashError {
     /// - `NotFound` → `127`
     /// - `LeakyJobs` → `3`
     /// - everything else → `1`
+    #[inline]
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {

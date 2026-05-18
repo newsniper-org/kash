@@ -33,12 +33,14 @@ pub struct Span {
 
 impl Span {
     /// Construct a span from a half-open byte range.
+    #[inline]
     #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
 
     /// Zero-length span at the given offset.
+    #[inline]
     #[must_use]
     pub const fn point(at: usize) -> Self {
         Self {
@@ -191,6 +193,7 @@ pub struct Lexer<'src> {
 
 impl<'src> Lexer<'src> {
     /// Wrap a source buffer.
+    #[inline]
     #[must_use]
     pub fn new(src: &'src str) -> Self {
         Self {
@@ -204,22 +207,26 @@ impl<'src> Lexer<'src> {
     /// Current byte position in the source buffer. Exposed so the
     /// parser can record source spans for here-doc bodies that the
     /// lexer reads via [`read_heredoc_body`](Self::read_heredoc_body).
+    #[inline]
     #[must_use]
     pub fn byte_pos(&self) -> usize {
         self.pos
     }
 
     /// Peek the byte at the given offset, returning `None` past EOF.
+    #[inline]
     fn peek_at(&self, off: usize) -> Option<u8> {
         self.bytes.get(self.pos + off).copied()
     }
 
     /// Peek the next byte (no consumption).
+    #[inline]
     fn peek(&self) -> Option<u8> {
         self.peek_at(0)
     }
 
     /// Consume and return the next byte.
+    #[inline]
     fn bump(&mut self) -> Option<u8> {
         let b = self.peek()?;
         self.pos += 1;
@@ -667,6 +674,7 @@ impl<'src> Lexer<'src> {
 
 /// True if `b` belongs to a bare word — i.e. is not whitespace, a
 /// newline, an operator, a comment marker, or a quote character.
+#[inline]
 const fn is_word_byte(b: u8) -> bool {
     !matches!(
         b,

@@ -49,6 +49,7 @@ impl Outcome {
     /// whether to unwind.
     ///
     /// [`is_exit_request`]: Self::is_exit_request
+    #[inline]
     #[must_use]
     pub fn status(self) -> i32 {
         match self {
@@ -58,12 +59,14 @@ impl Outcome {
 
     /// `true` iff the program asked us to exit (via the `exit`
     /// builtin) rather than just completing with a status.
+    #[inline]
     #[must_use]
     pub fn is_exit_request(self) -> bool {
         matches!(self, Self::Exit(_))
     }
 
     /// `true` iff [`status`](Self::status) is zero — POSIX "success".
+    #[inline]
     #[must_use]
     pub fn success(self) -> bool {
         self.status() == 0
@@ -188,18 +191,21 @@ impl Evaluator {
     }
 
     /// Read-only access to the active option set.
+    #[inline]
     #[must_use]
     pub fn options(&self) -> &ShellOptions {
         &self.options
     }
 
     /// Active mode.
+    #[inline]
     #[must_use]
     pub fn mode(&self) -> &Mode {
         &self.mode
     }
 
     /// Last command's `$?`.
+    #[inline]
     #[must_use]
     pub fn last_status(&self) -> i32 {
         self.last_status
@@ -207,6 +213,7 @@ impl Evaluator {
 
     /// Read-only access to the variable scope (for tests and
     /// embedders that want to peek without running anything).
+    #[inline]
     #[must_use]
     pub fn scope(&self) -> &Scope {
         &self.scope
@@ -219,12 +226,14 @@ impl Evaluator {
 
     /// Drain the accumulated output buffer, returning its contents.
     /// The internal buffer is left empty.
+    #[inline]
     pub fn take_output(&mut self) -> String {
         core::mem::take(&mut self.output)
     }
 
     /// Drain the accumulated trace buffer (xtrace lines), returning
     /// its contents. The internal buffer is left empty.
+    #[inline]
     pub fn take_trace_output(&mut self) -> String {
         core::mem::take(&mut self.trace_output)
     }
