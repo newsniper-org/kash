@@ -2066,6 +2066,14 @@ impl<B: MapBackend> Evaluator<B> {
             return self.lookup_param(name);
         }
 
+        // ksh93/bash pattern-strip + replace + case-fold forms.
+        // Recognised *before* the `:` modifier family so the
+        // two-character operators (`##`, `%%`, `//`, `^^`, `,,`)
+        // never get partially consumed.
+        if let Some(out) = self.expand_strip_replace_fold(name, rest)? {
+            return Ok(out);
+        }
+
         // Parse the modifier prefix: optional `:`, then one of `-=?+`.
         let (test_null, op_char, word) = if let Some(after_colon) = rest.strip_prefix(':') {
             let mut it = after_colon.chars();
@@ -2132,6 +2140,156 @@ impl<B: MapBackend> Evaluator<B> {
                 "unsupported modifier `{other}` in `${{{body}}}`"
             ))),
         }
+    }
+
+    /// Try the pattern-strip / replace / case-fold forms of brace
+    /// expansion. Returns `Ok(Some(out))` on a match, `Ok(None)` if
+    /// none of these forms applied (so the caller can fall through
+    /// to `:-`-style modifiers), and `Err` on a parse / runtime
+    /// failure that's specific to the matched form.
+    fn expand_strip_replace_fold(
+        &mut self,
+        name: &str,
+        rest: &str,
+    ) -> Result<Option<String>> {
+        // Pattern-strip — `#`/`##` (prefix) and `%`/`%%` (suffix).
+        // The two-char forms must be tested first because
+        // `strip_prefix("#")` would otherwise eat a `##` operator.
+        if let Some(pat) = rest.strip_prefix("##") {
+            let pat = self.expand_inline(pat)?;
+            let value = self.lookup_param_raw(name);
+            return Ok(Some(strip_prefix_match(&pat, &value, true)));
+        }
+        if let Some(pat) = rest.strip_prefix("%%") {
+            let pat = self.expand_inline(pat)?;
+            let value = self.lookup_param_raw(name);
+            return Ok(Some(strip_suffix_match(&pat, &value, true)));
+        }
+        if let Some(pat) = rest.strip_prefix('#') {
+            let pat = self.expand_inline(pat)?;
+            let value = self.lookup_param_raw(name);
+            return Ok(Some(strip_prefix_match(&pat, &value, false)));
+        }
+        if let Some(pat) = rest.strip_prefix('%') {
+            let pat = self.expand_inline(pat)?;
+            let value = self.lookup_param_raw(name);
+            return Ok(Some(strip_suffix_match(&pat, &value, false)));
+        }
+        // Replace — `${VAR/old/new}` and `${VAR//old/new}`. Also
+        // honours the `/#old` / `/%old` anchor variants, which
+        // restrict the match to a prefix / suffix respectively.
+        if let Some(rest) = rest.strip_prefix("//") {
+            let value = self.lookup_param_raw(name);
+            let (old, new) = split_replace_args(rest);
+            let old = self.expand_inline(&old)?;
+            let new = self.expand_inline(&new)?;
+            return Ok(Some(replace_glob_all(&value, &old, &new)));
+        }
+        if let Some(rest) = rest.strip_prefix('/') {
+            let value = self.lookup_param_raw(name);
+            // `/#pat/repl` / `/%pat/repl` — anchored replace.
+            if let Some(rest) = rest.strip_prefix('#') {
+                let (old, new) = split_replace_args(rest);
+                let old = self.expand_inline(&old)?;
+                let new = self.expand_inline(&new)?;
+                return Ok(Some(replace_glob_anchored(&value, &old, &new, true)));
+            }
+            if let Some(rest) = rest.strip_prefix('%') {
+                let (old, new) = split_replace_args(rest);
+                let old = self.expand_inline(&old)?;
+                let new = self.expand_inline(&new)?;
+                return Ok(Some(replace_glob_anchored(&value, &old, &new, false)));
+            }
+            let (old, new) = split_replace_args(rest);
+            let old = self.expand_inline(&old)?;
+            let new = self.expand_inline(&new)?;
+            return Ok(Some(replace_glob_first(&value, &old, &new)));
+        }
+        // Case-fold — `^^`/`^` (to upper) / `,,`/`,` (to lower).
+        // The trailing `pat` filter (a glob the candidate char must
+        // match) is bash semantics; we currently honour it only as
+        // a literal char-set if the pattern is `[abc]`-style, and
+        // otherwise apply unconditionally — minimal v1 surface.
+        if let Some(pat) = rest.strip_prefix("^^") {
+            let value = self.lookup_param_raw(name);
+            let pat = if pat.is_empty() {
+                None
+            } else {
+                Some(self.expand_inline(pat)?)
+            };
+            return Ok(Some(case_fold(&value, true, true, pat.as_deref())));
+        }
+        if let Some(pat) = rest.strip_prefix(",,") {
+            let value = self.lookup_param_raw(name);
+            let pat = if pat.is_empty() {
+                None
+            } else {
+                Some(self.expand_inline(pat)?)
+            };
+            return Ok(Some(case_fold(&value, false, true, pat.as_deref())));
+        }
+        if let Some(pat) = rest.strip_prefix('^') {
+            let value = self.lookup_param_raw(name);
+            let pat = if pat.is_empty() {
+                None
+            } else {
+                Some(self.expand_inline(pat)?)
+            };
+            return Ok(Some(case_fold(&value, true, false, pat.as_deref())));
+        }
+        if let Some(pat) = rest.strip_prefix(',') {
+            let value = self.lookup_param_raw(name);
+            let pat = if pat.is_empty() {
+                None
+            } else {
+                Some(self.expand_inline(pat)?)
+            };
+            return Ok(Some(case_fold(&value, false, false, pat.as_deref())));
+        }
+        // Substring — `${VAR:OFFSET}` / `${VAR:OFFSET:LENGTH}`.
+        // Only fires when `:` is *not* immediately followed by one
+        // of the `-=?+` modifier operators, so the colon-prefixed
+        // family still owns its surface.
+        if let Some(rest) = rest.strip_prefix(':')
+            && !rest.starts_with(['-', '=', '?', '+'])
+        {
+            let value = self.lookup_param_raw(name);
+            return Ok(Some(self.expand_substring(&value, rest)?));
+        }
+        Ok(None)
+    }
+
+    /// Compute `${VAR:OFFSET[:LEN]}`. Both operands are arithmetic
+    /// expressions evaluated in the usual `$((…))` context. Negative
+    /// offsets count from the end of the string; negative lengths
+    /// count back from the end. An out-of-range offset clamps to
+    /// either end. Length 0 is allowed.
+    fn expand_substring(&mut self, value: &str, rest: &str) -> Result<String> {
+        let (off_expr, len_expr) = match rest.find(':') {
+            Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+            None => (rest, None),
+        };
+        let total = value.chars().count() as i64;
+        let off = self.eval_arith(off_expr)?;
+        let len = match len_expr {
+            Some(s) => Some(self.eval_arith(s)?),
+            None => None,
+        };
+        let start = if off < 0 {
+            (total + off).max(0)
+        } else {
+            off.min(total)
+        };
+        let end = match len {
+            None => total,
+            Some(l) if l < 0 => (total + l).max(start),
+            Some(l) => (start + l).min(total),
+        };
+        Ok(value
+            .chars()
+            .skip(start as usize)
+            .take((end - start).max(0) as usize)
+            .collect())
     }
 
     /// Assign `value` into the `name[idx]` slot. The binding is
@@ -4222,6 +4380,204 @@ fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
 }
 
+/// `${VAR#pat}` / `${VAR##pat}` — drop a glob-pattern prefix from
+/// `value`. With `longest=true` the longest matching prefix wins,
+/// otherwise the shortest. No match returns `value` unchanged.
+fn strip_prefix_match(pat: &str, value: &str, longest: bool) -> String {
+    let bytes = value.as_bytes();
+    let pat_bytes = pat.as_bytes();
+    let mut hits: Vec<usize> = (0..=bytes.len())
+        .filter(|i| value.is_char_boundary(*i) && glob_match_bytes(pat_bytes, &bytes[..*i]))
+        .collect();
+    if hits.is_empty() {
+        return value.to_string();
+    }
+    let pick = if longest {
+        hits.pop().unwrap()
+    } else {
+        hits.remove(0)
+    };
+    value[pick..].to_string()
+}
+
+/// `${VAR%pat}` / `${VAR%%pat}` — drop a glob-pattern suffix.
+fn strip_suffix_match(pat: &str, value: &str, longest: bool) -> String {
+    let bytes = value.as_bytes();
+    let pat_bytes = pat.as_bytes();
+    let mut hits: Vec<usize> = (0..=bytes.len())
+        .filter(|i| value.is_char_boundary(*i) && glob_match_bytes(pat_bytes, &bytes[*i..]))
+        .collect();
+    if hits.is_empty() {
+        return value.to_string();
+    }
+    // For shortest suffix we want the largest index i; for the
+    // longest, the smallest. `hits` is sorted ascending.
+    let pick = if longest {
+        hits.remove(0)
+    } else {
+        hits.pop().unwrap()
+    };
+    value[..pick].to_string()
+}
+
+/// Split the `OLD/NEW` portion of a `${VAR/OLD/NEW}` body at the
+/// *first* unescaped `/`. The pattern half can contain a literal
+/// slash by escaping it as `\/`. If no `/` is present the entire
+/// input is taken as `OLD` and `NEW` is empty.
+fn split_replace_args(body: &str) -> (String, String) {
+    let mut old = String::new();
+    let mut it = body.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\'
+            && let Some(&next) = it.peek()
+        {
+            it.next();
+            old.push(next);
+            continue;
+        }
+        if c == '/' {
+            let new: String = it.collect();
+            return (old, new);
+        }
+        old.push(c);
+    }
+    (old, String::new())
+}
+
+/// `${VAR/OLD/NEW}` — replace the first match. The match is
+/// anywhere in the string; the longest match anchored at each
+/// position is tried, starting from the left.
+fn replace_glob_first(value: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return value.to_string();
+    }
+    if let Some((start, end)) = first_glob_span(value, old) {
+        let mut out = String::with_capacity(value.len() - (end - start) + new.len());
+        out.push_str(&value[..start]);
+        out.push_str(new);
+        out.push_str(&value[end..]);
+        return out;
+    }
+    value.to_string()
+}
+
+/// `${VAR//OLD/NEW}` — replace every match.
+fn replace_glob_all(value: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor <= value.len() {
+        if let Some((start, end)) = first_glob_span(&value[cursor..], old) {
+            let abs_start = cursor + start;
+            let abs_end = cursor + end;
+            out.push_str(&value[cursor..abs_start]);
+            out.push_str(new);
+            // Avoid an infinite loop on zero-width matches.
+            cursor = if abs_end == abs_start {
+                next_char_boundary(value, abs_end)
+            } else {
+                abs_end
+            };
+        } else {
+            out.push_str(&value[cursor..]);
+            break;
+        }
+    }
+    out
+}
+
+/// `${VAR/#OLD/NEW}` (anchor=prefix) and `${VAR/%OLD/NEW}` (suffix).
+fn replace_glob_anchored(value: &str, old: &str, new: &str, prefix: bool) -> String {
+    if prefix {
+        let stripped = strip_prefix_match(old, value, true);
+        if stripped == value {
+            return value.to_string();
+        }
+        return alloc::format!("{new}{stripped}");
+    }
+    let stripped = strip_suffix_match(old, value, true);
+    if stripped == value {
+        return value.to_string();
+    }
+    alloc::format!("{stripped}{new}")
+}
+
+/// Locate the *first* glob span in `haystack` matching `pat`, by
+/// scanning start positions left-to-right and picking the longest
+/// match at each. Returns `(start_byte, end_byte)` on hit.
+fn first_glob_span(haystack: &str, pat: &str) -> Option<(usize, usize)> {
+    let bytes = haystack.as_bytes();
+    let pat_bytes = pat.as_bytes();
+    for start in 0..=bytes.len() {
+        if !haystack.is_char_boundary(start) {
+            continue;
+        }
+        let mut longest: Option<usize> = None;
+        for end in start..=bytes.len() {
+            if !haystack.is_char_boundary(end) {
+                continue;
+            }
+            if glob_match_bytes(pat_bytes, &bytes[start..end]) {
+                longest = Some(end);
+            }
+        }
+        if let Some(end) = longest {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Step `i` forward to the next UTF-8 char boundary, or `s.len()`
+/// when already at the end. Used to advance past zero-width
+/// pattern matches without looping forever.
+fn next_char_boundary(s: &str, i: usize) -> usize {
+    let mut j = i + 1;
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j.min(s.len())
+}
+
+/// Case-fold `value` per `${VAR^^}` / `${VAR^}` / `${VAR,,}` /
+/// `${VAR,}`. `upper=true` selects to-upper; `upper=false` selects
+/// to-lower. `all=true` folds every char; `all=false` folds only
+/// the first. An optional `filter` glob (typical bash form is a
+/// single bracketed char set, e.g. `[abc]`) constrains which chars
+/// are eligible; absent it everything is eligible.
+fn case_fold(value: &str, upper: bool, all: bool, filter: Option<&str>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut folded_any = false;
+    for c in value.chars() {
+        let eligible = match filter {
+            None => true,
+            Some(pat) => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                glob_match(pat, s)
+            }
+        };
+        let do_fold = eligible && (all || !folded_any);
+        if do_fold {
+            if upper {
+                for u in c.to_uppercase() {
+                    out.push(u);
+                }
+            } else {
+                for u in c.to_lowercase() {
+                    out.push(u);
+                }
+            }
+            folded_any = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn glob_match_bytes(pat: &[u8], s: &[u8]) -> bool {
     let (p0, s0) = (pat.first().copied(), s.first().copied());
     // ksh93 / bash extglob: `?(p)` / `*(p)` / `+(p)` / `@(p)` / `!(p)`.
@@ -6119,6 +6475,124 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== parameter expansion — strip / fold / replace / substring =====
+
+    #[test]
+    fn param_prefix_strip_shortest() {
+        let (_, out, _) = run("p=a.b.c; echo ${p#*.}\n");
+        assert_eq!(out, "b.c\n");
+    }
+
+    #[test]
+    fn param_prefix_strip_longest() {
+        let (_, out, _) = run("p=a.b.c; echo ${p##*.}\n");
+        assert_eq!(out, "c\n");
+    }
+
+    #[test]
+    fn param_suffix_strip_shortest() {
+        let (_, out, _) = run("p=a.b.c; echo ${p%.*}\n");
+        assert_eq!(out, "a.b\n");
+    }
+
+    #[test]
+    fn param_suffix_strip_longest() {
+        let (_, out, _) = run("p=a.b.c; echo ${p%%.*}\n");
+        assert_eq!(out, "a\n");
+    }
+
+    #[test]
+    fn param_strip_no_match_returns_value() {
+        let (_, out, _) = run("p=abc; echo ${p#xyz}\n");
+        assert_eq!(out, "abc\n");
+    }
+
+    #[test]
+    fn param_case_fold_upper_all() {
+        let (_, out, _) = run("v=hello; echo ${v^^}\n");
+        assert_eq!(out, "HELLO\n");
+    }
+
+    #[test]
+    fn param_case_fold_upper_first() {
+        let (_, out, _) = run("v=hello; echo ${v^}\n");
+        assert_eq!(out, "Hello\n");
+    }
+
+    #[test]
+    fn param_case_fold_lower_all() {
+        let (_, out, _) = run("v=HELLO; echo ${v,,}\n");
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn param_case_fold_lower_first() {
+        let (_, out, _) = run("v=HELLO; echo ${v,}\n");
+        assert_eq!(out, "hELLO\n");
+    }
+
+    #[test]
+    fn param_replace_first_match() {
+        let (_, out, _) = run("v=foofoo; echo ${v/foo/bar}\n");
+        assert_eq!(out, "barfoo\n");
+    }
+
+    #[test]
+    fn param_replace_all_matches() {
+        let (_, out, _) = run("v=foofoo; echo ${v//foo/bar}\n");
+        assert_eq!(out, "barbar\n");
+    }
+
+    #[test]
+    fn param_replace_prefix_anchored() {
+        let (_, out, _) = run("v=abcabc; echo ${v/#abc/X}\n");
+        assert_eq!(out, "Xabc\n");
+    }
+
+    #[test]
+    fn param_replace_suffix_anchored() {
+        let (_, out, _) = run("v=abcabc; echo ${v/%abc/X}\n");
+        assert_eq!(out, "abcX\n");
+    }
+
+    #[test]
+    fn param_replace_glob_pattern() {
+        let (_, out, _) = run("v=a-b-c; echo ${v/-*-/X}\n");
+        assert_eq!(out, "aXc\n");
+    }
+
+    #[test]
+    fn param_substring_simple() {
+        let (_, out, _) = run("v=abcdef; echo ${v:2}\n");
+        assert_eq!(out, "cdef\n");
+    }
+
+    #[test]
+    fn param_substring_with_length() {
+        let (_, out, _) = run("v=abcdef; echo ${v:1:3}\n");
+        assert_eq!(out, "bcd\n");
+    }
+
+    #[test]
+    fn param_substring_negative_offset_counts_from_end() {
+        let (_, out, _) = run("v=abcdef; echo ${v: -2}\n");
+        assert_eq!(out, "ef\n");
+    }
+
+    #[test]
+    fn param_substring_negative_length_is_end_offset() {
+        let (_, out, _) = run("v=abcdef; echo ${v:1:-1}\n");
+        assert_eq!(out, "bcde\n");
+    }
+
+    #[test]
+    fn param_colon_dash_modifier_still_works() {
+        // Make sure substring detection doesn't break the existing
+        // `${VAR:-default}` form.
+        let (_, out, _) = run("unset v; echo ${v:-fallback}\n");
+        assert_eq!(out, "fallback\n");
     }
 
     #[test]
