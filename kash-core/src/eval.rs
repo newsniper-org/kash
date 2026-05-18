@@ -128,6 +128,16 @@ struct InstanceEntry {
     methods: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
 }
 
+/// One `use namespace …` import in effect. The wildcard form
+/// (source-only, no alias) is what stage 3 ships; alias / single-
+/// symbol / brace forms land in follow-ups.
+#[derive(Clone, Debug)]
+struct ImportEntry {
+    /// Namespace path the import is *sourcing* from, each entry a
+    /// single bare segment with no leading `.`.
+    source: Vec<String>,
+}
+
 /// One registered function. Stored owned so the call site doesn't
 /// need a borrow of the original AST.
 #[derive(Clone, Debug)]
@@ -185,6 +195,12 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// (each function carries the namespace path it was *defined* in
     /// so callers see the lexical view inside the body).
     namespace_path: Vec<String>,
+    /// Active namespace imports, organised by function-frame stack.
+    /// Each top-level / function-call frame gets its own slot in the
+    /// outer `Vec`. A `use namespace foo` statement pushes onto the
+    /// topmost slot, and lookup consults *only* the topmost slot
+    /// (strict isolation per `project_shell_namespace.md`).
+    imports: Vec<Vec<ImportEntry>>,
     /// Mode-restoration stack, one entry per active mode-scoping
     /// frame (function call or `mode <name> { … }` block).
     /// `Some(saved_mode)` means "restore this on exit"; `None`
@@ -246,6 +262,7 @@ impl<B: MapBackend> Evaluator<B> {
             positionals_stack: Vec::new(),
             functions: <B::Map<String, FunctionEntry> as Default>::default(),
             namespace_path: Vec::new(),
+            imports: alloc::vec![Vec::new()],
             function_mode_save: Vec::new(),
             typeclasses: alloc::collections::BTreeMap::new(),
             instances: alloc::collections::BTreeMap::new(),
@@ -327,9 +344,8 @@ impl<B: MapBackend> Evaluator<B> {
     /// name we should look up (the bare name as written, or a
     /// path-prefixed one). Mirrors `resolve_function_name`: the
     /// walked path goes inside-out so an inner namespace shadows an
-    /// outer one. Returns `None` only when the bare name has a
-    /// leading `.` and isn't present — there's no further fallback
-    /// to try in that case.
+    /// outer one, then `use namespace` imports are consulted in
+    /// declaration order. Returns `None` only when nothing matches.
     fn resolve_var_name(&self, name: &str) -> Option<String> {
         if self.scope.get(name).is_some() {
             return Some(name.to_string());
@@ -338,15 +354,22 @@ impl<B: MapBackend> Evaluator<B> {
             return None;
         }
         for i in (1..=self.namespace_path.len()).rev() {
-            let mut candidate = String::new();
-            for seg in &self.namespace_path[..i] {
-                candidate.push('.');
-                candidate.push_str(seg);
-            }
-            candidate.push('.');
-            candidate.push_str(name);
+            let candidate = build_qualified_name(&self.namespace_path[..i], name);
             if self.scope.get(&candidate).is_some() {
                 return Some(candidate);
+            }
+        }
+        // `use namespace foo` imports. Underscore-prefixed names are
+        // excluded from wildcard imports (Python `__all__`-style
+        // privacy convention).
+        if !name.starts_with('_')
+            && let Some(frame) = self.imports.last()
+        {
+            for entry in frame {
+                let candidate = build_qualified_name(&entry.source, name);
+                if self.scope.get(&candidate).is_some() {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -361,33 +384,33 @@ impl<B: MapBackend> Evaluator<B> {
     ///    `.foo.helper`);
     /// 3. the same against successive outer namespaces (so a bare
     ///    reference inside `namespace foo.bar` falls back to
-    ///    `.foo.helper` if no `.foo.bar.helper` exists).
+    ///    `.foo.helper` if no `.foo.bar.helper` exists);
+    /// 4. `use namespace foo` imports in declaration order.
     ///
     /// Returns the *storage* name on success.
     fn resolve_function_name(&self, name: &str) -> Option<String> {
         if self.functions.contains_key(name) {
             return Some(name.to_string());
         }
-        // If the caller already wrote a leading `.` we treat that as
-        // an absolute path and don't try any namespace prefixing.
         if name.starts_with('.') {
             return None;
         }
-        for i in (0..=self.namespace_path.len()).rev() {
-            if i == 0 {
-                // Already tried bare lookup above.
-                break;
-            }
-            let mut candidate =
-                String::with_capacity(self.namespace_path[..i].iter().map(|s| s.len() + 1).sum::<usize>() + name.len() + 1);
-            for seg in &self.namespace_path[..i] {
-                candidate.push('.');
-                candidate.push_str(seg);
-            }
-            candidate.push('.');
-            candidate.push_str(name);
+        for i in (1..=self.namespace_path.len()).rev() {
+            let candidate = build_qualified_name(&self.namespace_path[..i], name);
             if self.functions.contains_key(&candidate) {
                 return Some(candidate);
+            }
+        }
+        // `use namespace foo` imports — skip names starting with
+        // `_` (private-by-convention).
+        if !name.starts_with('_')
+            && let Some(frame) = self.imports.last()
+        {
+            for entry in frame {
+                let candidate = build_qualified_name(&entry.source, name);
+                if self.functions.contains_key(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -680,6 +703,7 @@ impl<B: MapBackend> Evaluator<B> {
             "unalias" => self.builtin_unalias(&argv[1..]),
             "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
             "export" => self.builtin_export(&argv[1..]),
+            "use" => self.builtin_use(&argv[1..]),
             _ => self.run_external(&argv),
         }
     }
@@ -1050,6 +1074,45 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(Outcome::Status(0))
     }
 
+    /// `use namespace PATH` — install a wildcard namespace import
+    /// into the current function frame. Subsequent bare lookups
+    /// inside this frame consult the import after exhausting the
+    /// regular `namespace_path` walk. The import is dropped when
+    /// the frame pops.
+    ///
+    /// Stage-3 surface area is the wildcard form only; aliasing
+    /// (`use namespace foo as u`), single-symbol (`use .foo.x`),
+    /// and brace (`use .foo.{a,b}`) forms land in follow-ups.
+    fn builtin_use(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.first().map(alloc::string::String::as_str) != Some("namespace") {
+            return Err(KashError::Runtime(
+                "use: only `use namespace PATH` is supported at this stage".into(),
+            ));
+        }
+        if args.len() != 2 {
+            return Err(KashError::Runtime(
+                "use namespace: expected exactly one PATH argument".into(),
+            ));
+        }
+        let raw = &args[1];
+        let stripped = raw.strip_prefix('.').unwrap_or(raw);
+        let source: Vec<String> = stripped
+            .split('.')
+            .map(alloc::string::String::from)
+            .collect();
+        if source.iter().any(|s| s.is_empty()) {
+            return Err(KashError::Runtime(alloc::format!(
+                "use namespace: malformed path `{raw}`"
+            )));
+        }
+        let frame = self
+            .imports
+            .last_mut()
+            .expect("root imports frame always present");
+        frame.push(ImportEntry { source });
+        Ok(Outcome::Status(0))
+    }
+
     /// `export [NAME[=VAL] …]` — short-hand for `typeset -x`.
     /// `export` with no args lists the currently-exported bindings.
     fn builtin_export(&mut self, args: &[String]) -> Result<Outcome> {
@@ -1306,6 +1369,10 @@ impl<B: MapBackend> Evaluator<B> {
             &mut self.namespace_path,
             entry.defining_namespace.clone(),
         );
+        // Push a fresh imports frame — function bodies start with
+        // no namespace imports active and any `use namespace` they
+        // run is visible only inside the body. Restored on return.
+        self.imports.push(Vec::new());
         // Push a mode-save entry. By default the caller's mode is
         // restored on exit; an *unbounded* `mode` declaration inside
         // the body clears this entry so the change propagates back
@@ -1339,6 +1406,8 @@ impl<B: MapBackend> Evaluator<B> {
         if let Some(Some(saved_mode)) = self.function_mode_save.pop() {
             self.mode = saved_mode;
         }
+        // Drop the function's imports frame.
+        self.imports.pop();
         self.namespace_path = saved_ns;
         let restored = self.positionals_stack.pop().expect("we just pushed");
         self.positionals = restored;
@@ -3072,6 +3141,7 @@ ifstd!({
                 "unalias" => self.builtin_unalias(&argv[1..]),
                 "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
                 "export" => self.builtin_export(&argv[1..]),
+                "use" => self.builtin_use(&argv[1..]),
                 other => Err(KashError::Runtime(alloc::format!(
                     "internal: dispatch_builtin called for `{other}`"
                 ))),
@@ -3269,6 +3339,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "typeset"
             | "declare"
             | "export"
+            | "use"
     )
 }
 
@@ -4592,6 +4663,20 @@ fn is_valid_param_name(s: &str) -> bool {
 /// is good enough for the cases ksh93 / bash also handle.
 fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
+}
+
+/// Build `.<seg1>.<seg2>…<name>` for a namespace-qualified lookup.
+fn build_qualified_name(segments: &[String], name: &str) -> String {
+    let mut out = String::with_capacity(
+        segments.iter().map(|s| s.len() + 1).sum::<usize>() + name.len() + 1,
+    );
+    for seg in segments {
+        out.push('.');
+        out.push_str(seg);
+    }
+    out.push('.');
+    out.push_str(name);
+    out
 }
 
 /// `${VAR#pat}` / `${VAR##pat}` — drop a glob-pattern prefix from
@@ -6710,6 +6795,82 @@ mod tests {
              echo after=\"[${.utils.scratch}]\"\n",
         );
         assert_eq!(out, "got=temp\nafter=[]\n");
+    }
+
+    // ===== namespace — stage 3: `use namespace` import =====
+
+    #[test]
+    fn use_namespace_makes_bare_function_name_visible() {
+        let (_, out, _) = run(
+            "namespace utils { greet() { echo hi; }; }\n\
+             show() { use namespace utils; greet; }\n\
+             show\n",
+        );
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn use_namespace_makes_bare_variable_visible() {
+        let (_, out, _) = run(
+            "namespace utils { version=9.9; }\n\
+             show() { use namespace utils; echo $version; }\n\
+             show\n",
+        );
+        assert_eq!(out, "9.9\n");
+    }
+
+    #[test]
+    fn use_namespace_is_scoped_to_the_calling_function() {
+        // `outer` runs `inner` (which imports `utils`) then tries
+        // `greet` from its own body. Because imports are scoped to
+        // the function frame, `outer`'s `greet` is unresolved.
+        let src = "namespace utils { greet() { echo hi; }; }\n\
+                   inner() { use namespace utils; greet; }\n\
+                   outer() { inner; greet; }\n\
+                   outer\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        // Inner ran (so output contains `hi`), but outer's bare
+        // `greet` failed once inner's imports popped.
+        assert_eq!(err.exit_code(), 127);
+        assert!(ev.take_output().starts_with("hi\n"));
+    }
+
+    #[test]
+    fn use_namespace_underscore_prefixed_names_are_hidden() {
+        let (_, out, _) = run(
+            "namespace utils {\n\
+                 _helper() { echo helper; }\n\
+                 visible() { echo visible; }\n\
+             }\n\
+             show() {\n\
+                 use namespace utils\n\
+                 visible\n\
+             }\n\
+             show\n",
+        );
+        assert_eq!(out, "visible\n");
+    }
+
+    #[test]
+    fn use_namespace_explicit_dotted_name_still_reaches_underscore() {
+        // Hidden by wildcard import, but absolute path still works.
+        let (_, out, _) = run(
+            "namespace utils { _helper() { echo helper; }; }\n\
+             .utils._helper\n",
+        );
+        assert_eq!(out, "helper\n");
+    }
+
+    #[test]
+    fn use_namespace_path_with_dots_accepted() {
+        let (_, out, _) = run(
+            "namespace outer { namespace inner { hi() { echo hello; }; }; }\n\
+             show() { use namespace outer.inner; hi; }\n\
+             show\n",
+        );
+        assert_eq!(out, "hello\n");
     }
 
     #[test]
