@@ -942,6 +942,7 @@ impl<B: MapBackend> Evaluator<B> {
             "unset" => self.builtin_unset(&argv[1..]),
             "shift" => self.builtin_shift(&argv[1..]),
             "local" => self.builtin_local(&argv[1..]),
+            "read" => self.builtin_read(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1135,6 +1136,64 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign_local(&name, Value::Scalar(value))?;
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `read [-r] [-p PROMPT|--prompt=PROMPT] [NAME …]` — read a
+    /// line from stdin and bind the IFS-split fields to the given
+    /// names. Defaults: one name → `REPLY`; multi-name → first
+    /// `N-1` names get one field each, the last gets the remainder.
+    /// Returns exit status `1` on EOF, `0` otherwise.
+    fn builtin_read(&mut self, args: &[String]) -> Result<Outcome> {
+        let parsed = parse_read_args(args)?;
+        self.builtin_read_impl(parsed)
+    }
+
+    #[cfg(feature = "std")]
+    fn builtin_read_impl(&mut self, p: ReadArgs) -> Result<Outcome> {
+        use std::io::{self, BufRead, Write};
+        if let Some(prompt) = &p.prompt {
+            let mut stderr = io::stderr();
+            let _ = write!(stderr, "{prompt}");
+            let _ = stderr.flush();
+        }
+        let mut line = String::new();
+        let nread = io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| KashError::Runtime(alloc::format!("read: {e}")))?;
+        if nread == 0 {
+            return Ok(Outcome::Status(1));
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        let processed = if p.raw {
+            line
+        } else {
+            unescape_read_line(&line)
+        };
+        let names = if p.names.is_empty() {
+            alloc::vec!["REPLY".to_string()]
+        } else {
+            p.names
+        };
+        let ifs = self.lookup_ifs();
+        let fields = split_for_read(&processed, &ifs, names.len());
+        for (n, v) in names.iter().zip(fields.iter()) {
+            let target = self.qualify_var_for_write(n);
+            self.scope.assign(&target, Value::Scalar(v.clone()))?;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn builtin_read_impl(&mut self, _: ReadArgs) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "read requires the std feature (stdin)".into(),
+        ))
     }
 
     /// `alias [NAME[=VALUE] ...]` builtin.
@@ -3746,6 +3805,7 @@ ifstd!({
                 "unset" => self.builtin_unset(&argv[1..]),
                 "shift" => self.builtin_shift(&argv[1..]),
                 "local" => self.builtin_local(&argv[1..]),
+            "read" => self.builtin_read(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -4010,6 +4070,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "declare"
             | "export"
             | "use"
+            | "read"
     )
 }
 
@@ -5333,6 +5394,144 @@ fn is_valid_param_name(s: &str) -> bool {
 /// is good enough for the cases ksh93 / bash also handle.
 fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
+}
+
+/// Parsed `read` invocation. Pure value type so the std / alloc
+/// `builtin_read_impl` paths can share parsing logic.
+struct ReadArgs {
+    /// Prompt to print on stderr before reading. `None` means no
+    /// prompt.
+    prompt: Option<String>,
+    /// `true` when `-r` was given — disables backslash escapes in
+    /// the captured line.
+    raw: bool,
+    /// Names to bind the IFS-split fields to. Empty → caller
+    /// substitutes `REPLY`.
+    names: Vec<String>,
+}
+
+fn parse_read_args(args: &[String]) -> Result<ReadArgs> {
+    let mut out = ReadArgs {
+        prompt: None,
+        raw: false,
+        names: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(rest) = a.strip_prefix("--prompt=") {
+            out.prompt = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--prompt" {
+            i += 1;
+            out.prompt = Some(
+                args.get(i)
+                    .cloned()
+                    .ok_or_else(|| KashError::Runtime("read: --prompt needs an argument".into()))?,
+            );
+            i += 1;
+            continue;
+        }
+        if a == "-p" {
+            i += 1;
+            out.prompt = Some(
+                args.get(i)
+                    .cloned()
+                    .ok_or_else(|| KashError::Runtime("read: -p needs an argument".into()))?,
+            );
+            i += 1;
+            continue;
+        }
+        if a == "-r" {
+            out.raw = true;
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            i += 1;
+            while i < args.len() {
+                out.names.push(args[i].clone());
+                i += 1;
+            }
+            break;
+        }
+        if let Some(rest) = a.strip_prefix('-')
+            && !rest.is_empty()
+        {
+            return Err(KashError::Runtime(alloc::format!(
+                "read: unknown option `{a}`"
+            )));
+        }
+        out.names.push(a.clone());
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// POSIX `read` (without `-r`) processes `\X` by dropping the
+/// backslash unless `X` is the newline — and the line is already
+/// split on the original newline by the line reader, so we just
+/// peel single backslashes off every other byte.
+fn unescape_read_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(n) = chars.next()
+        {
+            out.push(n);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split `line` into up to `n` fields against `ifs`. The first
+/// `n-1` fields are minimal (one separator-run apart); the last
+/// field captures all remaining bytes including any embedded
+/// IFS — exactly what POSIX `read` mandates.
+fn split_for_read(line: &str, ifs: &str, n: usize) -> Vec<String> {
+    if n <= 1 {
+        return alloc::vec![line.to_string()];
+    }
+    let is_ifs = |b: u8| ifs.as_bytes().contains(&b);
+    let bytes = line.as_bytes();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut i = 0;
+    // Per POSIX, leading IFS-whitespace is discarded before the
+    // first field. Whitespace IFS is space / tab / newline; for the
+    // simple case the user typically has `IFS=" \t\n"` so we lean
+    // on `char::is_ascii_whitespace`.
+    while i < bytes.len() && is_ifs(bytes[i]) && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut start = i;
+    while out.len() < n - 1 && i < bytes.len() {
+        if is_ifs(bytes[i]) {
+            out.push(line[start..i].to_string());
+            i += 1;
+            // Skip following IFS-whitespace as a single separator.
+            while i < bytes.len() && is_ifs(bytes[i]) && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    // Final field — remainder verbatim. Trailing IFS-whitespace is
+    // stripped from the *last* field only when it's effectively
+    // empty after the strip; otherwise it's preserved (matches
+    // bash/ksh observed behaviour).
+    let tail = &line[start..];
+    out.push(tail.to_string());
+    while out.len() < n {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Load a venv config file (TOML) and return the materialised
@@ -8382,6 +8581,72 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== `read` builtin =====
+
+    #[test]
+    fn read_parse_args_default_name_replied() {
+        let p = parse_read_args(&[]).unwrap();
+        assert!(p.names.is_empty());
+        assert!(!p.raw);
+        assert!(p.prompt.is_none());
+    }
+
+    #[test]
+    fn read_parse_args_dash_p_prompt() {
+        let args: alloc::vec::Vec<String> = alloc::vec!["-p".into(), "say: ".into(), "X".into()];
+        let p = parse_read_args(&args).unwrap();
+        assert_eq!(p.prompt.as_deref(), Some("say: "));
+        assert_eq!(p.names, alloc::vec!["X".to_string()]);
+    }
+
+    #[test]
+    fn read_parse_args_long_prompt_eq_form() {
+        let args: alloc::vec::Vec<String> = alloc::vec!["--prompt=> ".into(), "X".into()];
+        let p = parse_read_args(&args).unwrap();
+        assert_eq!(p.prompt.as_deref(), Some("> "));
+        assert_eq!(p.names, alloc::vec!["X".to_string()]);
+    }
+
+    #[test]
+    fn read_parse_args_raw_flag() {
+        let args: alloc::vec::Vec<String> = alloc::vec!["-r".into(), "X".into()];
+        let p = parse_read_args(&args).unwrap();
+        assert!(p.raw);
+    }
+
+    #[test]
+    fn read_split_single_name_keeps_whole_line() {
+        let v = split_for_read("a b c", " \t\n", 1);
+        assert_eq!(v, alloc::vec!["a b c".to_string()]);
+    }
+
+    #[test]
+    fn read_split_multi_name_last_gets_remainder() {
+        let v = split_for_read("a b c d", " \t\n", 2);
+        assert_eq!(v, alloc::vec!["a".to_string(), "b c d".to_string()]);
+    }
+
+    #[test]
+    fn read_split_more_names_than_fields_pads_empty() {
+        let v = split_for_read("a", " \t\n", 3);
+        assert_eq!(
+            v,
+            alloc::vec!["a".to_string(), String::new(), String::new()]
+        );
+    }
+
+    #[test]
+    fn read_split_leading_whitespace_stripped() {
+        let v = split_for_read("  a b", " \t\n", 2);
+        assert_eq!(v, alloc::vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn read_unescape_drops_backslashes() {
+        assert_eq!(unescape_read_line("a\\bc"), "abc");
+        assert_eq!(unescape_read_line("\\\\"), "\\");
     }
 
     // ===== command-not-found / capability-denied → status =====
