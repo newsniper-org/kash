@@ -2154,8 +2154,38 @@ impl<B: MapBackend> Evaluator<B> {
         if fields.is_empty() {
             fields.push(String::new());
         }
+        // Lexer emits `Bare` segments with their backslashes already
+        // resolved (escape happens at tokenisation time), but
+        // `DoubleQuoted` segments arrive verbatim — the lexer keeps
+        // both bytes of `\X` so the parser can re-route the body
+        // through here. `split_ifs.is_none()` is the (only) marker
+        // we have for "this segment is double-quoted"; if you ever
+        // call this routine for some other no-split context, that
+        // assumption needs a separate flag.
+        let in_double_quoted = split_ifs.is_none();
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
+            if in_double_quoted && c == '\\' {
+                // POSIX 2.2.3: inside double-quoted strings,
+                // backslash retains its meaning only before
+                // `$`, `` ` ``, `"`, `\`, and newline; for any
+                // other character it survives literally.
+                match chars.peek().copied() {
+                    Some(n @ ('$' | '`' | '"' | '\\')) => {
+                        chars.next();
+                        fields.last_mut().expect("fields invariant").push(n);
+                    }
+                    Some('\n') => {
+                        // `\<newline>` is line-continuation: both
+                        // bytes drop.
+                        chars.next();
+                    }
+                    _ => {
+                        fields.last_mut().expect("fields invariant").push(c);
+                    }
+                }
+                continue;
+            }
             if c == '`' {
                 let body = read_backtick_body(&mut chars)?;
                 let value = self.run_command_substitution(&body)?;
@@ -8161,6 +8191,41 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== double-quote backslash escape =====
+
+    #[test]
+    fn dq_backslash_dollar_escapes_expansion() {
+        let (_, out, _) = run("x=val; echo \"\\$x\"\n");
+        assert_eq!(out, "$x\n");
+    }
+
+    #[test]
+    fn dq_backslash_double_quote_literal() {
+        let (_, out, _) = run("echo \"\\\"quoted\\\"\"\n");
+        assert_eq!(out, "\"quoted\"\n");
+    }
+
+    #[test]
+    fn dq_backslash_backslash_literal() {
+        let (_, out, _) = run("echo \"\\\\\"\n");
+        assert_eq!(out, "\\\n");
+    }
+
+    #[test]
+    fn dq_backslash_other_char_survives() {
+        // POSIX: a backslash before any char other than $, `, ", \,
+        // newline is *literal*. `\n` here means literal backslash +
+        // letter `n`.
+        let (_, out, _) = run("echo \"\\n\"\n");
+        assert_eq!(out, "\\n\n");
+    }
+
+    #[test]
+    fn dq_dollar_without_backslash_still_expands() {
+        let (_, out, _) = run("x=val; echo \"$x\"\n");
+        assert_eq!(out, "val\n");
     }
 
     // ===== venv — v.1 surface =====
