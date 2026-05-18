@@ -449,6 +449,60 @@ impl<B: MapBackend> Evaluator<B> {
         None
     }
 
+    /// Resolve a *typeclass* name reference. Same shape as
+    /// [`resolve_function_name`] / [`resolve_var_name`] — namespace
+    /// path walk inside-out, then `use …` imports.
+    fn resolve_typeclass_name(&self, name: &str) -> Option<String> {
+        if self.typeclasses.contains_key(name) {
+            return Some(name.to_string());
+        }
+        if let Some(rewritten) = self.rewrite_via_alias_import(name)
+            && self.typeclasses.contains_key(&rewritten)
+        {
+            return Some(rewritten);
+        }
+        if name.starts_with('.') {
+            return None;
+        }
+        for i in (1..=self.namespace_path.len()).rev() {
+            let candidate = build_qualified_name(&self.namespace_path[..i], name);
+            if self.typeclasses.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        if let Some(frame) = self.imports.last() {
+            for entry in frame {
+                match entry {
+                    ImportEntry::Wildcard { source } => {
+                        if name.starts_with('_') {
+                            continue;
+                        }
+                        let candidate = build_qualified_name(source, name);
+                        if self.typeclasses.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
+                    }
+                    ImportEntry::Symbol {
+                        source_path,
+                        source_name,
+                        alias,
+                    } => {
+                        let bound = alias.as_deref().unwrap_or(source_name);
+                        if name == bound {
+                            let candidate =
+                                build_qualified_name(source_path, source_name);
+                            if self.typeclasses.contains_key(&candidate) {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                    ImportEntry::Aliased { .. } => {}
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve a *reference* to a function by trying, in order:
     ///
     /// 1. the name as written (so absolute `.foo.bar` calls and
@@ -1340,26 +1394,22 @@ impl<B: MapBackend> Evaluator<B> {
         match parts.len() {
             3 => {
                 // Stage 2: fully-qualified `Typeclass::Type::method`.
-                let (tc, ty, method) = (parts[0], parts[1], parts[2]);
-                if !self.typeclasses.contains_key(tc) {
+                let (tc_ref, ty, method) = (parts[0], parts[1], parts[2]);
+                let Some(tc) = self.resolve_typeclass_name(tc_ref) else {
                     return Ok(None);
-                }
-                let body = self.resolve_typeclass_body(tc, ty, method)?;
+                };
+                let body = self.resolve_typeclass_body(&tc, ty, method)?;
                 let body_args: alloc::vec::Vec<String> = argv[1..].to_vec();
                 self.run_typeclass_body(body, body_args).map(Some)
             }
             2 => {
-                // Stage 3: inferred `Typeclass::method`. The receiver
-                // type is read off the first positional via the
-                // lightweight inference rules in `infer_arg_type` —
-                // explicit `@Type` prefix, integer-literal → `Int`,
-                // anything else → `String`.
-                let (tc, method) = (parts[0], parts[1]);
-                if !self.typeclasses.contains_key(tc) {
+                // Stage 3: inferred `Typeclass::method`.
+                let (tc_ref, method) = (parts[0], parts[1]);
+                let Some(tc) = self.resolve_typeclass_name(tc_ref) else {
                     return Ok(None);
-                }
+                };
                 let (ty, body_args) = infer_dispatch_type(argv);
-                let body = self.resolve_typeclass_body(tc, &ty, method)?;
+                let body = self.resolve_typeclass_body(&tc, &ty, method)?;
                 self.run_typeclass_body(body, body_args).map(Some)
             }
             _ => Ok(None),
@@ -1559,6 +1609,7 @@ impl<B: MapBackend> Evaluator<B> {
                 result
             }
             CompoundKind::TypeclassDef { name, items } => {
+                let qualified_name = self.qualify_decl_name(name);
                 let mut defaults: alloc::collections::BTreeMap<
                     String,
                     alloc::boxed::Box<CompoundCommand>,
@@ -1570,7 +1621,7 @@ impl<B: MapBackend> Evaluator<B> {
                         crate::ast::TypeclassMember::Default { name: n, body } => {
                             if defaults.contains_key(n) || abstracts.contains(n) {
                                 return Err(KashError::Parse(alloc::format!(
-                                    "typeclass `{name}` declares method `{n}` twice"
+                                    "typeclass `{qualified_name}` declares method `{n}` twice"
                                 )));
                             }
                             defaults.insert(n.clone(), body.clone());
@@ -1578,7 +1629,7 @@ impl<B: MapBackend> Evaluator<B> {
                         crate::ast::TypeclassMember::Signature { name: n } => {
                             if defaults.contains_key(n) || abstracts.contains(n) {
                                 return Err(KashError::Parse(alloc::format!(
-                                    "typeclass `{name}` declares method `{n}` twice"
+                                    "typeclass `{qualified_name}` declares method `{n}` twice"
                                 )));
                             }
                             abstracts.insert(n.clone());
@@ -1586,7 +1637,7 @@ impl<B: MapBackend> Evaluator<B> {
                     }
                 }
                 self.typeclasses.insert(
-                    name.clone(),
+                    qualified_name,
                     TypeclassEntry {
                         defaults,
                         abstracts,
@@ -1599,15 +1650,19 @@ impl<B: MapBackend> Evaluator<B> {
                 for_type,
                 items,
             } => {
-                // Validate against the typeclass declaration: every
-                // abstract member must be supplied, and the instance
-                // must not introduce names the typeclass never
-                // declared. The typeclass itself must already exist.
-                let Some(tc_entry) = self.typeclasses.get(typeclass) else {
+                // Resolve the typeclass name against the current
+                // namespace path / imports so `instance Sayer for
+                // Int` inside `namespace foo { … }` lands on
+                // `.foo.Sayer` (rather than the bare name).
+                let Some(resolved_tc) = self.resolve_typeclass_name(typeclass) else {
                     return Err(KashError::NotFound(alloc::format!(
                         "typeclass `{typeclass}` (cannot define an instance for an undeclared typeclass)"
                     )));
                 };
+                let tc_entry = self
+                    .typeclasses
+                    .get(&resolved_tc)
+                    .expect("just resolved");
                 let mut methods: alloc::collections::BTreeMap<
                     String,
                     alloc::boxed::Box<CompoundCommand>,
@@ -1616,12 +1671,12 @@ impl<B: MapBackend> Evaluator<B> {
                     let crate::ast::InstanceMember::Method { name: n, body } = m;
                     if !tc_entry.declares(n) {
                         return Err(KashError::Parse(alloc::format!(
-                            "instance `{typeclass} for {for_type}` defines `{n}`, but typeclass `{typeclass}` does not declare it"
+                            "instance `{resolved_tc} for {for_type}` defines `{n}`, but typeclass `{resolved_tc}` does not declare it"
                         )));
                     }
                     if methods.contains_key(n) {
                         return Err(KashError::Parse(alloc::format!(
-                            "instance `{typeclass} for {for_type}` defines method `{n}` twice"
+                            "instance `{resolved_tc} for {for_type}` defines method `{n}` twice"
                         )));
                     }
                     methods.insert(n.clone(), body.clone());
@@ -1629,11 +1684,11 @@ impl<B: MapBackend> Evaluator<B> {
                 for required in &tc_entry.abstracts {
                     if !methods.contains_key(required) {
                         return Err(KashError::Parse(alloc::format!(
-                            "instance `{typeclass} for {for_type}` is missing abstract method `{required}`"
+                            "instance `{resolved_tc} for {for_type}` is missing abstract method `{required}`"
                         )));
                     }
                 }
-                let key = (typeclass.clone(), for_type.clone());
+                let key = (resolved_tc, for_type.clone());
                 self.instances.insert(key, InstanceEntry { methods });
                 Ok(Outcome::Status(0))
             }
@@ -7065,6 +7120,77 @@ mod tests {
              show\n",
         );
         assert_eq!(out, "helper-explicit\n");
+    }
+
+    // ===== namespace — stage 4: typeclass / instance scoping =====
+
+    #[test]
+    fn typeclass_in_namespace_dispatches_via_dotted_name() {
+        let (_, out, _) = run(
+            "namespace foo {\n\
+                 typeclass Sayer { say() { echo default; }; }\n\
+                 instance Sayer for Int { say() { echo foo-int; }; }\n\
+             }\n\
+             .foo.Sayer::Int::say\n",
+        );
+        assert_eq!(out, "foo-int\n");
+    }
+
+    #[test]
+    fn typeclass_in_namespace_short_name_works_inside_namespace_func() {
+        let (_, out, _) = run(
+            "namespace foo {\n\
+                 typeclass Sayer { say() { echo default; }; }\n\
+                 instance Sayer for Int { say() { echo foo-int; }; }\n\
+                 entry() { Sayer::Int::say; }\n\
+             }\n\
+             .foo.entry\n",
+        );
+        assert_eq!(out, "foo-int\n");
+    }
+
+    #[test]
+    fn typeclass_in_namespace_invisible_to_unrelated_caller() {
+        let src = "namespace foo {\n\
+                       typeclass Sayer { say() { echo default; }; }\n\
+                       instance Sayer for Int { say() { echo foo-int; }; }\n\
+                   }\n\
+                   Sayer::Int::say\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        // Outside the namespace and without a `use`, the bare
+        // `Sayer` isn't resolvable.
+        assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[test]
+    fn typeclass_use_namespace_brings_into_scope() {
+        let (_, out, _) = run(
+            "namespace foo {\n\
+                 typeclass Sayer { say() { echo default; }; }\n\
+                 instance Sayer for Int { say() { echo foo-int; }; }\n\
+             }\n\
+             entry() { use namespace foo; Sayer::Int::say; }\n\
+             entry\n",
+        );
+        assert_eq!(out, "foo-int\n");
+    }
+
+    #[test]
+    fn typeclass_same_name_in_different_namespaces_are_distinct() {
+        let (_, out, _) = run(
+            "namespace foo {\n\
+                 typeclass Sayer { say() { echo default; }; }\n\
+                 instance Sayer for Int { say() { echo foo; }; }\n\
+             }\n\
+             namespace bar {\n\
+                 typeclass Sayer { say() { echo default; }; }\n\
+                 instance Sayer for Int { say() { echo bar; }; }\n\
+             }\n\
+             .foo.Sayer::Int::say\n\
+             .bar.Sayer::Int::say\n",
+        );
+        assert_eq!(out, "foo\nbar\n");
     }
 
     #[test]
