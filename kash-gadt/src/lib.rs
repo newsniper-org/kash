@@ -147,19 +147,19 @@ pub trait MapStorage<K, V>: Default + Clone {
     fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// Mutable lookup, same `Borrow<Q>` shape as `get`.
     fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// `true` iff `key` is bound.
     fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// Insert / overwrite. Returns the old value if there was one.
     fn insert(&mut self, key: K, value: V) -> Option<V>;
@@ -168,7 +168,7 @@ pub trait MapStorage<K, V>: Default + Clone {
     fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// Drop every binding.
     fn clear(&mut self);
@@ -200,7 +200,7 @@ pub trait SetStorage<T>: Default + Clone {
     fn contains<Q>(&self, value: &Q) -> bool
     where
         T: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// Insert `value`. Returns `true` if `value` wasn't already a
     /// member.
@@ -210,7 +210,7 @@ pub trait SetStorage<T>: Default + Clone {
     fn remove<Q>(&mut self, value: &Q) -> bool
     where
         T: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized;
+        Q: Ord + core::hash::Hash + Eq + ?Sized;
 
     /// Drop every member.
     fn clear(&mut self);
@@ -281,7 +281,7 @@ impl<K: Ord + Clone, V: Clone> MapStorage<K, V> for BTreeMap<K, V> {
     fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeMap::get(self, key)
     }
@@ -290,7 +290,7 @@ impl<K: Ord + Clone, V: Clone> MapStorage<K, V> for BTreeMap<K, V> {
     fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeMap::get_mut(self, key)
     }
@@ -299,7 +299,7 @@ impl<K: Ord + Clone, V: Clone> MapStorage<K, V> for BTreeMap<K, V> {
     fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeMap::contains_key(self, key)
     }
@@ -313,7 +313,7 @@ impl<K: Ord + Clone, V: Clone> MapStorage<K, V> for BTreeMap<K, V> {
     fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeMap::remove(self, key)
     }
@@ -349,7 +349,7 @@ impl<T: Ord + Clone> SetStorage<T> for BTreeSet<T> {
     fn contains<Q>(&self, value: &Q) -> bool
     where
         T: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeSet::contains(self, value)
     }
@@ -363,7 +363,7 @@ impl<T: Ord + Clone> SetStorage<T> for BTreeSet<T> {
     fn remove<Q>(&mut self, value: &Q) -> bool
     where
         T: core::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + core::hash::Hash + Eq + ?Sized,
     {
         BTreeSet::remove(self, value)
     }

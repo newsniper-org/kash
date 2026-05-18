@@ -10,5 +10,8 @@ repository.workspace = true
 [features]
 # Same `no_std + alloc` posture as the rest of the kash workspace.
 default = ["alloc"]
-alloc = []
-std = ["alloc"]
+alloc = ["kash-gadt/alloc"]
+std = ["alloc", "kash-gadt/std"]
+
+[dependencies]
+kash-gadt = { path = "../kash-gadt", default-features = false }

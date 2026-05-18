@@ -426,6 +426,51 @@ where
         }
     }
 
+    /// Look up `key` and return a mutable reference to its value.
+    /// Same descent as [`Self::get`].
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let root = self.root.as_mut()?;
+        let mut depth_coord = Vec::new();
+        Self::get_mut_in(&self.hash_builder, self.recon, root, key, &mut depth_coord)
+    }
+
+    fn get_mut_in<'t, Q>(
+        hash_builder: &H,
+        recon: usize,
+        sub_table: &'t mut SubTable<K, V>,
+        key: &Q,
+        depth_coord: &mut Vec<u8>,
+    ) -> Option<&'t mut V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = compute_hash_with(hash_builder, recon, key, depth_coord);
+        let slot_idx = (hash & SLOT_MASK) as usize;
+        match &mut sub_table.slots[slot_idx] {
+            Bucket::Empty => None,
+            Bucket::Single(k, v) if (k as &K).borrow() == key => Some(v),
+            Bucket::Single(_, _) => None,
+            Bucket::Nested(nested) => {
+                depth_coord.push(slot_idx as u8);
+                let r = Self::get_mut_in(hash_builder, recon, nested, key, depth_coord);
+                depth_coord.pop();
+                r
+            }
+        }
+    }
+
+    /// Drop every entry. The root pointer is freed.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.root = None;
+        self.len = 0;
+    }
+
     /// Remove the binding for `key`. Returns the removed value if
     /// any.
     ///
@@ -552,6 +597,58 @@ where
     }
 }
 
+impl<K, V, H> LightNht<K, V, H>
+where
+    K: Hash + Eq,
+    H: Hasher,
+{
+    /// Iterate `(&K, &V)` pairs in DFS order over the sub-table tree.
+    /// The order is implementation-defined and changes after each
+    /// [`Self::reconstruct`]; do not rely on it.
+    #[inline]
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        let mut stack = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            stack.push((root.as_ref(), 0usize));
+        }
+        Iter { stack }
+    }
+}
+
+/// Borrowing iterator over every live `(&K, &V)` in a [`LightNht`].
+/// Walks the sub-table tree depth-first, yielding `Single` buckets
+/// in DFS order. State is a stack of `(sub_table, next_slot_index)`
+/// pairs.
+pub struct Iter<'a, K, V> {
+    stack: Vec<(&'a SubTable<K, V>, usize)>,
+}
+
+impl<'a, K, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Borrow-checker dance: peel one frame off the stack
+            // pointer at a time so the mutable update to the slot
+            // index doesn't alias the immutable read of the bucket.
+            let frame = self.stack.last_mut()?;
+            let (sub, idx) = (frame.0, frame.1);
+            if idx >= SUBTABLE_SIZE {
+                self.stack.pop();
+                continue;
+            }
+            frame.1 = idx + 1;
+            match &sub.slots[idx] {
+                Bucket::Empty => continue,
+                Bucket::Single(k, v) => return Some((k, v)),
+                Bucket::Nested(nested) => {
+                    self.stack.push((nested.as_ref(), 0));
+                }
+            }
+        }
+    }
+}
+
 /// Compute the 64-bit hash for `(entry, depth_coord, recon)` against
 /// `hash_builder`. Clones the prototype hasher so the input fed in
 /// here can't leak into a later call.
@@ -658,6 +755,29 @@ where
     pub fn recon(&self) -> usize {
         self.inner.recon()
     }
+
+    /// Iterate `&T` members in DFS order. The order is
+    /// implementation-defined and changes after [`Self::reconstruct`].
+    #[inline]
+    pub fn iter(&self) -> SetIter<'_, T> {
+        SetIter {
+            inner: self.inner.iter(),
+        }
+    }
+}
+
+/// Borrowing iterator over every live `&T` in a [`LightNhtSet`].
+pub struct SetIter<'a, T> {
+    inner: Iter<'a, T, ()>,
+}
+
+impl<'a, T> Iterator for SetIter<'a, T> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
 }
 
 impl<T, H> LightNhtSet<T, H>
@@ -722,6 +842,158 @@ where
 {
     fn default() -> Self {
         Self::with_hasher(H::default())
+    }
+}
+
+// ===== kash-gadt MapStorage / SetStorage impls =====
+//
+// These pull `lightnht` into the `MapBackend`-family picture so a
+// future `LightNhtBackend` zero-sized marker can slot in next to
+// `BTreeBackend`. `K` / `T` need `Ord` here because the trait
+// signature (intentionally) keeps the `Ord` bound for the BTree
+// path; in practice every shell-key type (`String`, `&str`, …)
+// already satisfies both `Ord` and `Hash + Eq`, so the doubled
+// bound just narrows callers to keys that work in either backend.
+
+impl<K, V, H> kash_gadt::MapStorage<K, V> for LightNht<K, V, H>
+where
+    K: Hash + Eq + Ord + Clone,
+    V: Clone,
+    H: Hasher + Clone + Default,
+{
+    type Iter<'a>
+        = Iter<'a, K, V>
+    where
+        Self: 'a,
+        K: 'a,
+        V: 'a;
+
+    #[inline]
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNht::<K, V, H>::get(self, key)
+    }
+
+    #[inline]
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNht::<K, V, H>::get_mut(self, key)
+    }
+
+    #[inline]
+    fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNht::<K, V, H>::get(self, key).is_some()
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        LightNht::<K, V, H>::insert(self, key, value)
+    }
+
+    #[inline]
+    fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNht::<K, V, H>::remove(self, key)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        LightNht::<K, V, H>::clear(self);
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        LightNht::<K, V, H>::len(self)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        LightNht::<K, V, H>::is_empty(self)
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter<'_> {
+        LightNht::<K, V, H>::iter(self)
+    }
+}
+
+impl<T, H> kash_gadt::SetStorage<T> for LightNhtSet<T, H>
+where
+    T: Hash + Eq + Ord + Clone,
+    H: Hasher + Clone + Default,
+{
+    type Iter<'a>
+        = SetIter<'a, T>
+    where
+        Self: 'a,
+        T: 'a;
+
+    #[inline]
+    fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNhtSet::<T, H>::contains(self, value)
+    }
+
+    #[inline]
+    fn insert(&mut self, value: T) -> bool {
+        LightNhtSet::<T, H>::insert(self, value)
+    }
+
+    #[inline]
+    fn remove<Q>(&mut self, value: &Q) -> bool
+    where
+        T: core::borrow::Borrow<Q>,
+        Q: Ord + Hash + Eq + ?Sized,
+    {
+        LightNhtSet::<T, H>::remove(self, value)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        // Forwards to the inner map's clear.
+        self.inner.clear();
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        LightNhtSet::<T, H>::len(self)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        LightNhtSet::<T, H>::is_empty(self)
+    }
+
+    #[inline]
+    fn iter(&self) -> Self::Iter<'_> {
+        LightNhtSet::<T, H>::iter(self)
+    }
+
+    fn is_subset(&self, other: &Self) -> bool {
+        // O(|self|) walk; each `contains` is a fresh descent through
+        // `other`'s tree.
+        for item in self.iter() {
+            if !LightNhtSet::<T, H>::contains(other, item) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -885,6 +1157,146 @@ mod tests {
         assert!(a.get("bar").is_none());
         assert_eq!(b.get("foo"), Some(&2));
         assert_eq!(b.get("bar"), Some(&3));
+    }
+
+    #[test]
+    fn iter_yields_every_entry() {
+        let mut m: Map = Map::default();
+        let mut expected: alloc::vec::Vec<(String, i32)> = alloc::vec::Vec::new();
+        for i in 0..50 {
+            let key = alloc::format!("iter-{i:03}");
+            m.insert(key.clone(), i);
+            expected.push((key, i));
+        }
+        let mut seen: alloc::vec::Vec<(String, i32)> = m
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn iter_on_empty_map_yields_nothing() {
+        let m: Map = Map::default();
+        assert_eq!(m.iter().count(), 0);
+    }
+
+    #[test]
+    fn get_mut_updates_in_place() {
+        let mut m: Map = Map::default();
+        m.insert(k("counter"), 0);
+        if let Some(v) = m.get_mut("counter") {
+            *v = 42;
+        }
+        assert_eq!(m.get("counter"), Some(&42));
+    }
+
+    #[test]
+    fn clear_drops_everything() {
+        let mut m: Map = Map::default();
+        for i in 0..10 {
+            m.insert(alloc::format!("k{i}"), i);
+        }
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert!(m.iter().next().is_none());
+        // Re-insert after clear should work.
+        m.insert(k("after"), 1);
+        assert_eq!(m.get("after"), Some(&1));
+    }
+
+    #[test]
+    fn set_iter_yields_every_member() {
+        let mut s: Set = Set::default();
+        for i in 0..30 {
+            s.insert(alloc::format!("m{i}"));
+        }
+        let mut got: alloc::vec::Vec<String> = s.iter().cloned().collect();
+        got.sort();
+        let mut expected: alloc::vec::Vec<String> = (0..30)
+            .map(|i| alloc::format!("m{i}"))
+            .collect();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    // ===== kash-gadt MapStorage / SetStorage trait impls =====
+
+    #[test]
+    fn map_storage_trait_basic_ops() {
+        use kash_gadt::MapStorage;
+        let mut m: Map = Map::default();
+        assert_eq!(MapStorage::len(&m), 0);
+        assert!(MapStorage::is_empty(&m));
+        MapStorage::insert(&mut m, k("foo"), 1);
+        MapStorage::insert(&mut m, k("bar"), 2);
+        assert_eq!(MapStorage::len(&m), 2);
+        assert_eq!(MapStorage::get(&m, "foo"), Some(&1));
+        assert!(MapStorage::contains_key(&m, "bar"));
+        assert_eq!(MapStorage::remove(&mut m, "foo"), Some(1));
+        assert_eq!(MapStorage::len(&m), 1);
+    }
+
+    #[test]
+    fn map_storage_iter_via_trait() {
+        use kash_gadt::MapStorage;
+        let mut m: Map = Map::default();
+        m.insert(k("a"), 1);
+        m.insert(k("b"), 2);
+        let count = MapStorage::iter(&m).count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn set_storage_trait_basic_ops() {
+        use kash_gadt::SetStorage;
+        let mut s: Set = Set::default();
+        assert!(SetStorage::insert(&mut s, k("alpha")));
+        assert!(!SetStorage::insert(&mut s, k("alpha"))); // duplicate
+        assert!(SetStorage::insert(&mut s, k("beta")));
+        assert_eq!(SetStorage::len(&s), 2);
+        assert!(SetStorage::contains(&s, "alpha"));
+        assert!(SetStorage::remove(&mut s, "alpha"));
+        assert!(!SetStorage::contains(&s, "alpha"));
+    }
+
+    #[test]
+    fn set_storage_is_subset() {
+        use kash_gadt::SetStorage;
+        let mut a: Set = Set::default();
+        let mut b: Set = Set::default();
+        a.insert(k("x"));
+        a.insert(k("y"));
+        b.insert(k("x"));
+        b.insert(k("y"));
+        b.insert(k("z"));
+        assert!(SetStorage::is_subset(&a, &b));
+        assert!(!SetStorage::is_subset(&b, &a));
+    }
+
+    #[test]
+    fn map_storage_swappable_with_btree() {
+        // A generic function written against `MapStorage` accepts
+        // both `BTreeMap` and `LightNht`. This compiles iff the
+        // trait surface really is interchangeable.
+        use kash_gadt::MapStorage;
+        fn round_trip<M>(map: &mut M)
+        where
+            M: MapStorage<String, i32>,
+        {
+            map.insert("ten".to_string(), 10);
+            map.insert("twenty".to_string(), 20);
+            assert_eq!(map.get("ten"), Some(&10));
+            assert_eq!(map.remove("ten"), Some(10));
+            assert_eq!(map.len(), 1);
+        }
+        let mut light: Map = Map::default();
+        let mut btree: alloc::collections::BTreeMap<String, i32> =
+            alloc::collections::BTreeMap::new();
+        round_trip(&mut light);
+        round_trip(&mut btree);
     }
 
     #[test]
