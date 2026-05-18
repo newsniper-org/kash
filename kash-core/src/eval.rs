@@ -29,6 +29,7 @@ use crate::error::{KashError, Result};
 use crate::mode::Mode;
 use crate::scope::Scope;
 use crate::value::Value;
+use kash_macros::ifstd;
 
 /// Result of evaluating a statement / command — either a normal exit
 /// status or an `exit N` request that should propagate upward.
@@ -197,9 +198,16 @@ impl Evaluator {
 
     fn eval_pipeline(&mut self, pipe: &Pipeline) -> Result<Outcome> {
         if pipe.stages.len() > 1 {
-            return Err(KashError::Runtime(
-                "multi-stage pipelines are not yet wired in the evaluator skeleton".into(),
-            ));
+            #[cfg(feature = "std")]
+            {
+                return self.run_pipeline_external(pipe);
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                return Err(KashError::Runtime(
+                    "multi-stage pipelines require the `std` feature".into(),
+                ));
+            }
         }
         self.eval_command(&pipe.stages[0])
     }
@@ -271,7 +279,20 @@ impl Evaluator {
             "set" => self.builtin_set(&argv[1..]),
             "unset" => self.builtin_unset(&argv[1..]),
             "shift" => self.builtin_shift(&argv[1..]),
-            other => Err(KashError::NotFound(format!("command `{other}`"))),
+            _ => self.run_external(&argv),
+        }
+    }
+
+    /// Run `argv[0]` as an external program. Available only under
+    /// `std` — the alloc-only build collapses this into `NotFound`.
+    fn run_external(&mut self, argv: &[String]) -> Result<Outcome> {
+        #[cfg(feature = "std")]
+        {
+            self.run_external_std(argv)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Err(KashError::NotFound(format!("command `{}`", argv[0])))
         }
     }
 
@@ -818,6 +839,159 @@ impl Default for Evaluator {
     }
 }
 
+// ===== std-only: external process exec + multi-stage pipeline =====
+
+ifstd!({
+    impl Evaluator {
+        /// Spawn `argv[0]` as an external process. The child inherits
+        /// our stdin/stderr; its stdout is captured and appended to
+        /// the evaluator's output buffer.
+        fn run_external_std(&mut self, argv: &[String]) -> Result<Outcome> {
+            use std::io::Read;
+            use std::process::{Command, Stdio};
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            cmd.stdin(Stdio::inherit());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::inherit());
+            let mut child = cmd.spawn().map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                } else {
+                    KashError::Runtime(alloc::format!("exec `{}`: {e}", argv[0]))
+                }
+            })?;
+            let mut stdout_buf = alloc::vec::Vec::<u8>::new();
+            if let Some(mut so) = child.stdout.take() {
+                so.read_to_end(&mut stdout_buf)
+                    .map_err(|e| KashError::Runtime(alloc::format!("read stdout: {e}")))?;
+            }
+            self.output
+                .push_str(&String::from_utf8_lossy(&stdout_buf));
+            let status = child
+                .wait()
+                .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+            Ok(Outcome::Status(status.code().unwrap_or(128)))
+        }
+
+        /// Spawn an N-stage pipeline of external commands. Stages
+        /// that resolve to a builtin or function are rejected — the
+        /// in-process / cross-process bridge for those lands later.
+        fn run_pipeline_external(&mut self, pipe: &Pipeline) -> Result<Outcome> {
+            use std::io::Read;
+            use std::process::{Child, Command, Stdio};
+
+            // Resolve every stage's argv up front. If any stage is a
+            // builtin / function / compound, bail before we spawn
+            // anything.
+            let mut argvs: alloc::vec::Vec<alloc::vec::Vec<String>> =
+                alloc::vec::Vec::with_capacity(pipe.stages.len());
+            for stage in &pipe.stages {
+                let simple = match stage {
+                    crate::ast::Command::Simple(s) => s,
+                    crate::ast::Command::Compound(_) => {
+                        return Err(KashError::Runtime(
+                            "compound commands in pipeline stages are not yet supported".into(),
+                        ));
+                    }
+                };
+                if !simple.redirects.is_empty() {
+                    return Err(KashError::Runtime(
+                        "redirections in pipeline stages are not yet supported".into(),
+                    ));
+                }
+                if !simple.assignments.is_empty() {
+                    return Err(KashError::Runtime(
+                        "assignment prefixes in pipeline stages are not yet supported".into(),
+                    ));
+                }
+                let mut argv = alloc::vec::Vec::with_capacity(simple.words.len());
+                for w in &simple.words {
+                    let s = self.expand_word(w)?;
+                    if !s.is_empty() {
+                        argv.push(s);
+                    }
+                }
+                if argv.is_empty() {
+                    return Err(KashError::Runtime(
+                        "pipeline stage expanded to nothing".into(),
+                    ));
+                }
+                let name = argv[0].as_str();
+                if self.functions.contains_key(name) || is_builtin_name(name) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "builtin or function `{name}` in a multi-stage pipeline is not yet supported"
+                    )));
+                }
+                argvs.push(argv);
+            }
+
+            // Spawn each stage, wiring stdin to the previous stage's
+            // stdout. The very last stage's stdout is captured into
+            // the evaluator's output buffer.
+            let n = argvs.len();
+            let mut children: alloc::vec::Vec<Child> = alloc::vec::Vec::with_capacity(n);
+            for (i, argv) in argvs.iter().enumerate() {
+                let mut cmd = Command::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                if i == 0 {
+                    cmd.stdin(Stdio::inherit());
+                } else {
+                    let prev_stdout = children[i - 1]
+                        .stdout
+                        .take()
+                        .expect("previous stage was spawned with piped stdout");
+                    cmd.stdin(Stdio::from(prev_stdout));
+                }
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::inherit());
+                let child = cmd.spawn().map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        KashError::NotFound(alloc::format!("command `{}`", argv[0]))
+                    } else {
+                        KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
+                    }
+                })?;
+                children.push(child);
+            }
+
+            // Drain the last child's stdout before reaping anyone,
+            // so a producer that writes more than a pipe-buffer's
+            // worth doesn't deadlock waiting for us to read.
+            let last = n - 1;
+            let mut last_stdout = children[last]
+                .stdout
+                .take()
+                .expect("last stage was spawned with piped stdout");
+            let mut buf = alloc::vec::Vec::<u8>::new();
+            last_stdout
+                .read_to_end(&mut buf)
+                .map_err(|e| KashError::Runtime(alloc::format!("read pipeline stdout: {e}")))?;
+            self.output.push_str(&String::from_utf8_lossy(&buf));
+
+            // Reap every stage. Pipeline exit status = last stage's
+            // (POSIX). `pipefail` lands with the set-options pass.
+            let mut final_status = 0;
+            for (i, child) in children.iter_mut().enumerate() {
+                let st = child
+                    .wait()
+                    .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+                if i == last {
+                    final_status = st.code().unwrap_or(128);
+                }
+            }
+            Ok(Outcome::Status(final_status))
+        }
+    }
+});
+
+fn is_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        ":" | "true" | "false" | "echo" | "exit" | "set" | "unset" | "shift"
+    )
+}
+
 // ===== helpers =====
 
 const fn is_name_start(c: char) -> bool {
@@ -1189,12 +1363,135 @@ mod tests {
         assert_eq!(out, "2\n1\n0\n");
     }
 
-    // ===== sanity: multistage pipeline still stubbed =====
+    // ===== multistage pipeline + external exec (env-dependent) =====
 
+    #[cfg(not(feature = "std"))]
     #[test]
-    fn multistage_pipeline_unsupported_yields_runtime_error() {
+    fn multistage_pipeline_unsupported_in_alloc_only() {
         let prog = parse("echo a | true").unwrap();
         let mut ev = Evaluator::new();
         assert!(ev.eval_program(&prog).is_err());
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn external_command_unknown_in_alloc_only() {
+        let prog = parse("definitely_not_a_real_command").unwrap();
+        let mut ev = Evaluator::new();
+        assert_eq!(
+            ev.eval_program(&prog).unwrap_err().exit_code(),
+            127
+        );
+    }
+
+    #[cfg(feature = "std")]
+    mod std_tests {
+        use super::*;
+        use std::path::Path;
+
+        /// Skip the test if the named binary isn't on the dev host
+        /// (some sandboxes / minimal images don't ship `/bin/echo`
+        /// etc.). Returns `true` if the binary exists.
+        fn have(p: &str) -> bool {
+            Path::new(p).exists()
+        }
+
+        #[test]
+        fn external_echo_captures_stdout() {
+            if !have("/bin/echo") {
+                return;
+            }
+            let prog = parse("/bin/echo hello world").unwrap();
+            let mut ev = Evaluator::new();
+            let o = ev.eval_program(&prog).unwrap();
+            assert_eq!(o, Outcome::Status(0));
+            assert_eq!(ev.take_output(), "hello world\n");
+        }
+
+        #[test]
+        fn external_true_returns_zero() {
+            if !have("/bin/true") {
+                return;
+            }
+            let prog = parse("/bin/true").unwrap();
+            let mut ev = Evaluator::new();
+            assert_eq!(ev.eval_program(&prog).unwrap(), Outcome::Status(0));
+        }
+
+        #[test]
+        fn external_false_returns_nonzero() {
+            if !have("/bin/false") {
+                return;
+            }
+            let prog = parse("/bin/false").unwrap();
+            let mut ev = Evaluator::new();
+            assert_eq!(ev.eval_program(&prog).unwrap().status(), 1);
+        }
+
+        #[test]
+        fn external_unknown_is_not_found() {
+            let prog = parse("definitely_not_a_real_command_xyzzy_42").unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert_eq!(err.exit_code(), 127);
+        }
+
+        #[test]
+        fn andor_with_external_status() {
+            if !have("/bin/false") || !have("/bin/echo") {
+                return;
+            }
+            let prog = parse("/bin/false || /bin/echo backup").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "backup\n");
+        }
+
+        #[test]
+        fn two_stage_pipeline_captures_through() {
+            if !have("/bin/echo") || !have("/bin/cat") {
+                return;
+            }
+            let prog = parse("/bin/echo hello | /bin/cat").unwrap();
+            let mut ev = Evaluator::new();
+            let o = ev.eval_program(&prog).unwrap();
+            assert_eq!(o.status(), 0);
+            assert_eq!(ev.take_output(), "hello\n");
+        }
+
+        #[test]
+        fn three_stage_pipeline_preserves_data() {
+            if !have("/bin/echo") || !have("/bin/cat") {
+                return;
+            }
+            let prog = parse("/bin/echo data | /bin/cat | /bin/cat").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "data\n");
+        }
+
+        #[test]
+        fn pipeline_status_is_last_stage() {
+            if !have("/bin/true") || !have("/bin/false") {
+                return;
+            }
+            // true | false → exit status 1 (last stage's).
+            let prog = parse("/bin/true | /bin/false").unwrap();
+            let mut ev = Evaluator::new();
+            assert_eq!(ev.eval_program(&prog).unwrap().status(), 1);
+            // false | true → 0.
+            let prog = parse("/bin/false | /bin/true").unwrap();
+            let mut ev = Evaluator::new();
+            assert_eq!(ev.eval_program(&prog).unwrap().status(), 0);
+        }
+
+        #[test]
+        fn pipeline_rejects_builtin_stage() {
+            // `echo` is an in-process builtin — using it as a pipeline
+            // stage isn't supported yet.
+            let prog = parse("echo a | /bin/cat").unwrap();
+            let mut ev = Evaluator::new();
+            assert!(ev.eval_program(&prog).is_err());
+        }
     }
 }
