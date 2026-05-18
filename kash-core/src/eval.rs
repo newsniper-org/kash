@@ -1765,6 +1765,20 @@ impl<B: MapBackend> Evaluator<B> {
         _name: &str,
         sections: &[crate::ast::VenvSection],
     ) -> Result<Outcome> {
+        // Strict modes disable the `venv` keyword per the locked
+        // semantics in `project_kash_venv.md`. (POSIX-strict and
+        // ksh93u-strict are by definition no-extensions modes.)
+        match self.mode.base {
+            crate::mode::BaseMode::PosixStrict
+            | crate::mode::BaseMode::Ksh93uStrict => {
+                return Err(KashError::Mode(alloc::format!(
+                    "`venv {{ … }}` blocks are not available inside `{}`; \
+                     switch to an `*-aware` or `default` mode in an outer scope",
+                    self.mode
+                )));
+            }
+            _ => {}
+        }
         let mut frame = VenvFrame::new();
         let mut body: Option<&[Statement]> = None;
         let mut import_entries: Vec<ImportEntry> = Vec::new();
@@ -8226,6 +8240,40 @@ mod tests {
     fn dq_dollar_without_backslash_still_expands() {
         let (_, out, _) = run("x=val; echo \"$x\"\n");
         assert_eq!(out, "val\n");
+    }
+
+    // ===== venv — strict-mode gating =====
+
+    #[test]
+    fn venv_disabled_in_posix_strict() {
+        // Switching to posix-strict happens before the venv decl
+        // so the strict gate fires.
+        let src = "mode posix-strict\nvenv x { body {}; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 2); // KashError::Mode → 2
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("posix-strict"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_disabled_in_ksh93u_strict() {
+        let src = "mode ksh93u-strict\nvenv x { body {}; }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("ksh93u-strict"), "got: {msg}");
+    }
+
+    #[test]
+    fn venv_available_in_posix_aware() {
+        let (_, out, _) = run(
+            "mode posix-aware\nvenv x { body { echo ok; }; }\n",
+        );
+        assert_eq!(out, "ok\n");
     }
 
     // ===== venv — v.1 surface =====
