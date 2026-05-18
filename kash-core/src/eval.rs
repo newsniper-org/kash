@@ -1040,21 +1040,51 @@ impl<B: MapBackend> Evaluator<B> {
         argv: &[String],
     ) -> Result<Option<Outcome>> {
         let parts: alloc::vec::Vec<&str> = name.splitn(3, "::").collect();
-        if parts.len() != 3 {
-            return Ok(None);
+        match parts.len() {
+            3 => {
+                // Stage 2: fully-qualified `Typeclass::Type::method`.
+                let (tc, ty, method) = (parts[0], parts[1], parts[2]);
+                if !self.typeclasses.contains_key(tc) {
+                    return Ok(None);
+                }
+                let body = self.resolve_typeclass_body(tc, ty, method)?;
+                let body_args: alloc::vec::Vec<String> = argv[1..].to_vec();
+                self.run_typeclass_body(body, body_args).map(Some)
+            }
+            2 => {
+                // Stage 3: inferred `Typeclass::method`. The receiver
+                // type is read off the first positional via the
+                // lightweight inference rules in `infer_arg_type` —
+                // explicit `@Type` prefix, integer-literal → `Int`,
+                // anything else → `String`.
+                let (tc, method) = (parts[0], parts[1]);
+                if !self.typeclasses.contains_key(tc) {
+                    return Ok(None);
+                }
+                let (ty, body_args) = infer_dispatch_type(argv);
+                let body = self.resolve_typeclass_body(tc, &ty, method)?;
+                self.run_typeclass_body(body, body_args).map(Some)
+            }
+            _ => Ok(None),
         }
-        let (tc, ty, method) = (parts[0], parts[1], parts[2]);
-        if !self.typeclasses.contains_key(tc) {
-            return Ok(None);
-        }
-        // Resolution: instance method beats typeclass default.
+    }
+
+    /// Look up the method body for `(typeclass, type, method)`.
+    /// Instance methods beat the typeclass default; neither present
+    /// is a `KashError::NotFound`.
+    fn resolve_typeclass_body(
+        &self,
+        tc: &str,
+        ty: &str,
+        method: &str,
+    ) -> Result<alloc::boxed::Box<CompoundCommand>> {
         let instance_body = self
             .instances
             .get(&(tc.to_string(), ty.to_string()))
             .and_then(|i| i.methods.get(method))
             .cloned();
-        let body = match instance_body {
-            Some(b) => b,
+        match instance_body {
+            Some(b) => Ok(b),
             None => self
                 .typeclasses
                 .get(tc)
@@ -1064,18 +1094,26 @@ impl<B: MapBackend> Evaluator<B> {
                     KashError::NotFound(alloc::format!(
                         "typeclass method `{tc}::{ty}::{method}`"
                     ))
-                })?,
-        };
-        // Run the body like a function call: swap positionals, push
-        // a static-scope function frame, eval, restore.
-        let saved = core::mem::replace(&mut self.positionals, argv[1..].to_vec());
+                }),
+        }
+    }
+
+    /// Run a resolved typeclass method body like a function call:
+    /// swap in the positional parameters, push a static-scope
+    /// function frame, evaluate, restore.
+    fn run_typeclass_body(
+        &mut self,
+        body: alloc::boxed::Box<CompoundCommand>,
+        body_args: alloc::vec::Vec<String>,
+    ) -> Result<Outcome> {
+        let saved = core::mem::replace(&mut self.positionals, body_args);
         self.positionals_stack.push(saved);
         self.scope.push_function_frame(true);
         let result = self.eval_compound(&body);
         self.scope.pop();
         let restored = self.positionals_stack.pop().expect("just pushed");
         self.positionals = restored;
-        result.map(Some)
+        result
     }
 
     fn call_function(&mut self, argv: &[String]) -> Result<Outcome> {
@@ -3828,6 +3866,46 @@ fn word_has_quoted_segment(w: &Word) -> bool {
     })
 }
 
+/// Stage-3 typeclass dispatch helper. Infer the *receiver type* of a
+/// `Typeclass::method args …` call from the first positional argument
+/// and return `(type_name, body_args)`:
+///
+/// - If the first arg has an `@TYPE` prefix, it's treated as an
+///   explicit type assertion. The `@TYPE` token is *removed* from
+///   the body args (it was an annotation, not an argument).
+/// - If the first arg is an integer literal (optionally signed), the
+///   inferred type is `"Int"` and the arg is kept.
+/// - Anything else is `"String"` and the arg is kept.
+/// - If `argv` has no positionals, the inferred type is `"Unit"` (a
+///   sentinel for the "no-arg" form; an instance for `Unit` is the
+///   only thing that will match).
+///
+/// More elaborate inference — `typeset` attribute lookup on the
+/// source variable, user-defined-type binding, multi-arg constraint
+/// solving — lands in a later stage when the parser threads
+/// expansion provenance through `Word`.
+fn infer_dispatch_type(
+    argv: &[String],
+) -> (alloc::string::String, alloc::vec::Vec<alloc::string::String>) {
+    let Some(first) = argv.get(1) else {
+        return ("Unit".into(), alloc::vec::Vec::new());
+    };
+    if let Some(rest) = first.strip_prefix('@') {
+        return (rest.to_string(), argv[2..].to_vec());
+    }
+    if looks_like_integer_literal(first) {
+        return ("Int".into(), argv[1..].to_vec());
+    }
+    ("String".into(), argv[1..].to_vec())
+}
+
+/// True iff `s` is a non-empty decimal integer literal,
+/// optionally signed.
+fn looks_like_integer_literal(s: &str) -> bool {
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// True iff every attribute set in `filter` is also set in `attrs`.
 /// An empty `filter` matches everything.
 fn attrs_match_filter(attrs: &AttrSet, filter: &AttrSet) -> bool {
@@ -5521,6 +5599,81 @@ mod tests {
             "typeclass Eq { eq() { :; } }; Eq::Int::compare",
         )
         .unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert_eq!(err.exit_code(), 127);
+    }
+
+    // ===== typeclass / instance — stage 3: inferred dispatch =====
+
+    #[test]
+    fn inferred_dispatch_picks_int_for_integer_literal() {
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo default $1; }; }\n\
+             instance Sayer for Int { say() { echo int $1; }; }\n\
+             instance Sayer for String { say() { echo str $1; }; }\n\
+             Sayer::say 42\n",
+        );
+        assert_eq!(out, "int 42\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_picks_string_for_non_numeric() {
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo default $1; }; }\n\
+             instance Sayer for Int { say() { echo int $1; }; }\n\
+             instance Sayer for String { say() { echo str $1; }; }\n\
+             Sayer::say hello\n",
+        );
+        assert_eq!(out, "str hello\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_signed_integer_is_int() {
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo default $1; }; }\n\
+             instance Sayer for Int { say() { echo int $1; }; }\n\
+             instance Sayer for String { say() { echo str $1; }; }\n\
+             Sayer::say -7\n",
+        );
+        assert_eq!(out, "int -7\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_explicit_at_type_strips_annotation() {
+        // `@Int` is a type assertion — it should not show up in `$@`.
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo \"count=$# first=$1\"; }; }\n\
+             instance Sayer for Int { say() { echo \"int count=$# first=$1\"; }; }\n\
+             Sayer::say @Int hello world\n",
+        );
+        assert_eq!(out, "int count=2 first=hello\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_no_args_picks_unit() {
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo default; }; }\n\
+             instance Sayer for Unit { say() { echo unit; }; }\n\
+             Sayer::say\n",
+        );
+        assert_eq!(out, "unit\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_falls_back_to_default_when_no_matching_instance() {
+        // No instance for Int — should hit the typeclass default.
+        let (_, out, _) = run(
+            "typeclass Sayer { say() { echo default $1; }; }\n\
+             instance Sayer for String { say() { echo str $1; }; }\n\
+             Sayer::say 42\n",
+        );
+        assert_eq!(out, "default 42\n");
+    }
+
+    #[test]
+    fn inferred_dispatch_unknown_typeclass_falls_through() {
+        let prog = parse("Nope::run 1 2 3").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         assert_eq!(err.exit_code(), 127);
