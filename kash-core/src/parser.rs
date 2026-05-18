@@ -40,6 +40,12 @@ pub struct Parser<'src> {
     /// at index 1 / 2 when distinguishing `name() { … }` (function
     /// definition) from `name args …` (simple command).
     peeked: Vec<Token>,
+    /// Queue of here-doc redirects pre-built by the *first*
+    /// `parse_heredoc` call on a multi-here-doc introducer line
+    /// (`cat <<A <<B …`). Each subsequent `parse_heredoc` call —
+    /// reached via a synthetic `<<` token pushed onto `peeked` —
+    /// pops the next entry instead of touching the lexer again.
+    pending_heredoc_redirects: alloc::collections::VecDeque<Redirect>,
 }
 
 /// One-shot convenience: parse a complete source unit.
@@ -118,6 +124,7 @@ impl<'src> Parser<'src> {
         Self {
             lexer: Lexer::new(source),
             peeked: Vec::new(),
+            pending_heredoc_redirects: alloc::collections::VecDeque::new(),
         }
     }
 
@@ -603,29 +610,51 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Handle `<<DELIM` / `<<-DELIM`. Reads the delimiter word and
-    /// then any *introducer-line trailing tokens* (so forms like
-    /// `cat <<EOF | wc -l` work) by buffering them aside. The
-    /// terminating newline of the introducer line is consumed, the
-    /// here-doc body is pulled from the lexer's raw buffer, and the
-    /// buffered tokens are pushed back onto the parser's lookahead
-    /// queue so the caller continues parsing as if they'd appeared
-    /// on a new line.
+    /// Handle `<<DELIM` / `<<-DELIM`.
+    ///
+    /// Two call shapes are supported:
+    ///
+    /// * **Initial** (peeked queue empty on entry): reads the
+    ///   delimiter, then buffers any *introducer-line trailing
+    ///   tokens* up to the terminating newline (so `cat <<EOF |
+    ///   wc -l` works), reads the body, and pushes the trailing
+    ///   tokens back onto the lookahead queue so the surrounding
+    ///   pipeline / list construct sees them in source order.
+    ///
+    /// * **Continuation** (peeked queue non-empty on entry — the
+    ///   only way we land here is via tokens pushed back by an
+    ///   earlier `parse_heredoc` on the *same* introducer line):
+    ///   reads the delimiter, drains any further introducer-line
+    ///   tokens that the queue still carries (no lexer lookahead),
+    ///   and reads the body from the lexer's current position
+    ///   (which is just past the previous here-doc's closing
+    ///   delimiter line). This is what makes `cat <<A <<B …` work.
     fn parse_heredoc(&mut self, op_start: usize, op: Op) -> Result<Redirect> {
+        // Synthetic re-entry: a previous chain-mode call queued
+        // additional redirects + pushed dummy `<<` / delim tokens
+        // onto the lookahead so the surrounding parse-redirects
+        // loop re-enters us. Pop the dummy delimiter (the dummy
+        // `<<` was already consumed by `parse_redirect`) and
+        // return the pre-built redirect.
+        if let Some(prebuilt) = self.pending_heredoc_redirects.pop_front() {
+            let _ = self.bump()?;
+            return Ok(prebuilt);
+        }
+        // Initial call. Walk the introducer line collecting every
+        // `<<` / `<<-` operator we find before the terminating
+        // newline, in source order, so we can read every body in a
+        // single pass once the lexer cursor is past the newline.
         let strip_tabs = matches!(op, Op::DoubleLtDash);
         let delim_word = self.parse_word()?;
         let (delim_text, quoted) = extract_heredoc_delim(&delim_word);
-        // Collect everything from the introducer line that comes
-        // *after* the delimiter, up to (and consuming) the
-        // line-terminating newline. These tokens belong to whatever
-        // pipeline / list construct surrounds the redirect; we'll
-        // re-insert them into the lookahead queue after reading the
-        // body.
+        // Chain entry: (op_start, strip_tabs, delim_text, quoted).
+        let mut chain: Vec<(usize, bool, String, bool)> =
+            alloc::vec![(op_start, strip_tabs, delim_text, quoted)];
         let mut trailing: Vec<Token> = Vec::new();
         loop {
             match self.peek_kind()? {
                 TokenKind::Newline => {
-                    self.bump()?; // consume the newline
+                    self.bump()?;
                     break;
                 }
                 TokenKind::Eof => {
@@ -633,44 +662,78 @@ impl<'src> Parser<'src> {
                         "here-doc body missing — input ended before the body could start".into(),
                     ));
                 }
+                TokenKind::Op(Op::DoubleLt) | TokenKind::Op(Op::DoubleLtDash) => {
+                    let inner_tok = self.bump()?;
+                    let TokenKind::Op(inner_op) = inner_tok.kind else {
+                        unreachable!()
+                    };
+                    let inner_strip = matches!(inner_op, Op::DoubleLtDash);
+                    let inner_delim_word = self.parse_word()?;
+                    let (inner_delim, inner_quoted) =
+                        extract_heredoc_delim(&inner_delim_word);
+                    chain.push((
+                        inner_tok.span.start,
+                        inner_strip,
+                        inner_delim,
+                        inner_quoted,
+                    ));
+                }
                 _ => {
                     trailing.push(self.bump()?);
                 }
             }
         }
-        // Body lives in the lexer's raw byte stream, *immediately*
-        // after the line we just consumed.
-        debug_assert!(
-            self.peeked.is_empty(),
-            "all introducer-line tokens should have been drained into `trailing`"
-        );
-        let body_start = self.lexer_pos();
-        let body = self
-            .lexer_mut()
-            .read_heredoc_body(&delim_text, strip_tabs)?;
-        let body_end = self.lexer_pos();
-        // Push the buffered introducer-line tokens back onto the
-        // lookahead queue so the surrounding parser sees them.
-        // They were collected in source order; insert in reverse at
-        // the front so the order is preserved.
+        // Read every body in declaration order. The lexer's raw
+        // byte cursor is positioned right after the introducer
+        // newline; after each `read_heredoc_body` it sits just
+        // past the closing delimiter line.
+        let mut redirects: Vec<Redirect> = Vec::with_capacity(chain.len());
+        for (start_pos, strip, delim, quoted) in &chain {
+            let body_start = self.lexer_pos();
+            let body = self.lexer_mut().read_heredoc_body(delim, *strip)?;
+            let body_end = self.lexer_pos();
+            let segment = if *quoted {
+                WordSegment::SingleQuoted(body)
+            } else {
+                WordSegment::Bare(body)
+            };
+            let target = Word {
+                segments: alloc::vec![segment],
+                span: Span::new(body_start, body_end),
+            };
+            redirects.push(Redirect {
+                kind: RedirectKind::HereDoc { strip_tabs: *strip },
+                fd: None,
+                target,
+                span: Span::new(*start_pos, body_end),
+            });
+        }
+        let first = redirects.remove(0);
+        let extras = redirects;
+        for r in &extras {
+            self.pending_heredoc_redirects.push_back(r.clone());
+        }
+        // Push trailing tokens back first (they end up *after* the
+        // synthetic pairs we'll push next).
         for tok in trailing.into_iter().rev() {
             self.peeked.insert(0, tok);
         }
-        let segment = if quoted {
-            WordSegment::SingleQuoted(body)
-        } else {
-            WordSegment::Bare(body)
-        };
-        let target = Word {
-            segments: alloc::vec![segment],
-            span: Span::new(body_start, body_end),
-        };
-        Ok(Redirect {
-            kind: RedirectKind::HereDoc { strip_tabs },
-            fd: None,
-            target,
-            span: Span::new(op_start, body_end),
-        })
+        // Push one synthetic `<<` + dummy-word pair for each
+        // queued redirect, so the surrounding parse-redirects loop
+        // re-enters this function once per pending entry.
+        for _ in &extras {
+            let dummy_word = Token {
+                kind: TokenKind::Word("_heredoc_pending_".into()),
+                span: Span::new(0, 0),
+            };
+            let dummy_op = Token {
+                kind: TokenKind::Op(Op::DoubleLt),
+                span: Span::new(0, 0),
+            };
+            self.peeked.insert(0, dummy_word);
+            self.peeked.insert(0, dummy_op);
+        }
+        Ok(first)
     }
 
     fn lexer_pos(&self) -> usize {

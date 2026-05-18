@@ -6626,6 +6626,36 @@ mod tests {
         }
 
         #[test]
+        fn here_doc_multi_on_one_introducer_line() {
+            // `cat <<A <<B` — two here-docs on the same introducer
+            // line. Bodies follow in declaration order, separated
+            // by their own closing delimiter lines. Only the *last*
+            // redirect is what cat's stdin actually sees (POSIX:
+            // later redirects on the same fd win), so we observe
+            // the second body in cat's stdout.
+            if !have("/bin/cat") {
+                return;
+            }
+            let src = "/bin/cat <<A <<B\nfirst-body\nA\nsecond-body\nB\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "second-body\n");
+        }
+
+        #[test]
+        fn here_doc_multi_parses_both_bodies() {
+            // Independent of which body cat actually reads, the
+            // parse must give us *two* here-doc redirects whose
+            // targets carry the right bodies in source order.
+            let src = "/bin/cat <<A <<B\nfirst\nA\nsecond\nB\n";
+            let prog = parse(src).expect("multi-heredoc parse");
+            let dbg = alloc::format!("{:?}", prog.statements[0]);
+            assert!(dbg.contains("first"), "got: {dbg}");
+            assert!(dbg.contains("second"), "got: {dbg}");
+        }
+
+        #[test]
         fn here_doc_with_trailing_semicolon_separates_statements() {
             if !have("/bin/cat") {
                 return;
