@@ -246,6 +246,31 @@ pub enum CompoundKind {
         /// The sequence of words inside the brackets, in source order.
         tokens: Vec<Word>,
     },
+    /// A typeclass declaration. Per `project_shell_typeclass.md`,
+    /// kash typeclasses are Scala 3-inspired: a named bundle of
+    /// method signatures (optionally with default implementations
+    /// provided as ordinary function bodies). Inheritance is
+    /// deliberately not modelled — instance composition replaces it.
+    TypeclassDef {
+        /// Typeclass name.
+        name: String,
+        /// Members — currently every member is a function with a
+        /// (default) body; signature-only declarations land with the
+        /// dispatch commit.
+        items: Vec<TypeclassMember>,
+    },
+    /// A typeclass instance. Provides concrete implementations of a
+    /// typeclass's methods for a given type. The `for_type` slot is a
+    /// bare type name (`Int`, `String`, user-defined, …); a richer
+    /// type-expression grammar lands with the type-inference commit.
+    InstanceDef {
+        /// Name of the typeclass this instance implements.
+        typeclass: String,
+        /// Concrete type the instance is for.
+        for_type: String,
+        /// Method implementations.
+        items: Vec<InstanceMember>,
+    },
     /// A function definition. Three source forms produce this node:
     /// the POSIX `name() <body>`, the ksh93 `function name <body>`,
     /// and the kash extension `function name(p, q, …) <body>` whose
@@ -264,6 +289,31 @@ pub enum CompoundKind {
         /// `None` covers both other forms (no capture list at all).
         captures: Option<Vec<String>>,
         /// Function body. Always a compound command.
+        body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// One member inside a [`CompoundKind::TypeclassDef`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeclassMember {
+    /// A method with a default implementation body. Same shape as a
+    /// top-level function definition.
+    Default {
+        /// Method name.
+        name: String,
+        /// Method body.
+        body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// One member inside a [`CompoundKind::InstanceDef`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstanceMember {
+    /// A concrete method implementation.
+    Method {
+        /// Method name.
+        name: String,
+        /// Method body.
         body: alloc::boxed::Box<CompoundCommand>,
     },
 }

@@ -333,6 +333,16 @@ impl<'src> Parser<'src> {
         if self.peek_bare_word()? == Some("[[") {
             return self.parse_double_bracket().map(Command::Compound);
         }
+        // `typeclass NAME { … }` / `instance NAME for TYPE { … }`
+        // recognised by bare-word lookahead; they aren't in the
+        // reserved-word table so they can still be used as ordinary
+        // command names outside this exact head position.
+        if self.peek_bare_word()? == Some("typeclass") {
+            return self.parse_typeclass_def().map(Command::Compound);
+        }
+        if self.peek_bare_word()? == Some("instance") {
+            return self.parse_instance_def().map(Command::Compound);
+        }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
         // error rather than tripping the `for` arm).
@@ -645,6 +655,128 @@ impl<'src> Parser<'src> {
 
     fn lexer_mut(&mut self) -> &mut Lexer<'src> {
         &mut self.lexer
+    }
+
+    // ---------- typeclass / instance ----------
+
+    /// Parse `typeclass NAME { … }`. Body items are ordinary function
+    /// definitions; signature-only declarations land with the
+    /// dispatch commit.
+    fn parse_typeclass_def(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?; // "typeclass"
+        let start = kw.span.start;
+        let name = self.expect_bare_identifier("typeclass name")?;
+        self.skip_newlines()?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            return Err(KashError::Parse(
+                "expected `{` after typeclass name".into(),
+            ));
+        }
+        self.bump()?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `typeclass { … }` block".into(),
+                ));
+            }
+            let cmd = self.parse_command()?;
+            let func = extract_function_def(cmd)?;
+            items.push(crate::ast::TypeclassMember::Default {
+                name: func.0,
+                body: func.1,
+            });
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        let close = self.bump()?; // }
+        let redirects = self.parse_trailing_redirects()?;
+        let end = redirects.last().map_or(close.span.end, |r| r.span.end);
+        Ok(CompoundCommand {
+            kind: CompoundKind::TypeclassDef { name, items },
+            redirects,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parse `instance NAME for TYPE { … }`.
+    fn parse_instance_def(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?; // "instance"
+        let start = kw.span.start;
+        let typeclass = self.expect_bare_identifier("typeclass name")?;
+        // Expect the `for` reserved word.
+        if self.peek_reserved()? != Some(Reserved::For) {
+            return Err(KashError::Parse(
+                "expected `for` after instance typeclass name".into(),
+            ));
+        }
+        self.bump()?;
+        let for_type = self.expect_bare_identifier("instance target type name")?;
+        self.skip_newlines()?;
+        if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            return Err(KashError::Parse(
+                "expected `{` after `instance NAME for TYPE`".into(),
+            ));
+        }
+        self.bump()?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                break;
+            }
+            if matches!(self.peek_kind()?, TokenKind::Eof) {
+                return Err(KashError::Parse(
+                    "unterminated `instance { … }` block".into(),
+                ));
+            }
+            let cmd = self.parse_command()?;
+            let func = extract_function_def(cmd)?;
+            items.push(crate::ast::InstanceMember::Method {
+                name: func.0,
+                body: func.1,
+            });
+            if matches!(
+                self.peek_kind()?,
+                TokenKind::Op(Op::Semi) | TokenKind::Newline
+            ) {
+                self.bump()?;
+            }
+        }
+        let close = self.bump()?; // }
+        let redirects = self.parse_trailing_redirects()?;
+        let end = redirects.last().map_or(close.span.end, |r| r.span.end);
+        Ok(CompoundCommand {
+            kind: CompoundKind::InstanceDef {
+                typeclass,
+                for_type,
+                items,
+            },
+            redirects,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn expect_bare_identifier(&mut self, what: &str) -> Result<String> {
+        let name = self
+            .peek_bare_word()?
+            .ok_or_else(|| KashError::Parse(format!("expected {what}")))?
+            .to_string();
+        if !is_valid_function_name(&name) {
+            return Err(KashError::Parse(format!(
+                "invalid {what} `{name}`"
+            )));
+        }
+        self.bump()?;
+        Ok(name)
     }
 
     // ---------- `[[ ... ]]` extended test ----------
@@ -1218,6 +1350,27 @@ const fn double_bracket_op_str(op: Op) -> Option<&'static str> {
         Op::Lt => Some("<"),
         Op::Gt => Some(">"),
         _ => None,
+    }
+}
+
+/// Pull the `(name, body)` out of a function-definition `Command`,
+/// erroring if the command isn't a function definition. Used by
+/// `parse_typeclass_def` / `parse_instance_def` to gate their bodies
+/// to function-definition items.
+fn extract_function_def(
+    cmd: Command,
+) -> Result<(String, alloc::boxed::Box<CompoundCommand>)> {
+    let Command::Compound(cc) = cmd else {
+        return Err(KashError::Parse(
+            "typeclass / instance bodies may only contain function definitions".into(),
+        ));
+    };
+    let CompoundCommand { kind, .. } = cc;
+    match kind {
+        CompoundKind::FunctionDef { name, body, .. } => Ok((name, body)),
+        _ => Err(KashError::Parse(
+            "typeclass / instance bodies may only contain function definitions".into(),
+        )),
     }
 }
 

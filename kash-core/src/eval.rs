@@ -98,6 +98,22 @@ pub struct ShellOptions {
     pub xtrace: bool,
 }
 
+/// One registered typeclass. Stores the default-method bodies; an
+/// instance can later override individual entries.
+#[derive(Clone, Debug)]
+struct TypeclassEntry {
+    /// Default-method bodies keyed by method name.
+    defaults: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
+}
+
+/// One registered instance: concrete method bodies for a given
+/// `(typeclass, type)` pair.
+#[derive(Clone, Debug)]
+struct InstanceEntry {
+    /// Concrete method bodies keyed by method name.
+    methods: alloc::collections::BTreeMap<String, alloc::boxed::Box<CompoundCommand>>,
+}
+
 /// One registered function. Stored owned so the call site doesn't
 /// need a borrow of the original AST.
 #[derive(Clone, Debug)]
@@ -140,6 +156,12 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// Function registry: name → definition. Functions live in a flat
     /// table for now; namespace scoping lights up later.
     functions: B::Map<String, FunctionEntry>,
+    /// Typeclass registry: typeclass name → default methods. Filled
+    /// at `typeclass NAME { … }` declaration time.
+    typeclasses: alloc::collections::BTreeMap<String, TypeclassEntry>,
+    /// Instance registry: `(typeclass, type)` → method overrides.
+    /// Filled at `instance NAME for TYPE { … }` declaration time.
+    instances: alloc::collections::BTreeMap<(String, String), InstanceEntry>,
     /// Alias table: NAME → expansion text. Substitution happens at
     /// the start of a simple command's dispatch — the first
     /// (already-expanded) argv slot is matched against this table,
@@ -187,6 +209,8 @@ impl<B: MapBackend> Evaluator<B> {
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
             functions: <B::Map<String, FunctionEntry> as Default>::default(),
+            typeclasses: alloc::collections::BTreeMap::new(),
+            instances: alloc::collections::BTreeMap::new(),
             aliases: <B::Map<String, String> as Default>::default(),
             traps: <B::Map<String, String> as Default>::default(),
             in_trap: false,
@@ -1074,6 +1098,43 @@ impl<B: MapBackend> Evaluator<B> {
                         scope: *scope,
                         captures: captures.clone(),
                         body: body.clone(),
+                    },
+                );
+                Ok(Outcome::Status(0))
+            }
+            CompoundKind::TypeclassDef { name, items } => {
+                self.typeclasses.insert(
+                    name.clone(),
+                    TypeclassEntry {
+                        defaults: items
+                            .iter()
+                            .map(|m| match m {
+                                crate::ast::TypeclassMember::Default { name: n, body } => {
+                                    (n.clone(), body.clone())
+                                }
+                            })
+                            .collect(),
+                    },
+                );
+                Ok(Outcome::Status(0))
+            }
+            CompoundKind::InstanceDef {
+                typeclass,
+                for_type,
+                items,
+            } => {
+                let key = (typeclass.clone(), for_type.clone());
+                self.instances.insert(
+                    key,
+                    InstanceEntry {
+                        methods: items
+                            .iter()
+                            .map(|m| match m {
+                                crate::ast::InstanceMember::Method { name: n, body } => {
+                                    (n.clone(), body.clone())
+                                }
+                            })
+                            .collect(),
                     },
                 );
                 Ok(Outcome::Status(0))
@@ -5311,6 +5372,43 @@ mod tests {
     fn dollar_hash_reflects_argc() {
         let (_, out, _) = run_with_args("echo $#", &["a", "b", "c"]);
         assert_eq!(out, "3\n");
+    }
+
+    // ===== typeclass / instance — 1단계: parse + register =====
+
+    #[test]
+    fn typeclass_def_parses_and_registers() {
+        let prog = parse("typeclass Eq { foo() { :; } }").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_ok());
+    }
+
+    #[test]
+    fn typeclass_def_multi_method() {
+        let prog =
+            parse("typeclass Show { show() { :; }; default() { :; } }").unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_ok());
+    }
+
+    #[test]
+    fn instance_def_parses_and_registers() {
+        let prog =
+            parse("typeclass Eq { foo() { :; } }; instance Eq for Int { foo() { :; } }")
+                .unwrap();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval_program(&prog).is_ok());
+    }
+
+    #[test]
+    fn typeclass_body_rejects_non_function_items() {
+        // Bare commands inside the body should fail to parse.
+        assert!(parse("typeclass Eq { echo hi }").is_err());
+    }
+
+    #[test]
+    fn instance_requires_for_keyword() {
+        assert!(parse("instance Eq Int { foo() { :; } }").is_err());
     }
 
     // ===== arrays + typeset =====
