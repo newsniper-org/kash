@@ -64,12 +64,12 @@
 /// ```
 #[macro_export]
 macro_rules! ifstd {
-    ({ $($if_std:item)* } else { $($if_not_std:item)* }) => {
+    (
+        { $($if_std:item)* }
+        $( else { $($if_not_std:item)* } )?
+    ) => {
         $( #[cfg(feature = "std")] $if_std )*
-        $( #[cfg(not(feature = "std"))] $if_not_std )*
-    };
-    ({ $($if_std:item)* }) => {
-        $( #[cfg(feature = "std")] $if_std )*
+        $( $( #[cfg(not(feature = "std"))] $if_not_std )* )?
     };
 }
 
@@ -92,11 +92,11 @@ macro_rules! ifstd {
 /// ```
 #[macro_export]
 macro_rules! ifalloc {
-    ({ $($if_alloc:item)* } else { $($if_not_alloc:item)* }) => {
+    (
+        { $($if_alloc:item)* }
+        $( else { $($if_not_alloc:item)* } )?
+    ) => {
         $( #[cfg(feature = "alloc")] $if_alloc )*
-        $( #[cfg(not(feature = "alloc"))] $if_not_alloc )*
-    };
-    ({ $($if_alloc:item)* }) => {
-        $( #[cfg(feature = "alloc")] $if_alloc )*
+        $( $( #[cfg(not(feature = "alloc"))] $if_not_alloc )* )?
     };
 }
