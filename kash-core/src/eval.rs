@@ -943,6 +943,7 @@ impl<B: MapBackend> Evaluator<B> {
             "shift" => self.builtin_shift(&argv[1..]),
             "local" => self.builtin_local(&argv[1..]),
             "read" => self.builtin_read(&argv[1..]),
+            "source" | "." => self.builtin_source(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1136,6 +1137,40 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign_local(&name, Value::Scalar(value))?;
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `source PATH` / `. PATH` — read PATH and evaluate its
+    /// contents in the *current* scope (no new function frame).
+    /// Definitions, assignments, mode declarations, and namespace
+    /// imports inside the loaded file all affect the caller.
+    /// Honours the active venv's `fs-read` capability.
+    fn builtin_source(&mut self, args: &[String]) -> Result<Outcome> {
+        let path = args
+            .first()
+            .ok_or_else(|| KashError::Runtime("source: missing PATH".into()))?;
+        if !self.is_capability_allowed(crate::capability::Capability::FsRead) {
+            return Err(KashError::CapabilityDenied(alloc::format!(
+                "source `{path}`: this venv revoked `fs-read`"
+            )));
+        }
+        self.builtin_source_impl(path)
+    }
+
+    #[cfg(feature = "std")]
+    fn builtin_source_impl(&mut self, path: &str) -> Result<Outcome> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            KashError::Runtime(alloc::format!("source: {path}: {e}"))
+        })?;
+        let prog = crate::parser::parse(&content)
+            .map_err(|e| KashError::Parse(alloc::format!("source {path}: {e}")))?;
+        self.eval_program(&prog)
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn builtin_source_impl(&mut self, _: &str) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "source requires the std feature (filesystem access)".into(),
+        ))
     }
 
     /// `read [-r] [-p PROMPT|--prompt=PROMPT] [NAME …]` — read a
@@ -3806,6 +3841,7 @@ ifstd!({
                 "shift" => self.builtin_shift(&argv[1..]),
                 "local" => self.builtin_local(&argv[1..]),
             "read" => self.builtin_read(&argv[1..]),
+            "source" | "." => self.builtin_source(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -4071,6 +4107,8 @@ fn is_builtin_name(name: &str) -> bool {
             | "export"
             | "use"
             | "read"
+            | "source"
+            | "."
     )
 }
 
@@ -8581,6 +8619,28 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== `source` / `.` builtin =====
+
+    #[test]
+    fn source_missing_path_errors() {
+        let prog = parse("source\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("missing PATH"), "got: {msg}");
+    }
+
+    #[test]
+    fn source_in_venv_without_fs_read_denied() {
+        let src = "venv tight { capabilities { profile none } body { source /etc/passwd; } }\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 126);
+        let err = ev.take_stderr();
+        assert!(err.contains("fs-read"), "got: {err}");
     }
 
     // ===== `read` builtin =====
