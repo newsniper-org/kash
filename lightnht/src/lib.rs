@@ -471,14 +471,34 @@ where
         self.len = 0;
     }
 
+    /// Total number of allocated sub-tables (root + every `Nested`
+    /// reachable from it). `0` when the table has never been written
+    /// to (root lazy-alloc). Useful for unit tests that want to
+    /// verify the shrink-on-remove behaviour.
+    #[must_use]
+    pub fn subtable_count(&self) -> usize {
+        fn rec<K, V>(sub: &SubTable<K, V>) -> usize {
+            let mut total = 1usize;
+            for slot in &sub.slots {
+                if let Bucket::Nested(inner) = slot {
+                    total += rec(inner);
+                }
+            }
+            total
+        }
+        self.root.as_ref().map_or(0, |r| rec(r))
+    }
+
     /// Remove the binding for `key`. Returns the removed value if
     /// any.
     ///
     /// Removal turns the matching `Single` slot back into `Empty`.
-    /// Sub-tables that drop to zero or one live entries are *not*
-    /// collapsed back up the tree in this minimal cut; the doc on
-    /// the crate notes that a follow-up commit can add the
-    /// promote-up optimisation if it ever matters in practice.
+    /// After a successful removal the descent path is walked back
+    /// up, collapsing each sub-table that's dropped to zero entries
+    /// (replaced by `Empty`) or to a single `Single` entry (lifted
+    /// into the parent slot). `Nested`-only sub-tables aren't
+    /// collapsed — that would require re-hashing the deeper entries
+    /// into a shallower hash space.
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: core::borrow::Borrow<Q>,
@@ -525,10 +545,18 @@ where
                 }
             }
             Bucket::Single(_, _) => None,
-            Bucket::Nested(nested) => {
+            Bucket::Nested(_) => {
                 depth_coord.push(slot_idx as u8);
-                let r = Self::remove_in(hash_builder, recon, nested, key, depth_coord);
+                let r = match &mut sub_table.slots[slot_idx] {
+                    Bucket::Nested(nested) => {
+                        Self::remove_in(hash_builder, recon, nested, key, depth_coord)
+                    }
+                    _ => unreachable!("matched Nested above"),
+                };
                 depth_coord.pop();
+                if r.is_some() {
+                    try_collapse_nested(&mut sub_table.slots[slot_idx]);
+                }
                 r
             }
         }
@@ -675,6 +703,57 @@ fn drain_subtable<K, V>(sub: SubTable<K, V>, out: &mut Vec<(K, V)>) {
             Bucket::Single(k, v) => out.push((k, v)),
             Bucket::Nested(inner) => drain_subtable(*inner, out),
         }
+    }
+}
+
+/// Sub-table shrink helper. Inspects a `Bucket::Nested(box_sub)`:
+///
+/// - all slots `Empty` → bucket becomes `Empty`. The sub-table is
+///   freed.
+/// - exactly one `Single` slot → bucket becomes that `Single`. The
+///   sub-table is freed. The entry's hash still places it at the
+///   parent's slot (the slot the now-gone sub-table itself
+///   occupied), because that's exactly the slot the original
+///   insertion descended through.
+/// - one `Nested` slot, or more than one live slot → leave alone.
+///
+/// Only collapses one level per call; cascading happens because
+/// `remove_in` runs this helper at every parent on its way out, so
+/// a chain of "now empty" sub-tables collapses bottom-up.
+fn try_collapse_nested<K, V>(bucket: &mut Bucket<K, V>) {
+    let Bucket::Nested(sub) = bucket else {
+        return;
+    };
+    let mut live = 0u32;
+    let mut single_at: Option<usize> = None;
+    let mut any_nested = false;
+    for (i, slot) in sub.slots.iter().enumerate() {
+        match slot {
+            Bucket::Empty => {}
+            Bucket::Single(_, _) => {
+                live += 1;
+                if live == 1 {
+                    single_at = Some(i);
+                }
+            }
+            Bucket::Nested(_) => {
+                live += 1;
+                any_nested = true;
+            }
+        }
+        if live > 1 {
+            return;
+        }
+    }
+    match (live, single_at, any_nested) {
+        (0, _, _) => {
+            *bucket = Bucket::Empty;
+        }
+        (1, Some(idx), false) => {
+            let single = core::mem::replace(&mut sub.slots[idx], Bucket::Empty);
+            *bucket = single;
+        }
+        _ => { /* one Nested or > 1 live — keep wrapper */ }
     }
 }
 
@@ -1132,6 +1211,50 @@ where
     fn default() -> Self {
         Self::with_hasher(H::default())
     }
+}
+
+// ===== kash-gadt MapBackend marker =====
+
+/// Zero-sized marker type that slots `LightNht` / `LightNhtSet` into
+/// the [`kash_gadt::MapBackend`] family. Parameterised by the
+/// prototype hasher `H` so callers can pick `LightnhtBackend<QLMHasher>`
+/// vs `LightnhtBackend<SwarQLMHasher>` (or any other `Hasher + Clone
+/// + Default`) without rewriting downstream `Map<…> / Set<…>` types.
+pub struct LightnhtBackend<H>(core::marker::PhantomData<H>);
+
+impl<H> core::fmt::Debug for LightnhtBackend<H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LightnhtBackend").finish()
+    }
+}
+
+impl<H> Clone for LightnhtBackend<H> {
+    fn clone(&self) -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<H> Copy for LightnhtBackend<H> {}
+
+impl<H> Default for LightnhtBackend<H> {
+    fn default() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<H> kash_gadt::MapBackend for LightnhtBackend<H>
+where
+    H: Hasher + Clone + Default + 'static,
+{
+    type Map<K, V>
+        = LightNht<K, V, H>
+    where
+        K: Ord + Clone + Hash + Eq,
+        V: Clone;
+    type Set<T>
+        = LightNhtSet<T, H>
+    where
+        T: Ord + Clone + Hash + Eq;
 }
 
 // ===== kash-gadt MapStorage / SetStorage impls =====
@@ -1656,6 +1779,56 @@ mod tests {
         assert_eq!(m.len(), 50);
         for i in 0..50 {
             assert_eq!(m.get(&alloc::format!("k{i}")), Some(&(i as i32)));
+        }
+    }
+
+    // ===== shrink / promote-up =====
+
+    #[test]
+    fn remove_all_collapses_back_to_root() {
+        // Insert enough entries to force several promotion levels,
+        // then remove every entry. The tree should collapse back to
+        // exactly one (empty) sub-table.
+        let mut m: Map = Map::default();
+        let n = 500u32;
+        for i in 0..n {
+            m.insert(alloc::format!("entry-{i:04}"), i as i32);
+        }
+        let nested_before = m.subtable_count();
+        assert!(
+            nested_before > 1,
+            "expected promotion to land on ≥ 2 sub-tables, got {nested_before}",
+        );
+        for i in 0..n {
+            m.remove(&alloc::format!("entry-{i:04}"));
+        }
+        assert_eq!(m.len(), 0);
+        // Only the root remains.
+        assert_eq!(m.subtable_count(), 1, "tree did not collapse on remove");
+    }
+
+    #[test]
+    fn partial_remove_shrinks_at_least_some_subtables() {
+        // After removing the second half of the keys, we expect at
+        // least *some* of the sub-tables to disappear. Exact
+        // numbers depend on the hasher / collision pattern, so just
+        // require monotonic decrease.
+        let mut m: Map = Map::default();
+        for i in 0..200u32 {
+            m.insert(alloc::format!("k-{i:03}"), i as i32);
+        }
+        let before = m.subtable_count();
+        for i in 100..200u32 {
+            m.remove(&alloc::format!("k-{i:03}"));
+        }
+        let after = m.subtable_count();
+        assert!(
+            after < before,
+            "remove didn't shrink: before={before}, after={after}",
+        );
+        // Remaining entries still readable.
+        for i in 0..100u32 {
+            assert_eq!(m.get(&alloc::format!("k-{i:03}")), Some(&(i as i32)));
         }
     }
 

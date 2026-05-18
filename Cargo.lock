@@ -8,6 +8,7 @@ version = "0.1.0-posix2024-pre"
 dependencies = [
  "kash-gadt",
  "kash-macros",
+ "lightnht",
 ]
 
 [[package]]

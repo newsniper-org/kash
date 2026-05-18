@@ -22,3 +22,9 @@ alloc = ["kash-gadt/alloc"]
 [dependencies]
 kash-gadt = { path = "../kash-gadt", default-features = false }
 kash-macros = { path = "../kash-macros", default-features = false }
+
+[dev-dependencies]
+# Used by the backend-comparison integration test in `tests/`. The
+# engine itself does not depend on `lightnht`; the test plumbs it
+# in as one of the candidate `MapBackend`s.
+lightnht = { path = "../lightnht" }

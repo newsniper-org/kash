@@ -238,15 +238,22 @@ pub trait SetStorage<T>: Default + Clone {
 /// per-call-site trait bounds.
 pub trait MapBackend {
     /// Concrete map type used by this backend for owned bindings.
+    ///
+    /// The `Hash + Eq` bounds are present on top of `Ord + Clone`
+    /// so a hash-table backend (`LightnhtBackend`, future
+    /// `HashBrownBackend`, …) can implement [`MapStorage`] without
+    /// the engine having to spell two separate trait families. Keys
+    /// commonly used through the engine (`String`, `&str`, integer
+    /// types) all satisfy the union without effort.
     type Map<K, V>: MapStorage<K, V>
     where
-        K: Ord + Clone,
+        K: Ord + Clone + core::hash::Hash + Eq,
         V: Clone;
 
     /// Concrete set type used by this backend.
     type Set<T>: SetStorage<T>
     where
-        T: Ord + Clone;
+        T: Ord + Clone + core::hash::Hash + Eq;
 }
 
 /// Default backend: `alloc::collections::BTreeMap` /
@@ -260,12 +267,12 @@ impl MapBackend for BTreeBackend {
     type Map<K, V>
         = BTreeMap<K, V>
     where
-        K: Ord + Clone,
+        K: Ord + Clone + core::hash::Hash + Eq,
         V: Clone;
     type Set<T>
         = BTreeSet<T>
     where
-        T: Ord + Clone;
+        T: Ord + Clone + core::hash::Hash + Eq;
 }
 
 // ===== BTreeMap / BTreeSet trait impls =====
