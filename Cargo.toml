@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "kash",
     "kash-core",
     "kash-gadt",
     "kash-macros",

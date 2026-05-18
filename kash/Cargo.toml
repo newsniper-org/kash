@@ -1,0 +1,15 @@
+[package]
+name = "kash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "kash — Korn Again SHell CLI"
+
+[[bin]]
+name = "kash"
+path = "src/main.rs"
+
+[dependencies]
+kash-core = { path = "../kash-core", features = ["std"] }

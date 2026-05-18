@@ -300,6 +300,13 @@ impl<B: MapBackend> Evaluator<B> {
         &self.options
     }
 
+    /// Replace the evaluator's top-level positional parameters
+    /// (`$1`, `$2`, …) before running a program. Intended for CLI
+    /// entry points that pass through `argv` past the script path.
+    pub fn set_positionals(&mut self, args: Vec<String>) {
+        self.positionals = args;
+    }
+
     /// Active mode.
     #[inline]
     #[must_use]

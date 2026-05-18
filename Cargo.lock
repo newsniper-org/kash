@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "kash"
+version = "0.1.0-posix2024-pre"
+dependencies = [
+ "kash-core",
+]
+
+[[package]]
 name = "kash-core"
 version = "0.1.0-posix2024-pre"
 dependencies = [
