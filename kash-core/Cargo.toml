@@ -12,7 +12,7 @@ repository.workspace = true
 # Consumers (kash-bin, downstream embedders) explicitly opt into `std`
 # when they need filesystem, environment, threads, signals, terminal IO.
 default = ["alloc"]
-std = ["alloc", "kash-gadt/std"]
+std = ["alloc", "kash-gadt/std", "dep:toml"]
 # `alloc` enables heap-allocated containers (Vec/String/Box/etc.) without
 # requiring the rest of the standard library. The engine fundamentally
 # needs a heap, so bare-`no_std` (neither feature) is rejected by a
@@ -22,6 +22,10 @@ alloc = ["kash-gadt/alloc"]
 [dependencies]
 kash-gadt = { path = "../kash-gadt", default-features = false }
 kash-macros = { path = "../kash-macros", default-features = false }
+# TOML config loader for venv `load-config PATH` (v.5). Strict data
+# format — never executable, never source-able. Std-only because
+# `toml` itself needs std.
+toml = { version = "0.8", optional = true, default-features = false, features = ["parse"] }
 
 [dev-dependencies]
 # Used by the backend-comparison integration test in `tests/`. The

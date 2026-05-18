@@ -367,6 +367,17 @@ pub enum VenvSection {
         /// Textual spec produced by `parse_capabilities_section`.
         spec: crate::capability::CapabilitySpec,
     },
+    /// `load-config PATH` — load capability + env (+ v.6 imports)
+    /// from an external *data-only* TOML file. The path is taken
+    /// verbatim from source (subject to ordinary expansion at
+    /// evaluator time) and parsed strictly as TOML — no shell
+    /// evaluation, no source-able formats. See
+    /// `project_kash_venv.md` for the schema lock.
+    LoadConfig {
+        /// The single bare-word path argument written after
+        /// `load-config`. Expanded at evaluator time.
+        path: Word,
+    },
     /// `env { … }` — environment overlay applied to *external*
     /// commands spawned from inside the venv. Directives:
     ///

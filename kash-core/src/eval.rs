@@ -1771,6 +1771,16 @@ impl<B: MapBackend> Evaluator<B> {
                 crate::ast::VenvSection::Env { directives } => {
                     frame.env_directives.extend(directives.iter().cloned());
                 }
+                crate::ast::VenvSection::LoadConfig { path } => {
+                    let resolved = self.expand_word(path)?;
+                    let (caps_spec, env_dirs) = load_venv_config(&resolved)?;
+                    if let Some(spec) = caps_spec {
+                        let set = crate::capability::CapabilitySet::from_spec(&spec)
+                            .map_err(KashError::Runtime)?;
+                        frame.capabilities = Some(set);
+                    }
+                    frame.env_directives.extend(env_dirs);
+                }
             }
         }
         self.venv_stack.push(frame);
@@ -5077,6 +5087,108 @@ fn glob_match(pat: &str, s: &str) -> bool {
     glob_match_bytes(pat.as_bytes(), s.as_bytes())
 }
 
+/// Load a venv config file (TOML) and return the materialised
+/// pieces. Std-only — the alloc-only build can't read files at
+/// all, so the call surfaces a runtime error there.
+#[cfg(feature = "std")]
+fn load_venv_config(
+    path: &str,
+) -> Result<(Option<crate::capability::CapabilitySpec>, Vec<crate::ast::EnvDirective>)> {
+    use crate::ast::EnvDirective;
+    use crate::capability::CapabilitySpec;
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        KashError::Runtime(alloc::format!("load-config: {path}: {e}"))
+    })?;
+    let value: toml::Value = toml::from_str(&content).map_err(|e| {
+        KashError::Runtime(alloc::format!("load-config: {path}: invalid TOML: {e}"))
+    })?;
+    let table = value.as_table().ok_or_else(|| {
+        KashError::Runtime("load-config: top-level must be a TOML table".into())
+    })?;
+    let caps_spec = table
+        .get("capabilities")
+        .map(|c| -> Result<CapabilitySpec> {
+            let t = c.as_table().ok_or_else(|| {
+                KashError::Runtime(
+                    "load-config: `[capabilities]` must be a TOML table".into(),
+                )
+            })?;
+            let mut spec = CapabilitySpec::default();
+            if let Some(p) = t.get("profile") {
+                spec.profile = Some(toml_string(p, "[capabilities].profile")?);
+            }
+            if let Some(a) = t.get("add") {
+                spec.grants = toml_string_list(a, "[capabilities].add")?;
+            }
+            if let Some(r) = t.get("remove") {
+                spec.revokes = toml_string_list(r, "[capabilities].remove")?;
+            }
+            if let Some(c) = t.get("allow-cmd") {
+                spec.allow_cmd =
+                    Some(toml_string_list(c, "[capabilities].allow-cmd")?);
+            }
+            Ok(spec)
+        })
+        .transpose()?;
+    let mut env_dirs: Vec<EnvDirective> = Vec::new();
+    if let Some(env) = table.get("env") {
+        let t = env.as_table().ok_or_else(|| {
+            KashError::Runtime(
+                "load-config: `[env]` must be a TOML table".into(),
+            )
+        })?;
+        for (k, v) in t {
+            match k.as_str() {
+                "PATH-prepend" => env_dirs.push(EnvDirective::PathPrepend {
+                    dir: toml_string(v, "[env].PATH-prepend")?,
+                }),
+                "PATH-append" => env_dirs.push(EnvDirective::PathAppend {
+                    dir: toml_string(v, "[env].PATH-append")?,
+                }),
+                _ => env_dirs.push(EnvDirective::Set {
+                    name: k.clone(),
+                    value: toml_string(v, &alloc::format!("[env].{k}"))?,
+                }),
+            }
+        }
+    }
+    Ok((caps_spec, env_dirs))
+}
+
+/// alloc-only stub: file IO isn't available, so `load-config`
+/// surfaces a runtime error.
+#[cfg(not(feature = "std"))]
+fn load_venv_config(
+    _path: &str,
+) -> Result<(Option<crate::capability::CapabilitySpec>, Vec<crate::ast::EnvDirective>)> {
+    Err(KashError::Other(
+        "load-config requires the `std` feature".into(),
+    ))
+}
+
+#[cfg(feature = "std")]
+fn toml_string(v: &toml::Value, what: &str) -> Result<String> {
+    v.as_str()
+        .map(alloc::string::String::from)
+        .ok_or_else(|| {
+            KashError::Runtime(alloc::format!("load-config: `{what}` must be a string"))
+        })
+}
+
+#[cfg(feature = "std")]
+fn toml_string_list(v: &toml::Value, what: &str) -> Result<Vec<String>> {
+    let arr = v.as_array().ok_or_else(|| {
+        KashError::Runtime(alloc::format!(
+            "load-config: `{what}` must be an array of strings"
+        ))
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        out.push(toml_string(item, what)?);
+    }
+    Ok(out)
+}
+
 /// Parse the args to `use`. Accepts the four documented forms plus
 /// the brace expansion shorthand `use .foo.{a,b}` (which expands to
 /// the cross-product of single-symbol imports), returning one or
@@ -6915,6 +7027,57 @@ mod tests {
                 .next()
                 .unwrap_or("");
             assert_eq!(last, "/tmp/kashtest-tail", "full PATH: {out}");
+        }
+
+        #[test]
+        fn venv_load_config_applies_capabilities_and_env() {
+            // Write a tiny TOML profile, load it, observe the
+            // env overlay reached an external command. Run under
+            // std-only because both fs::write and toml are gated.
+            if !have("/usr/bin/printenv") {
+                return;
+            }
+            let tmp = std::env::temp_dir().join("kash-venv-config.toml");
+            std::fs::write(
+                &tmp,
+                "[capabilities]\nprofile = \"basic\"\n\n[env]\nKASH_VENV_TOKEN = \"from-config\"\n",
+            )
+            .unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "venv myproj {{ load-config {path}; body {{ /usr/bin/printenv KASH_VENV_TOKEN; }}; }}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "from-config\n");
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn venv_load_config_missing_file_errors() {
+            let src = "venv myproj { load-config /no/such/file.toml; body {}; }\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("load-config"), "got: {msg}");
+        }
+
+        #[test]
+        fn venv_load_config_rejects_invalid_toml() {
+            let tmp = std::env::temp_dir().join("kash-venv-bad.toml");
+            std::fs::write(&tmp, "this = is = not valid toml\n").unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "venv myproj {{ load-config {path}; body {{}}; }}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("invalid TOML"), "got: {msg}");
+            let _ = std::fs::remove_file(&tmp);
         }
 
         #[test]

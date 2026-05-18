@@ -863,7 +863,15 @@ impl<'src> Parser<'src> {
     /// `KashError::Parse` so accidentally-misspelled section names
     /// don't silently parse as commands.
     fn parse_venv_section(&mut self) -> Result<crate::ast::VenvSection> {
-        let section_name = self.expect_bare_identifier("venv section name")?;
+        // `load-config` is a one-line directive — `load-config PATH`
+        // — *not* a `<keyword> { … }` block, so it's split off
+        // before we look for a brace.
+        if self.peek_bare_word()? == Some("load-config") {
+            self.bump()?;
+            let path = self.parse_word()?;
+            return Ok(crate::ast::VenvSection::LoadConfig { path });
+        }
+        let section_name = self.expect_bare_word("venv section name")?;
         if !matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
             return Err(KashError::Parse(alloc::format!(
                 "expected `{{` after venv section `{section_name}`"
