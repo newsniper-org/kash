@@ -310,6 +310,48 @@ impl<B: MapBackend> Evaluator<B> {
         out
     }
 
+    /// Pick the storage name under which a *variable* assignment
+    /// should land. Inside a function frame the name is taken as-is
+    /// (assignments are local to the frame). At file / namespace
+    /// scope the active `namespace_path` is prefixed, so
+    /// `foo=val` inside `namespace utils { … }` registers as
+    /// `.utils.foo`. Absolute paths (`.foo.bar`) are pass-through.
+    fn qualify_var_for_write(&self, name: &str) -> String {
+        if name.starts_with('.') || self.scope.in_function() || self.namespace_path.is_empty() {
+            return name.to_string();
+        }
+        self.qualify_decl_name(name)
+    }
+
+    /// Resolve a *variable* reference for read. Returns the storage
+    /// name we should look up (the bare name as written, or a
+    /// path-prefixed one). Mirrors `resolve_function_name`: the
+    /// walked path goes inside-out so an inner namespace shadows an
+    /// outer one. Returns `None` only when the bare name has a
+    /// leading `.` and isn't present — there's no further fallback
+    /// to try in that case.
+    fn resolve_var_name(&self, name: &str) -> Option<String> {
+        if self.scope.get(name).is_some() {
+            return Some(name.to_string());
+        }
+        if name.starts_with('.') {
+            return None;
+        }
+        for i in (1..=self.namespace_path.len()).rev() {
+            let mut candidate = String::new();
+            for seg in &self.namespace_path[..i] {
+                candidate.push('.');
+                candidate.push_str(seg);
+            }
+            candidate.push('.');
+            candidate.push_str(name);
+            if self.scope.get(&candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// Resolve a *reference* to a function by trying, in order:
     ///
     /// 1. the name as written (so absolute `.foo.bar` calls and
@@ -524,11 +566,12 @@ impl<B: MapBackend> Evaluator<B> {
             } else {
                 value
             };
+            let target = self.qualify_var_for_write(&a.name);
             if let Some(sub) = &a.subscript {
                 let idx = self.expand_word(sub)?;
-                self.assign_array_element(&a.name, &idx, value)?;
+                self.assign_array_element(&target, &idx, value)?;
             } else {
-                self.scope.assign(&a.name, Value::Scalar(value))?;
+                self.scope.assign(&target, Value::Scalar(value))?;
             }
         }
         if cmd.words.is_empty() {
@@ -985,12 +1028,13 @@ impl<B: MapBackend> Evaluator<B> {
                     )));
                 }
                 let raw_value = rest[1..].to_string();
-                self.scope.apply_attrs(name, &attrs)?;
+                let target = self.qualify_var_for_write(name);
+                self.scope.apply_attrs(&target, &attrs)?;
                 let value = self.coerce_for_attrs(&attrs, raw_value)?;
                 if in_func {
-                    self.scope.assign_local(name, Value::Scalar(value))?;
+                    self.scope.assign_local(&target, Value::Scalar(value))?;
                 } else {
-                    self.scope.assign(name, Value::Scalar(value))?;
+                    self.scope.assign(&target, Value::Scalar(value))?;
                 }
             } else {
                 if !is_identifier(arg) {
@@ -998,7 +1042,8 @@ impl<B: MapBackend> Evaluator<B> {
                         "typeset: `{arg}` is not a valid identifier"
                     )));
                 }
-                self.scope.apply_attrs(arg, &attrs)?;
+                let target = self.qualify_var_for_write(arg);
+                self.scope.apply_attrs(&target, &attrs)?;
             }
             i += 1;
         }
@@ -1581,9 +1626,10 @@ impl<B: MapBackend> Evaluator<B> {
             // Omitted `in` clause iterates positional parameters.
             None => self.positionals.clone(),
         };
+        let target = self.qualify_var_for_write(name);
         let mut outcome = Outcome::Status(0);
         for item in items {
-            self.scope.assign(name, Value::Scalar(item))?;
+            self.scope.assign(&target, Value::Scalar(item))?;
             outcome = self.eval_statements(body)?;
             if outcome.is_exit_request() {
                 return Ok(outcome);
@@ -2103,7 +2149,8 @@ impl<B: MapBackend> Evaluator<B> {
                     "invalid `${{#{rest}}}` length expansion"
                 )));
             }
-            let len = match self.scope.get(rest) {
+            let resolved = self.resolve_var_name(rest);
+            let len = match resolved.as_ref().and_then(|n| self.scope.get(n)) {
                 Some(v) => v.to_scalar_string().chars().count(),
                 None => 0,
             };
@@ -2128,25 +2175,62 @@ impl<B: MapBackend> Evaluator<B> {
             return Ok(self.lookup_indexed(name, sub).unwrap_or_default());
         }
 
-        // Find the parameter name (run of identifier bytes). The first
-        // non-name byte after the name is either the end of the
-        // expansion or the start of an operator suffix.
+        // Find the parameter name (run of identifier bytes, with
+        // optional dotted-namespace path). The first non-name byte
+        // is either the end of the expansion or the start of an
+        // operator suffix.
+        //
+        // Two shapes:
+        //   * Plain identifier — `[_A-Za-z][_A-Za-z0-9]*` (single-
+        //     char `?` / `#` / digit specials handled separately).
+        //   * Absolute namespace path — `\.<seg>(\.<seg>)*`, e.g.
+        //     `.utils.version`. The leading dot signals a fully
+        //     qualified reference.
         let bytes = body.as_bytes();
         let mut idx = 0;
-        while idx < bytes.len() {
-            let b = bytes[idx];
-            if idx == 0 {
-                if !(b == b'_' || b.is_ascii_alphabetic() || b.is_ascii_digit() || b == b'?' || b == b'#') {
+        if bytes.first() == Some(&b'.') {
+            idx = 1;
+            // Each segment must be a non-empty identifier.
+            loop {
+                let seg_start = idx;
+                while idx < bytes.len()
+                    && (bytes[idx] == b'_' || bytes[idx].is_ascii_alphanumeric())
+                {
+                    idx += 1;
+                }
+                if idx == seg_start {
+                    return Err(KashError::Parse(format!(
+                        "empty segment in `${{{body}}}`"
+                    )));
+                }
+                if idx >= bytes.len() || bytes[idx] != b'.' {
                     break;
                 }
-            } else if !(b == b'_' || b.is_ascii_alphanumeric()) {
-                break;
+                idx += 1; // consume the '.'
             }
-            idx += 1;
-            // `$?` / `$#` are special-cased above; here we only allow
-            // single-byte digit / question / hash names.
-            if idx == 1 && (bytes[0].is_ascii_digit() || bytes[0] == b'?' || bytes[0] == b'#') {
-                break;
+        } else {
+            while idx < bytes.len() {
+                let b = bytes[idx];
+                if idx == 0 {
+                    if !(b == b'_'
+                        || b.is_ascii_alphabetic()
+                        || b.is_ascii_digit()
+                        || b == b'?'
+                        || b == b'#')
+                    {
+                        break;
+                    }
+                } else if !(b == b'_' || b.is_ascii_alphanumeric()) {
+                    break;
+                }
+                idx += 1;
+                // `$?` / `$#` are special-cased above; here we only
+                // allow single-byte digit / question / hash names.
+                if idx == 1
+                    && (bytes[0].is_ascii_digit() || bytes[0] == b'?' || bytes[0] == b'#')
+                {
+                    break;
+                }
             }
         }
         if idx == 0 {
@@ -2187,7 +2271,7 @@ impl<B: MapBackend> Evaluator<B> {
 
         // Modifier forms handle "unset" themselves, so look up the
         // raw value without firing `nounset` here.
-        let current_present = self.scope.get(name).is_some();
+        let current_present = self.resolve_var_name(name).is_some();
         let current_value = self.lookup_param_raw(name);
         let trigger = if test_null {
             !current_present || current_value.is_empty()
@@ -2206,7 +2290,8 @@ impl<B: MapBackend> Evaluator<B> {
             '=' => {
                 if trigger {
                     let v = self.expand_inline(word)?;
-                    self.scope.assign(name, Value::Scalar(v.clone()))?;
+                    let target = self.qualify_var_for_write(name);
+                    self.scope.assign(&target, Value::Scalar(v.clone()))?;
                     Ok(v)
                 } else {
                     Ok(current_value)
@@ -2489,7 +2574,8 @@ impl<B: MapBackend> Evaluator<B> {
     /// Look up `name[idx]`. Returns `None` if the binding is unset,
     /// the index is out-of-range, or the value isn't array-shaped.
     fn lookup_indexed(&self, name: &str, idx: &str) -> Option<String> {
-        let b = self.scope.get_binding(name)?;
+        let resolved = self.resolve_var_name(name)?;
+        let b = self.scope.get_binding(&resolved)?;
         match &b.value {
             Value::Array(v) => {
                 let i: usize = idx.parse().ok()?;
@@ -2504,7 +2590,8 @@ impl<B: MapBackend> Evaluator<B> {
     /// indexed arrays the order is index ascending; for associative
     /// arrays the order is `BTreeMap` (sorted by key).
     fn lookup_all_elements(&self, name: &str) -> Option<alloc::vec::Vec<String>> {
-        let b = self.scope.get_binding(name)?;
+        let resolved = self.resolve_var_name(name)?;
+        let b = self.scope.get_binding(&resolved)?;
         match &b.value {
             Value::Array(v) => Some(v.clone()),
             Value::AssocArray(m) => Some(m.values().cloned().collect()),
@@ -2536,10 +2623,14 @@ impl<B: MapBackend> Evaluator<B> {
                 .cloned()
                 .unwrap_or_default();
         }
-        self.scope
-            .get(name)
-            .map(|v| v.to_scalar_string())
-            .unwrap_or_default()
+        match self.resolve_var_name(name) {
+            Some(resolved) => self
+                .scope
+                .get(&resolved)
+                .map(|v| v.to_scalar_string())
+                .unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
     /// Look up `name` and return its scalar form, or empty for unset.
@@ -2568,7 +2659,8 @@ impl<B: MapBackend> Evaluator<B> {
                 .cloned()
                 .unwrap_or_default());
         }
-        match self.scope.get(name) {
+        let resolved = self.resolve_var_name(name);
+        match resolved.as_ref().and_then(|n| self.scope.get(n)) {
             Some(v) => Ok(v.to_scalar_string()),
             None => {
                 if self.options.nounset {
@@ -6533,6 +6625,101 @@ mod tests {
     #[test]
     fn namespace_name_with_embedded_dot_is_rejected() {
         assert!(parse("namespace foo.bar { x() { :; }; }\n").is_err());
+    }
+
+    // ===== namespace — stage 2: variable prefixing =====
+
+    #[test]
+    fn namespace_variable_registers_under_dotted_name() {
+        let (_, out, _) = run(
+            "namespace utils { version=1.0; }\n\
+             echo ${.utils.version}\n",
+        );
+        assert_eq!(out, "1.0\n");
+    }
+
+    #[test]
+    fn bare_var_at_top_level_does_not_see_namespaced_var() {
+        let (_, out, _) = run(
+            "namespace utils { version=1.0; }\n\
+             echo \"[${version}]\"\n",
+        );
+        // Unset bare lookup expands empty.
+        assert_eq!(out, "[]\n");
+    }
+
+    #[test]
+    fn namespace_function_reads_namespace_variable_by_short_name() {
+        let (_, out, _) = run(
+            "namespace utils {\n\
+                 version=2.5\n\
+                 show() { echo $version; }\n\
+             }\n\
+             .utils.show\n",
+        );
+        assert_eq!(out, "2.5\n");
+    }
+
+    #[test]
+    fn nested_namespace_reads_outer_var() {
+        let (_, out, _) = run(
+            "namespace outer {\n\
+                 a=outer-a\n\
+                 namespace inner {\n\
+                     show() { echo $a; }\n\
+                 }\n\
+             }\n\
+             .outer.inner.show\n",
+        );
+        assert_eq!(out, "outer-a\n");
+    }
+
+    #[test]
+    fn nested_namespace_inner_var_shadows_outer() {
+        let (_, out, _) = run(
+            "namespace outer {\n\
+                 a=outer-a\n\
+                 namespace inner {\n\
+                     a=inner-a\n\
+                     show() { echo $a; }\n\
+                 }\n\
+             }\n\
+             .outer.inner.show\n",
+        );
+        assert_eq!(out, "inner-a\n");
+    }
+
+    #[test]
+    fn typeset_inside_namespace_registers_under_dotted_name() {
+        let (_, out, _) = run(
+            "namespace utils { typeset api=v1; }\n\
+             echo ${.utils.api}\n",
+        );
+        assert_eq!(out, "v1\n");
+    }
+
+    #[test]
+    fn function_local_assignment_does_not_pollute_namespace() {
+        // Assignment inside a function body must stay frame-local,
+        // not leak as `.utils.scratch`.
+        let (_, out, _) = run(
+            "namespace utils {\n\
+                 run() { scratch=temp; echo got=$scratch; }\n\
+             }\n\
+             .utils.run\n\
+             echo after=\"[${.utils.scratch}]\"\n",
+        );
+        assert_eq!(out, "got=temp\nafter=[]\n");
+    }
+
+    #[test]
+    fn namespace_reopen_sees_earlier_var() {
+        let (_, out, _) = run(
+            "namespace utils { a=first; }\n\
+             namespace utils { show() { echo $a; }; }\n\
+             .utils.show\n",
+        );
+        assert_eq!(out, "first\n");
     }
 
     // ===== function capture list — read-only by-ref =====
