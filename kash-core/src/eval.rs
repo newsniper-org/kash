@@ -215,6 +215,14 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// PID of the most-recently-spawned background job (the `$!`
     /// special parameter). Zero before any `cmd &` has run.
     last_bg_pid: i32,
+    /// Effective stdin for *external* commands inside the active
+    /// compound body. Set by `{ … } < file` (and similar) on
+    /// enter; restored on exit. The spawn paths consult this
+    /// when no per-command input redirect / pipe is supplied —
+    /// each spawn `dup`s a fresh handle so file offsets advance
+    /// the way a real shell expects.
+    #[cfg(feature = "std")]
+    compound_input: Option<std::fs::File>,
     /// Live background-job handles. Std-only because `Child` is
     /// itself std. Kept just so each spawn doesn't immediately drop
     /// the handle and orphan the process — full job-control
@@ -321,6 +329,8 @@ impl<B: MapBackend> Evaluator<B> {
             trace_output: String::new(),
             stderr_output: String::new(),
             last_bg_pid: 0,
+            #[cfg(feature = "std")]
+            compound_input: None,
             #[cfg(feature = "std")]
             background_jobs: Vec::new(),
             mode,
@@ -744,12 +754,21 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(outcome)
     }
 
-    /// Run a list backgrounded. Minimum: the list is a single
-    /// simple external command; spawn it, record the PID as `$!`,
-    /// and return status 0 immediately. Other shapes
-    /// (builtin/function background, pipeline background, compound
-    /// background) raise an explicit "not yet supported" so the
-    /// limitation is visible.
+    /// Run a list backgrounded. POSIX `cmd &` semantics:
+    ///
+    ///   * A simple external command is the easy case — `spawn`
+    ///     without `wait`, record the PID as `$!`, return 0.
+    ///   * A pipeline of *external* stages is the same, just one
+    ///     stage per child.
+    ///   * Builtins / functions / compound bodies don't fork — we
+    ///     run them in-process, synchronously, but still report
+    ///     status 0 and zero out `$!`. They aren't *truly*
+    ///     backgrounded (the caller waits for them inline), and
+    ///     that limitation is preserved as a deliberate v.1 simp
+    ///     until a proper fork / thread / coroutine boundary
+    ///     lands.
+    ///   * `&&`/`||` lists backgrounded as a whole still bail —
+    ///     the recovery semantics need their own design pass.
     fn eval_background(&mut self, list: &AndOrList) -> Result<Outcome> {
         if !list.tail.is_empty() {
             return Err(KashError::Runtime(
@@ -757,38 +776,165 @@ impl<B: MapBackend> Evaluator<B> {
             ));
         }
         let pipe = &list.head;
-        if pipe.stages.len() != 1 {
-            return Err(KashError::Runtime(
-                "backgrounding a pipeline isn't supported yet".into(),
-            ));
+        if pipe.stages.len() == 1 {
+            return self.eval_background_single(&pipe.stages[0]);
         }
-        let crate::ast::Command::Simple(simple) = &pipe.stages[0] else {
-            return Err(KashError::Runtime(
-                "backgrounding a compound command isn't supported yet".into(),
-            ));
-        };
-        if !simple.redirects.is_empty() {
-            return Err(KashError::Runtime(
-                "backgrounding with redirects isn't supported yet".into(),
-            ));
+        // Multi-stage pipeline. All-external → real background;
+        // anything else falls back to in-process sync execution.
+        let all_external = pipe.stages.iter().all(|st| {
+            let crate::ast::Command::Simple(s) = st else {
+                return false;
+            };
+            // We have to actually peek argv[0] to know — function
+            // / builtin lookup is name-sensitive.
+            if let Some(first) = s.words.first() {
+                let raw = word_first_field_hint(first);
+                !is_builtin_name(&raw) && self.resolve_function_name(&raw).is_none()
+            } else {
+                false
+            }
+        });
+        if all_external {
+            return self.spawn_pipeline_background(pipe);
         }
-        let mut argv: Vec<String> = Vec::with_capacity(simple.words.len());
-        for w in &simple.words {
-            argv.extend(self.expand_word_to_fields(w)?);
+        // In-process fallback — run the pipeline synchronously and
+        // discard its status, returning 0 / clearing `$!`. Same
+        // limitation note as the single non-external case.
+        self.last_bg_pid = 0;
+        let _ = self.eval_pipeline(pipe)?;
+        Ok(Outcome::Status(0))
+    }
+
+    fn eval_background_single(&mut self, stage: &crate::ast::Command) -> Result<Outcome> {
+        match stage {
+            crate::ast::Command::Compound(c) => {
+                // Compound bodies run in-process — see the doc on
+                // `eval_background`.
+                self.last_bg_pid = 0;
+                let _ = self.eval_compound(c)?;
+                Ok(Outcome::Status(0))
+            }
+            crate::ast::Command::Simple(simple) => {
+                let mut argv: Vec<String> = Vec::with_capacity(simple.words.len());
+                for w in &simple.words {
+                    argv.extend(self.expand_word_to_fields(w)?);
+                }
+                if argv.is_empty() {
+                    return Err(KashError::Runtime(
+                        "background stage expanded to nothing".into(),
+                    ));
+                }
+                let name = argv[0].clone();
+                let is_builtin_or_fn = is_builtin_name(&name)
+                    || self.resolve_function_name(&name).is_some();
+                if is_builtin_or_fn {
+                    // In-process synchronous, status discarded.
+                    self.last_bg_pid = 0;
+                    let _ = self.eval_simple(simple)?;
+                    return Ok(Outcome::Status(0));
+                }
+                if !simple.redirects.is_empty() {
+                    return Err(KashError::Runtime(
+                        "backgrounding with redirects isn't supported yet".into(),
+                    ));
+                }
+                self.check_external_spawn(&name)?;
+                self.spawn_background(argv)
+            }
         }
-        if argv.is_empty() {
-            return Err(KashError::Runtime(
-                "background stage expanded to nothing".into(),
-            ));
+    }
+
+    #[cfg(feature = "std")]
+    fn spawn_pipeline_background(&mut self, pipe: &Pipeline) -> Result<Outcome> {
+        use std::process::{Child, Command, Stdio};
+        // Replay the external pipeline spawn loop, but without
+        // any wait / drain at the end. The first child's PID
+        // lands in `$!` — POSIX nominates the *last* command's
+        // PID for pipeline `$!`, but the last pid is also exposed
+        // by `wait`; the first is more useful for tracking.
+        let mut specs: Vec<(Vec<String>, StageIo)> =
+            Vec::with_capacity(pipe.stages.len());
+        for stage in &pipe.stages {
+            let crate::ast::Command::Simple(simple) = stage else {
+                return Err(KashError::Runtime(
+                    "compound commands in pipeline stages are not yet supported".into(),
+                ));
+            };
+            let mut argv: Vec<String> = Vec::with_capacity(simple.words.len());
+            for w in &simple.words {
+                argv.extend(self.expand_word_to_fields(w)?);
+            }
+            if argv.is_empty() {
+                return Err(KashError::Runtime(
+                    "pipeline stage expanded to nothing".into(),
+                ));
+            }
+            let io = self.resolve_stage_io(&simple.redirects)?;
+            specs.push((argv, io));
         }
-        let name = argv[0].clone();
-        if is_builtin_name(&name) || self.resolve_function_name(&name).is_some() {
-            return Err(KashError::Runtime(alloc::format!(
-                "backgrounding builtin / function `{name}` isn't supported yet"
-            )));
+        let n = specs.len();
+        let mut children: Vec<Child> = Vec::with_capacity(n);
+        let mut last_pid: i32 = 0;
+        for (i, (argv, io)) in specs.iter_mut().enumerate() {
+            self.check_external_spawn(&argv[0])?;
+            let resolved =
+                resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
+            let mut cmd = Command::new(&resolved);
+            cmd.args(&argv[1..]);
+            self.apply_exported_env(&mut cmd);
+            // Apply assignment prefixes (handled below for the
+            // single-command external path; pipeline stages have
+            // their own assignments check earlier).
+            if let Some(f) = io.in_file.take() {
+                cmd.stdin(Stdio::from(f));
+            } else if i == 0 {
+                cmd.stdin(Stdio::null());
+            } else {
+                let prev = children[i - 1]
+                    .stdout
+                    .take()
+                    .expect("piped stdout");
+                cmd.stdin(Stdio::from(prev));
+            }
+            if let Some(f) = io.stdout_file.take() {
+                cmd.stdout(Stdio::from(f));
+            } else {
+                cmd.stdout(if i == n - 1 {
+                    Stdio::inherit()
+                } else {
+                    Stdio::piped()
+                });
+            }
+            if let Some(ef) = io.stderr_file.take() {
+                cmd.stderr(Stdio::from(ef));
+            } else {
+                cmd.stderr(Stdio::inherit());
+            }
+            let child = cmd.spawn().map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    KashError::ExternalNotFound(argv[0].clone())
+                } else {
+                    KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
+                }
+            })?;
+            if i == 0 {
+                self.last_bg_pid = child.id() as i32;
+            }
+            last_pid = child.id() as i32;
+            children.push(child);
         }
-        self.check_external_spawn(&name)?;
-        self.spawn_background(argv)
+        let _ = last_pid;
+        for c in children {
+            self.background_jobs.push(c);
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn spawn_pipeline_background(&mut self, _: &Pipeline) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "background pipelines require the std feature".into(),
+        ))
     }
 
     #[cfg(feature = "std")]
@@ -897,33 +1043,45 @@ impl<B: MapBackend> Evaluator<B> {
     fn eval_compound_with_redirects_std(&mut self, c: &CompoundCommand) -> Result<Outcome> {
         use crate::ast::RedirectKind;
         use std::io::Write;
-        // Reject input / fd-dup redirects before opening any
-        // files, so a missing path doesn't override the
-        // "not-supported" message.
+        // Inline-bytes (here-doc / here-string) on compound bodies
+        // still need cross-stage plumbing we haven't built. fd-dup
+        // forms on compound bodies also stay out of scope.
         for r in &c.redirects {
             if matches!(
                 r.kind,
-                RedirectKind::Input
-                    | RedirectKind::HereString
+                RedirectKind::HereString
                     | RedirectKind::HereDoc { .. }
                     | RedirectKind::DupInput
             ) {
                 return Err(KashError::Runtime(
-                    "input redirect on a compound command isn't supported yet".into(),
+                    "here-doc / fd-dup input redirect on a compound command isn't supported yet"
+                        .into(),
                 ));
             }
         }
         let io = self.resolve_stage_io(&c.redirects)?;
-        if io.in_file.is_some() || io.in_inline.is_some() {
+        if io.in_inline.is_some() {
             return Err(KashError::Runtime(
-                "input redirect on a compound command isn't supported yet".into(),
+                "here-doc / here-string redirect on a compound command isn't supported yet".into(),
             ));
         }
+        // `{ … } < file` — install the file as effective stdin
+        // for every external spawn inside `c`'s body. Each spawn
+        // dup's its own handle so file offset advances naturally
+        // across the body's commands.
+        let saved_input = if let Some(f) = io.in_file {
+            Some(core::mem::replace(&mut self.compound_input, Some(f)))
+        } else {
+            None
+        };
+        // If there's no stdout redirect either, the body just
+        // runs with input set — done.
         let Some(mut out_file) = io.stdout_file else {
-            return Err(KashError::Runtime(
-                "only `> file` / `>> file` / `&> file` redirects on compound commands are supported"
-                    .into(),
-            ));
+            let result = self.eval_compound_inner(c);
+            if let Some(saved) = saved_input {
+                self.compound_input = saved;
+            }
+            return result;
         };
         // Capture everything the body writes to the evaluator's
         // output buffer, then route the new tail into `out_file`.
@@ -952,6 +1110,9 @@ impl<B: MapBackend> Evaluator<B> {
             stderr_file
                 .write_all(stderr_chunk.as_bytes())
                 .map_err(|e| KashError::Runtime(alloc::format!("compound stderr write: {e}")))?;
+        }
+        if let Some(saved) = saved_input {
+            self.compound_input = saved;
         }
         result
     }
@@ -4098,6 +4259,11 @@ ifstd!({
                     c.stdin(Stdio::from(f));
                 } else if needs_inline_write {
                     c.stdin(Stdio::piped());
+                } else if let Some(f) = self.compound_input.as_ref() {
+                    let dup = f.try_clone().map_err(|e| {
+                        KashError::Runtime(alloc::format!("dup compound stdin: {e}"))
+                    })?;
+                    c.stdin(Stdio::from(dup));
                 } else {
                     c.stdin(Stdio::inherit());
                 }
@@ -4239,7 +4405,15 @@ ifstd!({
             let mut cmd = Command::new(&resolved);
             cmd.args(&argv[1..]);
             self.apply_exported_env(&mut cmd);
-            cmd.stdin(Stdio::inherit());
+            // Compound-body input redirect overrides plain inherit.
+            if let Some(f) = self.compound_input.as_ref() {
+                let dup = f
+                    .try_clone()
+                    .map_err(|e| KashError::Runtime(alloc::format!("dup compound stdin: {e}")))?;
+                cmd.stdin(Stdio::from(dup));
+            } else {
+                cmd.stdin(Stdio::inherit());
+            }
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::inherit());
             let mut child = cmd.spawn().map_err(|e| {
@@ -4289,19 +4463,48 @@ ifstd!({
             pipe: &Pipeline,
             first_argv: alloc::vec::Vec<String>,
         ) -> Result<Outcome> {
-            use std::io::{Read, Write};
-            use std::process::{Child, Command, Stdio};
             // Step 1: run the leading builtin into a side buffer.
             let old_len = self.output.len();
             let leading = self.dispatch_known_builtin(&first_argv)?;
             let initial_bytes = self.output[old_len..].as_bytes().to_vec();
             self.output.truncate(old_len);
             let leading_status = leading.status();
-            // Step 2: validate + spawn the remaining stages exactly
-            // the way the regular external path does.
+            self.run_pipeline_tail_with_initial(pipe, initial_bytes, leading_status)
+        }
+
+        /// Compound first stage: evaluate the body in-process,
+        /// capture its stdout, then route the bytes into the
+        /// second stage's stdin and spawn the rest as usual.
+        fn run_pipeline_with_compound_first(&mut self, pipe: &Pipeline) -> Result<Outcome> {
+            let crate::ast::Command::Compound(c) = &pipe.stages[0] else {
+                unreachable!("caller checked stages[0] is Compound");
+            };
+            let old_len = self.output.len();
+            let leading = self.eval_compound(c)?;
+            let initial_bytes = self.output[old_len..].as_bytes().to_vec();
+            self.output.truncate(old_len);
+            let leading_status = leading.status();
+            self.run_pipeline_tail_with_initial(pipe, initial_bytes, leading_status)
+        }
+
+        /// Shared spawn-and-drain path for the in-process-first
+        /// pipeline forms (pure-output-builtin first, compound
+        /// first). `initial_bytes` is the captured stdout of the
+        /// leading stage; it gets written into the *second* stage's
+        /// piped stdin. `leading_status` participates in
+        /// `pipefail`.
+        fn run_pipeline_tail_with_initial(
+            &mut self,
+            pipe: &Pipeline,
+            initial_bytes: alloc::vec::Vec<u8>,
+            leading_status: i32,
+        ) -> Result<Outcome> {
+            use std::io::{Read, Write};
+            use std::process::{Child, Command, Stdio};
             struct StageSpec {
                 argv: alloc::vec::Vec<String>,
                 io: StageIo,
+                assignments: alloc::vec::Vec<(String, String)>,
             }
             let mut specs: alloc::vec::Vec<StageSpec> =
                 alloc::vec::Vec::with_capacity(pipe.stages.len() - 1);
@@ -4310,14 +4513,15 @@ ifstd!({
                     crate::ast::Command::Simple(s) => s,
                     crate::ast::Command::Compound(_) => {
                         return Err(KashError::Runtime(
-                            "compound commands in pipeline stages are not yet supported".into(),
+                            "compound commands past the first pipeline stage are not yet supported"
+                                .into(),
                         ));
                     }
                 };
-                if !simple.assignments.is_empty() {
-                    return Err(KashError::Runtime(
-                        "assignment prefixes in pipeline stages are not yet supported".into(),
-                    ));
+                let mut assignments: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+                for a in &simple.assignments {
+                    let v = self.expand_word(&a.value)?;
+                    assignments.push((a.name.clone(), v));
                 }
                 let mut argv = alloc::vec::Vec::with_capacity(simple.words.len());
                 for w in &simple.words {
@@ -4333,18 +4537,23 @@ ifstd!({
                     )));
                 }
                 let io = self.resolve_stage_io(&simple.redirects)?;
-                specs.push(StageSpec { argv, io });
+                specs.push(StageSpec { argv, io, assignments });
             }
             let n = specs.len();
             let mut children: alloc::vec::Vec<Child> = alloc::vec::Vec::with_capacity(n);
             for (i, spec) in specs.iter_mut().enumerate() {
-                let StageSpec { argv, io } = spec;
+                let StageSpec { argv, io, assignments } = spec;
                 self.check_external_spawn(&argv[0])?;
                 let resolved =
                     resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
                 let mut cmd = Command::new(&resolved);
                 cmd.args(&argv[1..]);
                 self.apply_exported_env(&mut cmd);
+                // Stage-local assignment prefixes — bash/ksh
+                // semantics: visible to the spawned process only.
+                for (k, v) in assignments.iter() {
+                    cmd.env(k, v);
+                }
                 // stdin: per-stage redirect wins; else previous-
                 // stage pipe (i > 0); else *the first stage's
                 // captured bytes* (i == 0) via piped stdin.
@@ -4454,15 +4663,16 @@ ifstd!({
             use std::io::{Read, Write};
             use std::process::{Child, Command, Stdio};
 
-            // First-stage in-process bridge: if the leading stage
-            // resolves to a *pure-output* builtin (`echo`, `printf`,
-            // `:`, `true`, `false`, `test`, `[`), run it in-process
-            // and route its captured output bytes as stdin into the
-            // second stage. Later stages keep going through the
-            // normal external-spawn path. Other in-process stages
-            // (function, side-effecting builtin like `read` or
-            // `set`) still bail with the original "not yet"
-            // diagnostic — handling them needs proper isolation.
+            // Compound first stage: run the body in-process and
+            // feed its captured stdout into the second stage's
+            // stdin.
+            if pipe.stages.len() >= 2
+                && matches!(pipe.stages[0], crate::ast::Command::Compound(_))
+            {
+                return self.run_pipeline_with_compound_first(pipe);
+            }
+            // Pure-output builtin first stage: in-process bridge
+            // (already covered).
             let first_argv = self.expand_pipeline_first_stage_argv(pipe)?;
             if let Some(name) = first_argv.first()
                 && is_pure_output_builtin(name)
@@ -4473,6 +4683,7 @@ ifstd!({
             struct StageSpec {
                 argv: alloc::vec::Vec<String>,
                 io: StageIo,
+                assignments: alloc::vec::Vec<(String, String)>,
             }
             let mut specs: alloc::vec::Vec<StageSpec> =
                 alloc::vec::Vec::with_capacity(pipe.stages.len());
@@ -4481,14 +4692,15 @@ ifstd!({
                     crate::ast::Command::Simple(s) => s,
                     crate::ast::Command::Compound(_) => {
                         return Err(KashError::Runtime(
-                            "compound commands in pipeline stages are not yet supported".into(),
+                            "compound commands past the first pipeline stage are not yet supported"
+                                .into(),
                         ));
                     }
                 };
-                if !simple.assignments.is_empty() {
-                    return Err(KashError::Runtime(
-                        "assignment prefixes in pipeline stages are not yet supported".into(),
-                    ));
+                let mut assignments: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+                for a in &simple.assignments {
+                    let v = self.expand_word(&a.value)?;
+                    assignments.push((a.name.clone(), v));
                 }
                 let mut argv = alloc::vec::Vec::with_capacity(simple.words.len());
                 for w in &simple.words {
@@ -4506,20 +4718,23 @@ ifstd!({
                     )));
                 }
                 let io = self.resolve_stage_io(&simple.redirects)?;
-                specs.push(StageSpec { argv, io });
+                specs.push(StageSpec { argv, io, assignments });
             }
 
             let n = specs.len();
             let mut children: alloc::vec::Vec<Child> = alloc::vec::Vec::with_capacity(n);
 
             for (i, spec) in specs.iter_mut().enumerate() {
-                let StageSpec { argv, io } = spec;
+                let StageSpec { argv, io, assignments } = spec;
                 self.check_external_spawn(&argv[0])?;
                 let resolved =
                     resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
                 let mut cmd = Command::new(&resolved);
                 cmd.args(&argv[1..]);
                 self.apply_exported_env(&mut cmd);
+                for (k, v) in assignments.iter() {
+                    cmd.env(k, v);
+                }
 
                 // stdin: per-stage redirect wins; else previous-stage
                 // pipe (i > 0); else inherit (first stage).
@@ -4652,6 +4867,24 @@ const fn default_fd_for(kind: crate::ast::RedirectKind) -> i32 {
 /// pipeline. Side-effecting builtins (`read`, `set`, `unset`,
 /// `eval`, …) stay rejected because their effects belong to the
 /// caller's scope and can't be cleanly funnelled through a pipe.
+/// Peek the literal-bare-prefix of a Word for dispatch hinting
+/// without firing full expansion. Returns the longest run of
+/// adjacent `Bare` segments at the start of the word; quoted /
+/// `$`-prefixed segments cut the prefix short. Used by the
+/// pipeline / background classifier to spot in-process names
+/// (builtins, functions) before the rest of expansion runs.
+fn word_first_field_hint(w: &Word) -> String {
+    use crate::ast::WordSegment;
+    let mut out = String::new();
+    for seg in &w.segments {
+        match seg {
+            WordSegment::Bare(s) => out.push_str(s),
+            _ => break,
+        }
+    }
+    out
+}
+
 fn is_pure_output_builtin(name: &str) -> bool {
     // `printf` would belong here once it lands as a builtin; for
     // now `echo` is the practical case the bridge handles.
@@ -8347,21 +8580,73 @@ mod tests {
         }
 
         #[test]
-        fn background_builtin_rejected() {
-            let prog = parse("echo hi &").unwrap();
+        fn background_builtin_runs_in_process_with_status_zero() {
+            // In-process synchronous fallback: status 0, `$!` left
+            // untouched (zero in a fresh evaluator).
+            let prog = parse("echo hi &\necho \"after, last_bg=$!\"\n").unwrap();
             let mut ev = Evaluator::new();
-            let err = ev.eval_program(&prog).unwrap_err();
-            let msg = alloc::format!("{err}");
-            assert!(msg.contains("backgrounding builtin"), "got: {msg}");
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            assert!(out.contains("hi"), "got: {out}");
+            assert!(out.contains("last_bg=0"), "got: {out}");
         }
 
         #[test]
-        fn background_pipeline_rejected() {
-            let prog = parse("/bin/echo a | /bin/cat &").unwrap();
+        fn background_external_pipeline_spawns() {
+            if !have("/bin/echo") || !have("/bin/cat") {
+                return;
+            }
+            let prog = parse("/bin/echo a | /bin/cat &\necho \"pid=$!\"\n").unwrap();
             let mut ev = Evaluator::new();
-            let err = ev.eval_program(&prog).unwrap_err();
-            let msg = alloc::format!("{err}");
-            assert!(msg.contains("backgrounding a pipeline"), "got: {msg}");
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            assert!(out.contains("pid="), "got: {out}");
+            // PID positive integer
+            let pid_line = out.lines().find(|l| l.starts_with("pid=")).unwrap();
+            let pid: i32 = pid_line.trim_start_matches("pid=").parse().unwrap();
+            assert!(pid > 0);
+        }
+
+        #[test]
+        fn pipeline_compound_first_stage_bridges_into_external() {
+            if !have("/usr/bin/wc") {
+                return;
+            }
+            let prog =
+                parse("{ echo a; echo b; echo c; } | /usr/bin/wc -l\n").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output().trim(), "3");
+        }
+
+        #[test]
+        fn pipeline_stage_assignment_prefix_reaches_child() {
+            if !have("/usr/bin/env") || !have("/usr/bin/grep") {
+                return;
+            }
+            // FOO=hi /usr/bin/env | grep ^FOO
+            let prog = parse(
+                "FOO=hi /usr/bin/env | /usr/bin/grep ^FOO\n",
+            )
+            .unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert!(ev.take_output().contains("FOO=hi"));
+        }
+
+        #[test]
+        fn compound_stdin_redirect_feeds_body() {
+            let tmp = std::env::temp_dir().join("kash-cmp-stdin.txt");
+            std::fs::write(&tmp, "line-from-file\n").unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "{{ /bin/cat; }} <{path}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "line-from-file\n");
+            let _ = std::fs::remove_file(&tmp);
         }
 
         #[test]
@@ -9322,17 +9607,20 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    fn compound_input_redirect_rejected_with_message() {
-        // input redirect on compound bodies is explicit not-yet-
-        // supported. The exact wording is the contract. alloc-
-        // only builds get a different "requires std" message
-        // because the whole redirect path is std-gated there.
-        let src = "{ echo a; } < /tmp/nope.txt\n";
+    fn compound_here_doc_redirect_still_rejected() {
+        // Plain input redirect on compound bodies is now supported
+        // (the file's fd becomes the effective stdin for the
+        // body's external commands). Here-doc / fd-dup forms on
+        // compound bodies still need cross-stage plumbing.
+        let src = "{ /bin/cat; } <<EOF\nbody\nEOF\n";
         let prog = parse(src).unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("input redirect"), "got: {msg}");
+        assert!(
+            msg.contains("here-doc") || msg.contains("here-string"),
+            "got: {msg}",
+        );
     }
 
     // ===== `command` builtin =====
