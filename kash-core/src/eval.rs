@@ -1586,6 +1586,19 @@ impl<B: MapBackend> Evaluator<B> {
                 .get_binding(&a.name)
                 .map(|b| (b.attrs.integer, b.attrs.numeric_type))
                 .unwrap_or((false, None));
+            // Complex retains a different store path — `name`,
+            // `name.re`, `name.im` all rewrite together — so peel
+            // it off before the scalar-string branch.
+            if let Some(nt) = numeric_type
+                && nt.is_complex()
+                && a.subscript.is_none()
+            {
+                let qualified = self.qualify_var_for_write(&a.name);
+                let target = self.follow_nameref_chain(&qualified);
+                self.check_private_member_access(&target)?;
+                self.store_complex(&target, nt, &value, false)?;
+                continue;
+            }
             let value = if let Some(nt) = numeric_type {
                 if nt.is_integer() {
                     let raw = i128::from(self.eval_arith(&value)?);
@@ -1597,13 +1610,19 @@ impl<B: MapBackend> Evaluator<B> {
                         ));
                     }
                     alloc::format!("{wrapped}")
-                } else {
+                } else if nt.is_float() {
                     let raw = match value.trim().parse::<f64>() {
                         Ok(f) => f,
                         Err(_) => self.eval_arith(&value)? as f64,
                     };
                     let projected = nt.project_float(raw);
                     format_float_value(projected)
+                } else {
+                    // Should be unreachable — complex was peeled
+                    // off above. Fall back to the raw string to
+                    // avoid an interactive panic if a future
+                    // variant slips in.
+                    value
                 }
             } else if integer {
                 let n = self.eval_arith(&value)?;
@@ -2759,6 +2778,16 @@ impl<B: MapBackend> Evaluator<B> {
                     i += 1;
                     continue;
                 }
+                // Complex types fan out into three bindings
+                // (`name`, `name.re`, `name.im`) — coerce_for_attrs
+                // can only return one string, so route around it.
+                if let Some(nt) = attrs.numeric_type
+                    && nt.is_complex()
+                {
+                    self.store_complex(&target, nt, &raw_value, in_func)?;
+                    i += 1;
+                    continue;
+                }
                 let value = self.coerce_for_attrs(&attrs, raw_value)?;
                 if in_func {
                     self.scope.assign_local(&target, Value::Scalar(value))?;
@@ -2843,6 +2872,45 @@ impl<B: MapBackend> Evaluator<B> {
     /// goes through `scope.assign*`: `-i` runs the string through
     /// arithmetic, `-l` / `-u` fold case. Errors propagate (e.g.
     /// bad arithmetic).
+    /// Store a complex literal into `name`. Parses the input,
+    /// projects each component through the type's float
+    /// precision, and writes three bindings: `name`, `name.re`,
+    /// `name.im`. The bare `name` carries the canonical
+    /// `R+Ii`-form string so `${name}` reads round-trip.
+    fn store_complex(
+        &mut self,
+        name: &str,
+        nt: crate::scope::NumericType,
+        raw: &str,
+        in_func: bool,
+    ) -> Result<()> {
+        let (re_raw, im_raw) = parse_complex_literal(raw).ok_or_else(|| {
+            KashError::Runtime(alloc::format!(
+                "invalid complex literal `{raw}` for type `{}`",
+                nt.name(),
+            ))
+        })?;
+        let (re, im) = nt.project_complex(re_raw, im_raw);
+        let scalar = format_complex_value(re, im);
+        let re_str = format_float_value(re);
+        let im_str = format_float_value(im);
+        // Per-component bindings — `name.re` / `name.im` — let
+        // user code read or update one half without re-parsing
+        // the string form.
+        let re_name = alloc::format!("{name}.re");
+        let im_name = alloc::format!("{name}.im");
+        if in_func {
+            self.scope.assign_local(&re_name, Value::Scalar(re_str))?;
+            self.scope.assign_local(&im_name, Value::Scalar(im_str))?;
+            self.scope.assign_local(name, Value::Scalar(scalar))?;
+        } else {
+            self.scope.assign(&re_name, Value::Scalar(re_str))?;
+            self.scope.assign(&im_name, Value::Scalar(im_str))?;
+            self.scope.assign(name, Value::Scalar(scalar))?;
+        }
+        Ok(())
+    }
+
     fn coerce_for_attrs(
         &mut self,
         attrs: &AttrSet,
@@ -2864,7 +2932,7 @@ impl<B: MapBackend> Evaluator<B> {
                     ));
                 }
                 alloc::format!("{wrapped}")
-            } else {
+            } else if nt.is_float() {
                 // Typed float: parse the RHS as `f64`, falling
                 // back to the arithmetic engine for integer-only
                 // forms like `$((2 + 3))`. Project to the type's
@@ -2876,6 +2944,12 @@ impl<B: MapBackend> Evaluator<B> {
                 };
                 let projected = nt.project_float(raw);
                 format_float_value(projected)
+            } else {
+                // Complex: callers route around this helper via
+                // `store_complex`. Returning the raw string is a
+                // defensive fallback in case a new path reaches
+                // here.
+                value
             }
         } else if attrs.integer {
             let n = self.eval_arith(&value)?;
@@ -5989,6 +6063,108 @@ fn printf_format(format: &str, params: &[String]) -> Result<(String, usize)> {
         }
     }
     Ok((out, p_idx))
+}
+
+/// Parse a kash complex literal into a `(real, imaginary)`
+/// pair. Recognised forms:
+///
+/// - `(re=R im=I)` — ksh93 compound literal. Either component
+///   may be omitted (defaults to `0`).
+/// - `R+Ii` / `R-Ii` — signed real + imaginary.
+/// - `Ii` / `i` / `-i` — pure imaginary.
+/// - `R` — real-only (imaginary defaults to `0`).
+///
+/// Returns `None` if the input doesn't match any form. The
+/// caller is responsible for projecting components through the
+/// destination type's component precision.
+pub fn parse_complex_literal(input: &str) -> Option<(f64, f64)> {
+    let s = input.trim();
+    // Compound form `(re=R im=I)` — order-free, components
+    // optional. Whitespace-separated key=value pairs.
+    if let Some(rest) = s.strip_prefix('(')
+        && let Some(inner) = rest.strip_suffix(')')
+    {
+        let mut re = 0.0_f64;
+        let mut im = 0.0_f64;
+        for kv in inner.split_whitespace() {
+            if let Some(v) = kv.strip_prefix("re=") {
+                re = v.parse().ok()?;
+            } else if let Some(v) = kv.strip_prefix("im=") {
+                im = v.parse().ok()?;
+            } else {
+                return None;
+            }
+        }
+        return Some((re, im));
+    }
+    // Forms with a trailing `i`.
+    if let Some(body) = s.strip_suffix('i') {
+        let bytes = body.as_bytes();
+        // Locate the split between real and imaginary parts —
+        // the rightmost `+` / `-` that isn't part of an
+        // exponent (`e+` / `E-`). Skipping index 0 lets a
+        // leading sign on the real part pass through.
+        let mut split: Option<usize> = None;
+        if !bytes.is_empty() {
+            for i in (1..bytes.len()).rev() {
+                let c = bytes[i] as char;
+                let prev = bytes[i - 1] as char;
+                if (c == '+' || c == '-') && prev != 'e' && prev != 'E' {
+                    split = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = split {
+            let (re_part, im_part) = body.split_at(idx);
+            let re: f64 = re_part.parse().ok()?;
+            let im: f64 = match im_part {
+                "+" => 1.0,
+                "-" => -1.0,
+                other => other.parse().ok()?,
+            };
+            return Some((re, im));
+        }
+        // No real part — body is the imaginary coefficient
+        // (possibly empty, `+`, or `-`).
+        let im = match body {
+            "" | "+" => 1.0,
+            "-" => -1.0,
+            other => other.parse().ok()?,
+        };
+        return Some((0.0, im));
+    }
+    // Real-only fallback.
+    let re: f64 = s.parse().ok()?;
+    Some((re, 0.0))
+}
+
+/// Render a `(real, imaginary)` complex value in canonical
+/// kash form. `0+0i` collapses to `0.0`; pure real / pure
+/// imaginary collapses to one component each. Round-trips
+/// through `parse_complex_literal`.
+pub fn format_complex_value(re: f64, im: f64) -> String {
+    if im == 0.0 {
+        return format_float_value(re);
+    }
+    if re == 0.0 {
+        if im == 1.0 {
+            return "i".into();
+        }
+        if im == -1.0 {
+            return "-i".into();
+        }
+        return alloc::format!("{}i", format_float_value(im));
+    }
+    let re_str = format_float_value(re);
+    let im_str = format_float_value(im);
+    // `im_str` carries its own sign for negative values, so
+    // sandwich a `+` only for non-negative imaginary parts.
+    if im > 0.0 {
+        alloc::format!("{re_str}+{im_str}i")
+    } else {
+        alloc::format!("{re_str}{im_str}i")
+    }
 }
 
 /// Render a `f64` for storage in a kash variable. Special-cases
@@ -11305,6 +11481,93 @@ mod tests {
         // Like the int case, the float type is sticky.
         let (_, out, _) = run("float32 a=0.0\na=3.14\necho $a\n");
         assert!(out.starts_with("3.140000"), "got: {out}");
+    }
+
+    // ===== primitive numeric types (complex) =====
+
+    #[test]
+    fn typed_complex_stores_re_and_im_components() {
+        let (_, out, _) = run(
+            "complex128 z=1+2i\necho \"z=$z z.re=${z.re} z.im=${z.im}\"\n",
+        );
+        assert_eq!(out, "z=1.0+2.0i z.re=1.0 z.im=2.0\n");
+    }
+
+    #[test]
+    fn typed_complex_compound_literal_form() {
+        let (_, out, _) = run(
+            "complex128 w=\"(re=3 im=-4)\"\necho $w\n",
+        );
+        assert_eq!(out, "3.0-4.0i\n");
+    }
+
+    #[test]
+    fn typed_complex_pure_imaginary() {
+        let (_, out, _) = run("complex128 p=2i\necho $p\n");
+        assert_eq!(out, "2.0i\n");
+    }
+
+    #[test]
+    fn typed_complex_pure_real_promotes_imaginary_to_zero() {
+        let (_, out, _) = run("complex128 r=5\necho $r\n");
+        // Pure-real value collapses to plain float-form on
+        // round-trip; the underlying `.im` component is `0.0`.
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn typed_complex_unit_imaginary() {
+        let (_, out, _) = run("complex128 i=i\necho $i\n");
+        assert_eq!(out, "i\n");
+    }
+
+    #[test]
+    fn typed_complex_negative_unit_imaginary() {
+        let (_, out, _) = run("complex128 ni=-i\necho $ni\n");
+        assert_eq!(out, "-i\n");
+    }
+
+    #[test]
+    fn typed_complex32_projects_through_half_precision() {
+        // `complex32` is two `f16`s — the components show the
+        // half-precision rounding.
+        let (_, out, _) = run(
+            "complex32 h=0.1+0.2i\necho \"${h.re} ${h.im}\"\n",
+        );
+        assert!(out.starts_with("0.099"), "got: {out}");
+        assert!(out.contains("0.199") || out.contains("0.200"), "got: {out}");
+    }
+
+    #[test]
+    fn typed_bcomplex32_round_trips_exactly_for_halves() {
+        let (_, out, _) = run("bcomplex32 b=0.5-1.5i\necho $b\n");
+        assert_eq!(out, "0.5-1.5i\n");
+    }
+
+    #[test]
+    fn typed_complex_invalid_literal_errors() {
+        let prog = parse("complex128 bad=not_a_complex\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("complex"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_complex_literal_accepts_canonical_forms() {
+        // Direct unit-test for the helper — covers spelling
+        // edge cases beyond what the integration test exercises.
+        assert_eq!(parse_complex_literal("1+2i"), Some((1.0, 2.0)));
+        assert_eq!(parse_complex_literal("1-2i"), Some((1.0, -2.0)));
+        assert_eq!(parse_complex_literal("2i"), Some((0.0, 2.0)));
+        assert_eq!(parse_complex_literal("i"), Some((0.0, 1.0)));
+        assert_eq!(parse_complex_literal("-i"), Some((0.0, -1.0)));
+        assert_eq!(parse_complex_literal("5"), Some((5.0, 0.0)));
+        assert_eq!(parse_complex_literal("(re=1 im=2)"), Some((1.0, 2.0)));
+        assert_eq!(parse_complex_literal("(im=2)"), Some((0.0, 2.0)));
+        // Exponential notation in the real part — the sign-finder
+        // mustn't split on the `+` inside `1e+5`.
+        assert_eq!(parse_complex_literal("1e+5+2i"), Some((1e5, 2.0)));
     }
 
     // ===== compound member access =====

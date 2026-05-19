@@ -89,6 +89,17 @@ pub enum NumericType {
     /// Google Brain bfloat16 (`bf16` via the `half` crate) —
     /// same exponent as `f32`, narrower mantissa, ML-friendly.
     BFloat16,
+    /// `complex32` — pair of `float16`s. Stored as a real /
+    /// imaginary `f64` pair, projected through `half::f16` on
+    /// assignment.
+    Complex32,
+    /// `complex64` — pair of `float32`s.
+    Complex64,
+    /// `complex128` — pair of `float64`s, kash's default
+    /// complex.
+    Complex128,
+    /// `bcomplex32` — pair of `bfloat16`s, ML-friendly.
+    BComplex32,
 }
 
 impl NumericType {
@@ -111,6 +122,10 @@ impl NumericType {
             "float32" => Self::Float32,
             "float64" => Self::Float64,
             "bfloat16" => Self::BFloat16,
+            "complex32" => Self::Complex32,
+            "complex64" => Self::Complex64,
+            "complex128" => Self::Complex128,
+            "bcomplex32" => Self::BComplex32,
             _ => return None,
         })
     }
@@ -134,10 +149,46 @@ impl NumericType {
         )
     }
 
-    /// True iff this type is a float.
+    /// True iff this type is a float (not integer, not complex).
     #[must_use]
     pub fn is_float(self) -> bool {
-        !self.is_integer()
+        matches!(
+            self,
+            Self::Float16 | Self::Float32 | Self::Float64 | Self::BFloat16,
+        )
+    }
+
+    /// True iff this type is a complex number (a real /
+    /// imaginary pair). Drives the special multi-binding store
+    /// path in [`crate::eval::Evaluator`].
+    #[must_use]
+    pub fn is_complex(self) -> bool {
+        matches!(
+            self,
+            Self::Complex32 | Self::Complex64 | Self::Complex128 | Self::BComplex32,
+        )
+    }
+
+    /// For a complex type, the float type that backs each
+    /// component (real / imaginary). Integer / float variants
+    /// panic.
+    #[must_use]
+    pub fn component_type(self) -> Self {
+        match self {
+            Self::Complex32 => Self::Float16,
+            Self::Complex64 => Self::Float32,
+            Self::Complex128 => Self::Float64,
+            Self::BComplex32 => Self::BFloat16,
+            _ => panic!("NumericType::component_type called on a non-complex type"),
+        }
+    }
+
+    /// Project a `(re, im)` pair through this complex type's
+    /// component precision and return the round-trip.
+    #[must_use]
+    pub fn project_complex(self, re: f64, im: f64) -> (f64, f64) {
+        let comp = self.component_type();
+        (comp.project_float(re), comp.project_float(im))
     }
 
     /// Wrap `v` into this type's representable range and return
@@ -158,8 +209,15 @@ impl NumericType {
             Self::UInt32 => i128::from(v as u32),
             Self::UInt64 => i128::from(v as u64),
             Self::UInt128 => v,
-            Self::Float16 | Self::Float32 | Self::Float64 | Self::BFloat16 => {
-                panic!("NumericType::wrap called on a float type — use project_float")
+            Self::Float16
+            | Self::Float32
+            | Self::Float64
+            | Self::BFloat16
+            | Self::Complex32
+            | Self::Complex64
+            | Self::Complex128
+            | Self::BComplex32 => {
+                panic!("NumericType::wrap called on a float/complex type — use project_float/complex")
             }
         }
     }
@@ -176,7 +234,7 @@ impl NumericType {
             Self::Float32 => v as f32 as f64,
             Self::Float16 => f64::from(half::f16::from_f64(v)),
             Self::BFloat16 => f64::from(half::bf16::from_f64(v)),
-            _ => panic!("NumericType::project_float called on an integer type"),
+            _ => panic!("NumericType::project_float called on a non-float type"),
         }
     }
 
@@ -199,6 +257,10 @@ impl NumericType {
             Self::Float32 => "float32",
             Self::Float64 => "float64",
             Self::BFloat16 => "bfloat16",
+            Self::Complex32 => "complex32",
+            Self::Complex64 => "complex64",
+            Self::Complex128 => "complex128",
+            Self::BComplex32 => "bcomplex32",
         }
     }
 }
