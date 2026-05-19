@@ -1288,6 +1288,9 @@ impl<B: MapBackend> Evaluator<B> {
             "wait" => self.builtin_wait(&argv[1..]),
             "fg" => self.builtin_fg(&argv[1..]),
             "bg" => self.builtin_bg(&argv[1..]),
+            "die" => self.builtin_die(&argv[1..]),
+            "assert" => self.builtin_assert(&argv[1..]),
+            "usage" => self.builtin_usage(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1481,6 +1484,51 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign_local(&name, Value::Scalar(value))?;
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `die [MSG] [STATUS]` — kash extension. Print MSG to stderr
+    /// (if given) and exit the script with STATUS (default 1).
+    /// Bash idiom for fail-fast scripts; locked in
+    /// `project_shell_builtins.md`.
+    fn builtin_die(&mut self, args: &[String]) -> Result<Outcome> {
+        let msg = args.first().cloned().unwrap_or_default();
+        let status = args
+            .get(1)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(1);
+        if !msg.is_empty() {
+            self.report_to_stderr(&alloc::format!("kash: {msg}"));
+        }
+        Ok(Outcome::Exit(status))
+    }
+
+    /// `assert EXPR…` — kash extension. Evaluate the args as a
+    /// `[[ … ]]` expression and `die` on false. Used for
+    /// invariant / precondition checks at the top of a function.
+    fn builtin_assert(&mut self, args: &[String]) -> Result<Outcome> {
+        let owned: alloc::vec::Vec<String> = args.to_vec();
+        let truth = eval_double_bracket(&owned)?;
+        if truth {
+            Ok(Outcome::Status(0))
+        } else {
+            let body = args.join(" ");
+            self.report_to_stderr(&alloc::format!(
+                "kash: assertion failed: [[ {body} ]]"
+            ));
+            Ok(Outcome::Exit(1))
+        }
+    }
+
+    /// `usage [NAME]` — kash extension. Print a usage line for
+    /// NAME (current function name when omitted) and exit with
+    /// status 2 — the conventional "shell misuse" code. The full
+    /// doc-comment plumbing remains a future stage; for now the
+    /// builtin emits a stub line so scripts can call it as the
+    /// `default` arm of an option parser.
+    fn builtin_usage(&mut self, args: &[String]) -> Result<Outcome> {
+        let target = args.first().cloned().unwrap_or_else(|| "<command>".into());
+        self.output.push_str(&alloc::format!("Usage: {target}\n"));
+        Ok(Outcome::Exit(2))
     }
 
     /// `jobs` — print the live background-job table. Output is
@@ -1747,6 +1795,9 @@ impl<B: MapBackend> Evaluator<B> {
             "wait" => self.builtin_wait(&argv[1..]),
             "fg" => self.builtin_fg(&argv[1..]),
             "bg" => self.builtin_bg(&argv[1..]),
+            "die" => self.builtin_die(&argv[1..]),
+            "assert" => self.builtin_assert(&argv[1..]),
+            "usage" => self.builtin_usage(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -4511,6 +4562,9 @@ ifstd!({
             "wait" => self.builtin_wait(&argv[1..]),
             "fg" => self.builtin_fg(&argv[1..]),
             "bg" => self.builtin_bg(&argv[1..]),
+            "die" => self.builtin_die(&argv[1..]),
+            "assert" => self.builtin_assert(&argv[1..]),
+            "usage" => self.builtin_usage(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -5166,6 +5220,9 @@ fn is_builtin_name(name: &str) -> bool {
             | "wait"
             | "fg"
             | "bg"
+            | "die"
+            | "assert"
+            | "usage"
     )
 }
 
@@ -9930,6 +9987,54 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== `die` / `assert` / `usage` builtins =====
+
+    #[test]
+    fn die_with_message_and_status() {
+        let prog = parse("die \"oops\" 42\n").unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        // Exit-request propagates as Outcome::Exit which surfaces
+        // as the requested status.
+        assert_eq!(outcome.status(), 42);
+        assert!(ev.take_stderr().contains("oops"));
+    }
+
+    #[test]
+    fn die_default_status_is_one() {
+        let prog = parse("die\n").unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 1);
+    }
+
+    #[test]
+    fn assert_true_returns_zero() {
+        let (_, out, _) = run("assert 1 -eq 1; echo passed\n");
+        assert_eq!(out, "passed\n");
+    }
+
+    #[test]
+    fn assert_false_dies_with_status_one() {
+        let prog = parse("assert 1 -eq 2\necho unreachable\n").unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 1);
+        assert!(!ev.take_output().contains("unreachable"));
+        assert!(ev.take_stderr().contains("assertion failed"));
+    }
+
+    #[test]
+    fn usage_prints_line_and_exits_two() {
+        let prog = parse("usage my-tool\necho unreachable\n").unwrap();
+        let mut ev = Evaluator::new();
+        let outcome = ev.eval_program(&prog).unwrap();
+        assert_eq!(outcome.status(), 2);
+        let out = ev.take_output();
+        assert!(out.contains("Usage: my-tool"), "got: {out}");
+        assert!(!out.contains("unreachable"));
     }
 
     // ===== `printf` builtin =====
