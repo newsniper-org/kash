@@ -1284,6 +1284,10 @@ impl<B: MapBackend> Evaluator<B> {
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
             "printf" => self.builtin_printf(&argv[1..]),
+            "jobs" => self.builtin_jobs(&argv[1..]),
+            "wait" => self.builtin_wait(&argv[1..]),
+            "fg" => self.builtin_fg(&argv[1..]),
+            "bg" => self.builtin_bg(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1479,6 +1483,93 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(Outcome::Status(0))
     }
 
+    /// `jobs` — print the live background-job table. Output is
+    /// `[<job-id>] <pid> Running` one per line, in the order the
+    /// jobs were spawned. Std-only because background jobs are
+    /// themselves std-only.
+    fn builtin_jobs(&mut self, _args: &[String]) -> Result<Outcome> {
+        self.builtin_jobs_impl()
+    }
+
+    #[cfg(feature = "std")]
+    fn builtin_jobs_impl(&mut self) -> Result<Outcome> {
+        for (i, child) in self.background_jobs.iter().enumerate() {
+            self.output.push_str(&alloc::format!(
+                "[{}] {} Running\n",
+                i + 1,
+                child.id()
+            ));
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn builtin_jobs_impl(&mut self) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "jobs requires the std feature".into(),
+        ))
+    }
+
+    /// `wait [PID]` — block until the named background job exits;
+    /// without an argument, block until *every* background job
+    /// exits. Returns the waited-on job's exit status (the last
+    /// one's, for the all-jobs form).
+    fn builtin_wait(&mut self, args: &[String]) -> Result<Outcome> {
+        self.builtin_wait_impl(args)
+    }
+
+    #[cfg(feature = "std")]
+    fn builtin_wait_impl(&mut self, args: &[String]) -> Result<Outcome> {
+        if let Some(pid_arg) = args.first() {
+            let pid: i32 = pid_arg.parse().map_err(|_| {
+                KashError::Runtime(alloc::format!("wait: `{pid_arg}` is not a valid PID"))
+            })?;
+            let idx = self
+                .background_jobs
+                .iter()
+                .position(|c| c.id() as i32 == pid);
+            let Some(idx) = idx else {
+                return Err(KashError::Runtime(alloc::format!(
+                    "wait: no such background job `{pid}`"
+                )));
+            };
+            let mut child = self.background_jobs.swap_remove(idx);
+            let st = child
+                .wait()
+                .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+            return Ok(Outcome::Status(st.code().unwrap_or(128)));
+        }
+        let mut last = 0;
+        for mut child in core::mem::take(&mut self.background_jobs) {
+            let st = child
+                .wait()
+                .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+            last = st.code().unwrap_or(128);
+        }
+        Ok(Outcome::Status(last))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn builtin_wait_impl(&mut self, _: &[String]) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "wait requires the std feature".into(),
+        ))
+    }
+
+    /// `fg` / `bg` — terminal-foreground job control. Not
+    /// supported in this commit cycle; SIGSTOP / SIGCONT handling
+    /// and tty foreground hand-off need their own design.
+    fn builtin_fg(&mut self, _args: &[String]) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "fg: terminal foreground job control isn't supported yet".into(),
+        ))
+    }
+    fn builtin_bg(&mut self, _args: &[String]) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "bg: terminal foreground job control isn't supported yet".into(),
+        ))
+    }
+
     /// `printf FORMAT [ARG …]` — POSIX format-string output. The
     /// format string honours `\n` / `\t` / `\r` / `\\` / `\0`
     /// escapes; conversions cover `%s`, `%d` / `%i`, `%x`, `%o`,
@@ -1652,6 +1743,10 @@ impl<B: MapBackend> Evaluator<B> {
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
             "printf" => self.builtin_printf(&argv[1..]),
+            "jobs" => self.builtin_jobs(&argv[1..]),
+            "wait" => self.builtin_wait(&argv[1..]),
+            "fg" => self.builtin_fg(&argv[1..]),
+            "bg" => self.builtin_bg(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -4412,6 +4507,10 @@ ifstd!({
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
             "printf" => self.builtin_printf(&argv[1..]),
+            "jobs" => self.builtin_jobs(&argv[1..]),
+            "wait" => self.builtin_wait(&argv[1..]),
+            "fg" => self.builtin_fg(&argv[1..]),
+            "bg" => self.builtin_bg(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -5063,6 +5162,10 @@ fn is_builtin_name(name: &str) -> bool {
             | "eval"
             | "command"
             | "printf"
+            | "jobs"
+            | "wait"
+            | "fg"
+            | "bg"
     )
 }
 
@@ -8778,6 +8881,66 @@ mod tests {
             let mut ev = Evaluator::new();
             ev.eval_program(&prog).unwrap();
             assert!(ev.take_output().contains("FOO=hi"));
+        }
+
+        #[test]
+        fn jobs_lists_running_background_pids() {
+            if !have("/bin/sleep") {
+                return;
+            }
+            let prog = parse("/bin/sleep 0.05 &\n/bin/sleep 0.05 &\njobs\nwait\n").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            assert!(out.contains("[1]"), "got: {out}");
+            assert!(out.contains("[2]"), "got: {out}");
+        }
+
+        #[test]
+        fn wait_specific_pid_reaps_one_job() {
+            if !have("/bin/sleep") {
+                return;
+            }
+            let prog = parse(
+                "/bin/sleep 0.02 &\np=$!\nwait $p\necho \"got=$?\"\n",
+            )
+            .unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            assert!(out.contains("got=0"), "got: {out}");
+        }
+
+        #[test]
+        fn wait_no_args_reaps_all_jobs() {
+            if !have("/bin/sleep") {
+                return;
+            }
+            let prog = parse(
+                "/bin/sleep 0.02 &\n/bin/sleep 0.02 &\nwait\necho ok\n",
+            )
+            .unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert!(ev.take_output().contains("ok"));
+        }
+
+        #[test]
+        fn wait_bad_pid_errors() {
+            let prog = parse("wait 999999999\n").unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("no such background job"), "got: {msg}");
+        }
+
+        #[test]
+        fn fg_and_bg_explicitly_not_yet_supported() {
+            let prog = parse("fg\n").unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("isn't supported yet"), "got: {msg}");
         }
 
         #[test]
