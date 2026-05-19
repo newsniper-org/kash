@@ -6129,6 +6129,30 @@ pub struct ExpansionFlags {
     /// single / double quotes; full shell-grammar tokenisation
     /// arrives with the lexer-driven implementation.
     z_split: bool,
+    /// `(o)` / `(O)` — sort the (post-split) array in
+    /// ascending / descending order. Combines with `(n)` for
+    /// numeric comparison and `(i)` for case-insensitive
+    /// comparison.
+    sort: Option<SortFlag>,
+    /// `(n)` — numeric comparison during sort. Strings that
+    /// don't parse as numbers compare lexically against each
+    /// other and are ordered after the numeric ones.
+    sort_numeric: bool,
+    /// `(i)` — case-insensitive comparison during sort. Combines
+    /// with the chosen sort direction.
+    sort_case_insensitive: bool,
+    /// `(u)` — drop duplicate elements from the post-split
+    /// array. Stable: first occurrence wins.
+    unique: bool,
+}
+
+/// `(o)` / `(O)` — sort direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortFlag {
+    /// `(o)` — ascending.
+    Ascending,
+    /// `(O)` — descending.
+    Descending,
 }
 
 impl ExpansionFlags {
@@ -6143,6 +6167,10 @@ impl ExpansionFlags {
             && !self.f_split
             && !self.f_join
             && !self.z_split
+            && self.sort.is_none()
+            && !self.sort_numeric
+            && !self.sort_case_insensitive
+            && !self.unique
     }
 }
 
@@ -6259,9 +6287,29 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
                 flags.z_split = true;
                 idx += 1;
             }
+            b'o' => {
+                flags.sort = Some(SortFlag::Ascending);
+                idx += 1;
+            }
+            b'O' => {
+                flags.sort = Some(SortFlag::Descending);
+                idx += 1;
+            }
+            b'n' => {
+                flags.sort_numeric = true;
+                idx += 1;
+            }
+            b'i' => {
+                flags.sort_case_insensitive = true;
+                idx += 1;
+            }
+            b'u' => {
+                flags.unique = true;
+                idx += 1;
+            }
             other => {
                 return Err(KashError::Parse(alloc::format!(
-                    "unsupported expansion flag `{}` (split/join/case/quote families are wired in this commit; others follow)",
+                    "unsupported expansion flag `{}` (split/join/sort/case/quote families are wired in this commit; others follow)",
                     other as char,
                 )));
             }
@@ -6293,6 +6341,21 @@ pub fn apply_expansion_flags(flags: &ExpansionFlags, value: String) -> String {
         parts = split_with_delim(&parts, "\n");
     } else if flags.z_split {
         parts = split_shell_tokens_many(&parts);
+    }
+    // Sort / dedup, in zsh's documented order: sort first
+    // (numeric / case-insensitive variants), unique second so
+    // the dedup sees a sorted array. `(u)` without a sort flag
+    // is a stable first-occurrence dedup on the original order.
+    if let Some(dir) = flags.sort {
+        sort_parts(
+            &mut parts,
+            dir,
+            flags.sort_numeric,
+            flags.sort_case_insensitive,
+        );
+    }
+    if flags.unique {
+        parts = dedup_stable(&parts);
     }
     // Join collapses the array back to a scalar. With no flag
     // we use an empty separator — kash's expansion contract is
@@ -6380,6 +6443,59 @@ fn split_with_delim(parts: &[String], delim: &str) -> Vec<String> {
 /// `'…'` / `"…"` / `\X` runs (their content stays glued); other
 /// whitespace separates tokens. Empty tokens are dropped, like
 /// the shell's regular word-splitting.
+/// Sort `parts` in place per the zsh sort-flag combination.
+/// `numeric` (the `(n)` flag) sorts on parsed `f64` values,
+/// breaking ties lexically; non-numeric strings fall after all
+/// numeric ones. `case_insensitive` (the `(i)` flag) lower-
+/// cases the comparison keys.
+fn sort_parts(
+    parts: &mut [String],
+    direction: SortFlag,
+    numeric: bool,
+    case_insensitive: bool,
+) {
+    parts.sort_by(|a, b| {
+        let ord = if numeric {
+            let na = a.trim().parse::<f64>().ok();
+            let nb = b.trim().parse::<f64>().ok();
+            match (na, nb) {
+                (Some(x), Some(y)) => x
+                    .partial_cmp(&y)
+                    .unwrap_or(core::cmp::Ordering::Equal),
+                (Some(_), None) => core::cmp::Ordering::Less,
+                (None, Some(_)) => core::cmp::Ordering::Greater,
+                (None, None) => compare_strs(a, b, case_insensitive),
+            }
+        } else {
+            compare_strs(a, b, case_insensitive)
+        };
+        match direction {
+            SortFlag::Ascending => ord,
+            SortFlag::Descending => ord.reverse(),
+        }
+    });
+}
+
+fn compare_strs(a: &str, b: &str, case_insensitive: bool) -> core::cmp::Ordering {
+    if case_insensitive {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    } else {
+        a.cmp(b)
+    }
+}
+
+/// Stable first-occurrence dedup. Preserves the input order of
+/// the *first* sighting of each distinct value.
+fn dedup_stable(parts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(parts.len());
+    for p in parts {
+        if !out.iter().any(|q| q == p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 fn split_shell_tokens_many(parts: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in parts {
@@ -12283,13 +12399,13 @@ mod tests {
 
     #[test]
     fn zsh_flag_unsupported_char_rejected() {
-        // Sort flag `(o)` is wired in a later sub-commit; until
+        // `(P)` indirect is wired in a later sub-commit; until
         // then unsupported characters must report a clear error.
-        let prog = parse("x=hi\necho \"${(o)x}\"\n").unwrap();
+        let prog = parse("x=hi\necho \"${(P)x}\"\n").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("o"), "got: {msg}");
+        assert!(msg.contains("P"), "got: {msg}");
     }
 
     #[test]
@@ -12353,6 +12469,57 @@ mod tests {
         // applies to the final scalar.
         let (_, out, _) = run("x=a,b,c\necho \"${(s.,.j.+.U)x}\"\n");
         assert_eq!(out, "A+B+C\n");
+    }
+
+    // ===== zsh-style expansion flags (sort + dedup subset) =====
+
+    #[test]
+    fn zsh_flag_sort_ascending() {
+        let (_, out, _) = run("x=c,a,b\necho \"${(s.,.j.,.o)x}\"\n");
+        assert_eq!(out, "a,b,c\n");
+    }
+
+    #[test]
+    fn zsh_flag_sort_descending() {
+        let (_, out, _) = run("x=a,c,b\necho \"${(s.,.j.,.O)x}\"\n");
+        assert_eq!(out, "c,b,a\n");
+    }
+
+    #[test]
+    fn zsh_flag_unique_preserves_first_seen_order() {
+        let (_, out, _) = run("x=c,a,b,a,c\necho \"${(s.,.j.,.u)x}\"\n");
+        assert_eq!(out, "c,a,b\n");
+    }
+
+    #[test]
+    fn zsh_flag_sort_plus_unique() {
+        let (_, out, _) = run("x=c,a,b,a,c\necho \"${(s.,.j.,.ou)x}\"\n");
+        assert_eq!(out, "a,b,c\n");
+    }
+
+    #[test]
+    fn zsh_flag_numeric_sort_orders_by_value() {
+        // Without `(n)` ascii sort would put `11` before `2`.
+        let (_, out, _) = run("x=3,11,2,1\necho \"${(s.,.j.,.no)x}\"\n");
+        assert_eq!(out, "1,2,3,11\n");
+    }
+
+    #[test]
+    fn zsh_flag_numeric_sort_falls_back_for_non_numbers() {
+        let (_, out, _) = run("x=3,foo,1\necho \"${(s.,.j.,.no)x}\"\n");
+        // Numeric values come first; non-numeric ones land
+        // after.
+        assert_eq!(out, "1,3,foo\n");
+    }
+
+    #[test]
+    fn zsh_flag_case_insensitive_sort() {
+        let (_, out, _) = run(
+            "x=Banana,apple,Cherry,banana\necho \"${(s.,.j.,.oi)x}\"\n",
+        );
+        // Case-insensitive: apple < Banana == banana < Cherry.
+        // Stable sort keeps Banana before banana.
+        assert_eq!(out, "apple,Banana,banana,Cherry\n");
     }
 
     #[test]
