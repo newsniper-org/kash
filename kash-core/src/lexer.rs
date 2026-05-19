@@ -213,6 +213,14 @@ impl<'src> Lexer<'src> {
         self.pos
     }
 
+    /// Original source buffer. Exposed for source-line lookups
+    /// (e.g. `.sh.lineno`).
+    #[inline]
+    #[must_use]
+    pub fn source(&self) -> &'src str {
+        self.src
+    }
+
     /// Peek the byte at the given offset, returning `None` past EOF.
     #[inline]
     fn peek_at(&self, off: usize) -> Option<u8> {

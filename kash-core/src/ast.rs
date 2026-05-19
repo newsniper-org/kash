@@ -614,6 +614,9 @@ pub struct Statement {
     pub terminator: Terminator,
     /// Source span covering list + terminator.
     pub span: Span,
+    /// 1-based line number where this statement starts. Surfaced
+    /// to scripts as `${.sh.lineno}` during evaluation.
+    pub lineno: u32,
 }
 
 /// A full source unit: zero or more [`Statement`]s in source order.

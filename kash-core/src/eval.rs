@@ -226,6 +226,10 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// `( … )` (subshell) entry, `-1` on exit. Surfaced as
     /// `${.sh.subshell}`.
     subshell_level: u32,
+    /// 1-based line number of the currently-executing statement.
+    /// Updated at every `eval_statement` entry; surfaced as
+    /// `${.sh.lineno}`.
+    current_lineno: u32,
     /// Stack of variable names whose discipline hooks are
     /// currently in flight. The top is what `${.sh.name}` returns
     /// — same contract ksh93 documents. Empty outside a hook.
@@ -359,6 +363,7 @@ impl<B: MapBackend> Evaluator<B> {
             last_bg_pid: 0,
             discipline_value: String::new(),
             subshell_level: 0,
+            current_lineno: 0,
             discipline_name_stack: Vec::new(),
             discipline_guard: alloc::collections::BTreeSet::new(),
             type_defs: alloc::collections::BTreeMap::new(),
@@ -922,6 +927,7 @@ impl<B: MapBackend> Evaluator<B> {
     }
 
     fn eval_statement(&mut self, stmt: &Statement) -> Result<Outcome> {
+        self.current_lineno = stmt.lineno;
         let outcome = match stmt.terminator {
             crate::ast::Terminator::Background => self.eval_background(&stmt.list)?,
             crate::ast::Terminator::Sync => self.eval_and_or(&stmt.list)?,
@@ -4040,6 +4046,7 @@ impl<B: MapBackend> Evaluator<B> {
                 }
             }
             "subshell" => Ok(Some(alloc::format!("{}", self.subshell_level))),
+            "lineno" => Ok(Some(alloc::format!("{}", self.current_lineno))),
             "name" => Ok(Some(
                 self.discipline_name_stack
                     .last()
@@ -10426,6 +10433,26 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== .sh.lineno =====
+
+    #[test]
+    fn sh_lineno_reflects_source_line() {
+        let (_, out, _) = run(
+            "echo a-${.sh.lineno}\necho b-${.sh.lineno}\n\necho d-${.sh.lineno}\n",
+        );
+        assert_eq!(out, "a-1\nb-2\nd-4\n");
+    }
+
+    #[test]
+    fn sh_lineno_zero_before_any_statement() {
+        // Read directly via the public expand path before
+        // anything runs.
+        let mut ev = Evaluator::new();
+        let prog = parse("echo ${.sh.lineno}\n").unwrap();
+        ev.eval_program(&prog).unwrap();
+        assert_eq!(ev.take_output(), "1\n");
     }
 
     // ===== .sh.pid / .sh.ppid / .sh.subshell / .sh.name =====

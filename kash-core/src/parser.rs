@@ -270,11 +270,28 @@ impl<'src> Parser<'src> {
                 )));
             }
         };
+        let lineno = self.lineno_at(start);
         Ok(Statement {
             list,
             terminator: term,
             span: Span::new(start, end),
+            lineno,
         })
+    }
+
+    /// Compute the 1-based line number for a byte offset into the
+    /// parser's source. Linear scan — acceptable for our
+    /// statement-start usage (one count per parsed statement).
+    fn lineno_at(&self, offset: usize) -> u32 {
+        let src = self.lexer.source().as_bytes();
+        let clamp = offset.min(src.len());
+        let mut n: u32 = 1;
+        for &b in &src[..clamp] {
+            if b == b'\n' {
+                n += 1;
+            }
+        }
+        n
     }
 
     // ---------- and-or list ----------
