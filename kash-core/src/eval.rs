@@ -3719,27 +3719,46 @@ impl<B: MapBackend> Evaluator<B> {
                 idx += 1; // consume the '.'
             }
         } else {
-            while idx < bytes.len() {
-                let b = bytes[idx];
-                if idx == 0 {
-                    if !(b == b'_'
-                        || b.is_ascii_alphabetic()
-                        || b.is_ascii_digit()
-                        || b == b'?'
-                        || b == b'#')
+            // Plain identifier — optionally followed by dotted
+            // compound-member segments (`var.x`, `var.x.y`). The
+            // first byte must be a regular identifier opener (or
+            // one of the single-byte specials), and each dotted
+            // segment after the first must itself be a non-empty
+            // identifier.
+            if !bytes.is_empty()
+                && (bytes[0] == b'_'
+                    || bytes[0].is_ascii_alphabetic()
+                    || bytes[0].is_ascii_digit()
+                    || bytes[0] == b'?'
+                    || bytes[0] == b'#')
+            {
+                idx = 1;
+                // single-byte specials terminate here
+                if !(bytes[0].is_ascii_digit() || bytes[0] == b'?' || bytes[0] == b'#') {
+                    while idx < bytes.len()
+                        && (bytes[idx] == b'_' || bytes[idx].is_ascii_alphanumeric())
                     {
-                        break;
+                        idx += 1;
                     }
-                } else if !(b == b'_' || b.is_ascii_alphanumeric()) {
-                    break;
-                }
-                idx += 1;
-                // `$?` / `$#` are special-cased above; here we only
-                // allow single-byte digit / question / hash names.
-                if idx == 1
-                    && (bytes[0].is_ascii_digit() || bytes[0] == b'?' || bytes[0] == b'#')
-                {
-                    break;
+                    // dotted compound-member segments
+                    while idx < bytes.len() && bytes[idx] == b'.' {
+                        let prev = idx;
+                        idx += 1;
+                        let seg_start = idx;
+                        while idx < bytes.len()
+                            && (bytes[idx] == b'_' || bytes[idx].is_ascii_alphanumeric())
+                        {
+                            idx += 1;
+                        }
+                        if idx == seg_start {
+                            // Trailing `.` or doubled `..` — back
+                            // up; the `.` belongs to the operator
+                            // tail (e.g. `${var.}` is a parse
+                            // error elsewhere).
+                            idx = prev;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -10223,6 +10242,38 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== compound member access =====
+
+    #[test]
+    fn compound_member_assign_and_lookup() {
+        let (_, out, _) = run("var.name=John\necho ${var.name}\n");
+        assert_eq!(out, "John\n");
+    }
+
+    #[test]
+    fn compound_member_nested_path() {
+        let (_, out, _) = run(
+            "p.address.city=Seoul\necho ${p.address.city}\n",
+        );
+        assert_eq!(out, "Seoul\n");
+    }
+
+    #[test]
+    fn compound_member_independent_keys() {
+        let (_, out, _) = run(
+            "p.x=1\np.y=2\necho \"${p.x} ${p.y}\"\n",
+        );
+        assert_eq!(out, "1 2\n");
+    }
+
+    #[test]
+    fn compound_member_in_modifier_form() {
+        // `${var.x:-default}` should work like the plain
+        // identifier case.
+        let (_, out, _) = run("echo ${p.missing:-fallback}\n");
+        assert_eq!(out, "fallback\n");
     }
 
     // ===== `typeset -n` (nameref) =====

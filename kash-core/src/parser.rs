@@ -2005,6 +2005,15 @@ fn is_valid_identifier(s: &str) -> bool {
         .all(|b| *b == b'_' || b.is_ascii_alphanumeric())
 }
 
+/// Dotted compound name — `var`, `var.x`, `var.x.y`, … Each
+/// segment is itself a valid identifier; segments are separated
+/// by single `.` characters; no trailing dot or empty segment.
+/// Used by `var.member=val` assignments and `${var.member}`
+/// lookups.
+fn is_valid_compound_name(s: &str) -> bool {
+    !s.is_empty() && s.split('.').all(is_valid_identifier)
+}
+
 /// A valid function name is a valid identifier that isn't a reserved
 /// keyword. Reserved words used as function names lead to confusing
 /// parses; reject them up front.
@@ -2019,14 +2028,15 @@ fn is_valid_function_name(s: &str) -> bool {
 fn looks_like_assignment(s: &str) -> bool {
     let Some(eq) = s.find('=') else { return false };
     let lhs = &s[..eq];
-    // Two shapes accepted: `NAME=` or `NAME[SUBSCRIPT]=`.
+    // Three shapes accepted: `NAME=`, `NAME[SUBSCRIPT]=`,
+    // `NAME.MEMBER=` (dotted compound name).
     if let Some(open) = lhs.find('[') {
         if !lhs.ends_with(']') {
             return false;
         }
-        is_valid_identifier(&lhs[..open])
+        is_valid_compound_name(&lhs[..open])
     } else {
-        is_valid_identifier(lhs)
+        is_valid_compound_name(lhs)
     }
 }
 
@@ -2049,12 +2059,12 @@ fn split_assignment(word: Word) -> core::result::Result<Assignment, Word> {
         }
         let n = &lhs[..open];
         let s = &lhs[open + 1..lhs.len() - 1];
-        if !is_valid_identifier(n) {
+        if !is_valid_compound_name(n) {
             return Err(word);
         }
         (n.to_string(), Some(s.to_string()))
     } else {
-        if !is_valid_identifier(lhs) {
+        if !is_valid_compound_name(lhs) {
             return Err(word);
         }
         (lhs.to_string(), None)
