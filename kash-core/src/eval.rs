@@ -1291,6 +1291,8 @@ impl<B: MapBackend> Evaluator<B> {
             "die" => self.builtin_die(&argv[1..]),
             "assert" => self.builtin_assert(&argv[1..]),
             "usage" => self.builtin_usage(&argv[1..]),
+            "time" => self.builtin_time(&argv[1..]),
+            "getopts" => self.builtin_getopts(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1482,6 +1484,136 @@ impl<B: MapBackend> Evaluator<B> {
         for arg in args {
             let (name, value) = parse_name_eq_value(arg)?;
             self.scope.assign_local(&name, Value::Scalar(value))?;
+        }
+        Ok(Outcome::Status(0))
+    }
+
+    /// `time COMMAND [ARGS …]` — run COMMAND and emit a
+    /// `real m s` line to stderr afterwards. POSIX reserves
+    /// `time` as a *keyword* whose syntax allows pipelines, but
+    /// the builtin form (one command) covers the day-to-day case
+    /// and is what's been wanted here. user / sys are stubbed at
+    /// zero — those need `getrusage` plumbing, scheduled with the
+    /// signal layer.
+    fn builtin_time(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.is_empty() {
+            return Err(KashError::Runtime("time: missing command".into()));
+        }
+        self.builtin_time_impl(args)
+    }
+
+    #[cfg(feature = "std")]
+    fn builtin_time_impl(&mut self, args: &[String]) -> Result<Outcome> {
+        let start = std::time::Instant::now();
+        let argv = args.to_vec();
+        let result = if self.resolve_function_name(&argv[0]).is_some() {
+            self.call_function(&argv)
+        } else if is_builtin_name(&argv[0]) {
+            self.dispatch_known_builtin(&argv)
+        } else {
+            self.run_external(&argv)
+        };
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs();
+        let line = alloc::format!(
+            "\nreal\t{}m{}.{:03}s\nuser\t0m0.000s\nsys\t0m0.000s\n",
+            secs / 60,
+            secs % 60,
+            elapsed.subsec_millis(),
+        );
+        self.report_to_stderr(&line);
+        result
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn builtin_time_impl(&mut self, _args: &[String]) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "time requires the std feature (`Instant`)".into(),
+        ))
+    }
+
+    /// `getopts OPTSTRING NAME [ARGS …]` — POSIX option-string
+    /// parser. Reads `$OPTIND` to know how far we've walked,
+    /// writes the chosen option letter to NAME, the matched
+    /// argument (if any) to `OPTARG`, and bumps `OPTIND`. Returns
+    /// 0 while there's still work to do, 1 once the args are
+    /// exhausted (or we hit `--`).
+    ///
+    /// Minimum surface: single-letter options, optional argument
+    /// trailer (`a:` means `-a` takes an argument as the rest of
+    /// the same token or the next positional). Clustered forms
+    /// (`-abc`) and OPTERR / silent-mode (`:opts`) are follow-up
+    /// work.
+    fn builtin_getopts(&mut self, args: &[String]) -> Result<Outcome> {
+        let optstring = args
+            .first()
+            .cloned()
+            .ok_or_else(|| KashError::Runtime("getopts: missing OPTSTRING".into()))?;
+        let var_name = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| KashError::Runtime("getopts: missing NAME".into()))?;
+        let parse_args: Vec<String> = if args.len() > 2 {
+            args[2..].to_vec()
+        } else {
+            self.positionals.clone()
+        };
+        let optind: usize = self
+            .scope
+            .get("OPTIND")
+            .map(|v| v.to_scalar_string().parse::<usize>().unwrap_or(1))
+            .unwrap_or(1);
+        let bind_var = |this: &mut Self, name: &str, value: &str| -> Result<()> {
+            let target = this.qualify_var_for_write(name);
+            this.scope.assign(&target, Value::Scalar(value.into()))?;
+            Ok(())
+        };
+        if optind == 0 || optind > parse_args.len() {
+            bind_var(self, &var_name, "?")?;
+            return Ok(Outcome::Status(1));
+        }
+        let cur = parse_args[optind - 1].clone();
+        if !cur.starts_with('-') || cur == "-" {
+            bind_var(self, &var_name, "?")?;
+            return Ok(Outcome::Status(1));
+        }
+        if cur == "--" {
+            bind_var(self, "OPTIND", &alloc::format!("{}", optind + 1))?;
+            bind_var(self, &var_name, "?")?;
+            return Ok(Outcome::Status(1));
+        }
+        let opt_char = cur.chars().nth(1).expect("validated above");
+        let mut chars = optstring.chars().peekable();
+        let mut found = false;
+        let mut needs_arg = false;
+        while let Some(c) = chars.next() {
+            if c == opt_char {
+                found = true;
+                if chars.peek() == Some(&':') {
+                    needs_arg = true;
+                }
+                break;
+            }
+        }
+        if !found {
+            // Unknown option — bind NAME=`?`, OPTARG to the char.
+            bind_var(self, &var_name, "?")?;
+            bind_var(self, "OPTARG", &opt_char.to_string())?;
+            bind_var(self, "OPTIND", &alloc::format!("{}", optind + 1))?;
+            return Ok(Outcome::Status(0));
+        }
+        bind_var(self, &var_name, &opt_char.to_string())?;
+        if needs_arg {
+            let arg_val = if cur.len() > 2 {
+                cur[2..].to_string()
+            } else {
+                parse_args.get(optind).cloned().unwrap_or_default()
+            };
+            bind_var(self, "OPTARG", &arg_val)?;
+            let step = if cur.len() > 2 { 1 } else { 2 };
+            bind_var(self, "OPTIND", &alloc::format!("{}", optind + step))?;
+        } else {
+            bind_var(self, "OPTIND", &alloc::format!("{}", optind + 1))?;
         }
         Ok(Outcome::Status(0))
     }
@@ -1798,6 +1930,8 @@ impl<B: MapBackend> Evaluator<B> {
             "die" => self.builtin_die(&argv[1..]),
             "assert" => self.builtin_assert(&argv[1..]),
             "usage" => self.builtin_usage(&argv[1..]),
+            "time" => self.builtin_time(&argv[1..]),
+            "getopts" => self.builtin_getopts(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -4565,6 +4699,8 @@ ifstd!({
             "die" => self.builtin_die(&argv[1..]),
             "assert" => self.builtin_assert(&argv[1..]),
             "usage" => self.builtin_usage(&argv[1..]),
+            "time" => self.builtin_time(&argv[1..]),
+            "getopts" => self.builtin_getopts(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -5223,6 +5359,8 @@ fn is_builtin_name(name: &str) -> bool {
             | "die"
             | "assert"
             | "usage"
+            | "time"
+            | "getopts"
     )
 }
 
@@ -9987,6 +10125,42 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== `getopts` builtin =====
+
+    #[test]
+    fn getopts_walks_flag_options() {
+        let (_, out, _) = run(
+            "while getopts \"ab\" opt -a -b; do echo \"opt=$opt OPTIND=$OPTIND\"; done\n",
+        );
+        assert!(out.contains("opt=a OPTIND=2"), "got: {out}");
+        assert!(out.contains("opt=b OPTIND=3"), "got: {out}");
+    }
+
+    #[test]
+    fn getopts_handles_option_with_argument() {
+        let (_, out, _) = run(
+            "while getopts \"x:\" opt -x value; do echo \"opt=$opt OPTARG=$OPTARG OPTIND=$OPTIND\"; done\n",
+        );
+        assert!(
+            out.contains("opt=x OPTARG=value OPTIND=3"),
+            "got: {out}",
+        );
+    }
+
+    #[test]
+    fn getopts_unknown_option_yields_question_mark() {
+        let (_, out, _) = run(
+            "getopts \"a\" opt -z; echo \"opt=$opt OPTARG=$OPTARG\"\n",
+        );
+        assert!(out.contains("opt=? OPTARG=z"), "got: {out}");
+    }
+
+    #[test]
+    fn getopts_double_dash_stops_parsing() {
+        let (outcome, _, _) = run("getopts \"a\" opt -- -a\n");
+        assert_eq!(outcome.status(), 1);
     }
 
     // ===== `die` / `assert` / `usage` builtins =====
