@@ -2872,6 +2872,135 @@ impl<B: MapBackend> Evaluator<B> {
     /// goes through `scope.assign*`: `-i` runs the string through
     /// arithmetic, `-l` / `-u` fold case. Errors propagate (e.g.
     /// bad arithmetic).
+    /// Apply the post-lookup half of the flag pipeline (split,
+    /// sort, dedup, join, quote, case) to an already-formed
+    /// `Vec<String>`. This is the seam the multi-element flags
+    /// (`(k)` / `(v)`) hand their results off to.
+    fn finish_flag_pipeline(
+        &self,
+        flags: &ExpansionFlags,
+        parts: Vec<String>,
+    ) -> String {
+        apply_expansion_flags_parts(flags, parts)
+    }
+
+    /// `(t)` — produce the type-descriptor string for the
+    /// variable named by `body`. Returns `"unset"` when nothing
+    /// is bound; `"compound"` when no bare binding exists but
+    /// at least one `body.X` member does.
+    fn expansion_type_query(&self, body: &str) -> String {
+        // Compound-var sentinel: no bare binding but at least
+        // one `body.X` member exists.
+        let bare = self.scope.get_binding(body);
+        if bare.is_none() {
+            let prefix = alloc::format!("{body}.");
+            let has_member = self
+                .scope
+                .all_bindings()
+                .any(|(n, _)| n.starts_with(&prefix));
+            if has_member {
+                return "compound".into();
+            }
+            return "unset".into();
+        }
+        match &bare.expect("checked").value {
+            Value::Scalar(_) => "scalar".into(),
+            Value::Array(_) => "indexed".into(),
+            Value::AssocArray(_) => "assoc".into(),
+            Value::Empty => "unset".into(),
+        }
+    }
+
+    /// `(k)` / `(v)` — list the keys or values of `body`. For
+    /// an associative array the keys / values are read from the
+    /// stored map; for an indexed array we surface the numeric
+    /// indices as keys; for a compound variable (a set of
+    /// `body.X` bindings) the member names / values come from
+    /// scanning the binding table; for a plain scalar both
+    /// flags fall back to the value alone, matching zsh's
+    /// scalar fallback.
+    fn expansion_keys_or_values(
+        &self,
+        body: &str,
+        want_keys: bool,
+        want_values: bool,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(b) = self.scope.get_binding(body) {
+            match &b.value {
+                Value::AssocArray(m) => {
+                    for (k, v) in m {
+                        if want_keys {
+                            out.push(k.clone());
+                        }
+                        if want_values {
+                            out.push(v.clone());
+                        }
+                    }
+                    return out;
+                }
+                Value::Array(v) => {
+                    for (i, elem) in v.iter().enumerate() {
+                        if want_keys {
+                            out.push(alloc::format!("{i}"));
+                        }
+                        if want_values {
+                            out.push(elem.clone());
+                        }
+                    }
+                    return out;
+                }
+                Value::Scalar(s) => {
+                    if want_keys {
+                        out.push(body.to_string());
+                    }
+                    if want_values {
+                        out.push(s.clone());
+                    }
+                    return out;
+                }
+                Value::Empty => {}
+            }
+        }
+        // Compound: scan bindings whose name starts with `body.`.
+        let prefix = alloc::format!("{body}.");
+        let mut members: Vec<(String, String)> = self
+            .scope
+            .all_bindings()
+            .filter_map(|(n, b)| {
+                n.strip_prefix(&prefix).map(|rest| {
+                    (rest.to_string(), b.value.to_scalar_string())
+                })
+            })
+            .collect();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        for (k, v) in members {
+            if want_keys {
+                out.push(k);
+            }
+            if want_values {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// `(D)` — replace a leading `$HOME` prefix with `~`. No-op
+    /// when `HOME` is unset or the value doesn't start with it.
+    fn abbreviate_home_prefix(&mut self, value: String) -> String {
+        let home = match self.scope.get("HOME") {
+            Some(v) => v.to_scalar_string(),
+            None => return value,
+        };
+        if home.is_empty() {
+            return value;
+        }
+        if let Some(rest) = value.strip_prefix(&home) {
+            return alloc::format!("~{rest}");
+        }
+        value
+    }
+
     /// Refuse zsh `${(…)body}` flag-block expansions inside
     /// the strict modes that disable zsh extensions. POSIX-
     /// strict and `ksh93u-strict` are both no-extensions modes
@@ -4201,8 +4330,56 @@ impl<B: MapBackend> Evaluator<B> {
             if !flags.is_empty() {
                 self.check_zsh_flag_mode()?;
             }
-            let inner = self.expand_braced(rest)?;
-            return Ok(apply_expansion_flags(&flags, inner));
+            // `(e)` is locked under `-secure` per
+            // `project_kash_security_policy.md`.
+            if flags.reeval
+                && self.mode.modifiers.contains(&crate::mode::Modifier::Secure)
+            {
+                return Err(KashError::SecureViolation(
+                    "`${(e)…}` re-evaluation is disabled under the `-secure` modifier"
+                        .into(),
+                ));
+            }
+            // Type query short-circuits the rest of the
+            // pipeline — `(t)` returns a fixed-vocabulary
+            // descriptor, not the variable's value.
+            if flags.type_query {
+                return Ok(self.expansion_type_query(rest));
+            }
+            // Keys / values short-circuit similarly: the result
+            // is a list of member names or member values,
+            // joined per the flag rules below.
+            if flags.compound_keys || flags.compound_values {
+                let parts = self.expansion_keys_or_values(
+                    rest,
+                    flags.compound_keys,
+                    flags.compound_values,
+                );
+                return Ok(self.finish_flag_pipeline(&flags, parts));
+            }
+            // `(P)` re-routes the lookup: `body`'s expansion is
+            // a name, and we look *that* name up.
+            let mut inner = if flags.indirect {
+                let name = self.expand_braced(rest)?;
+                self.lookup_param(&name)?
+            } else {
+                self.expand_braced(rest)?
+            };
+            // `(e)` re-runs parameter / arithmetic / command
+            // substitution on the value — *not* a full script
+            // eval. So `${(e)foo}` where `foo=hello $x world`
+            // re-expands `$x` and surfaces the joined string;
+            // it doesn't try to run `hello` as a command.
+            if flags.reeval {
+                let mut buf = String::new();
+                self.expand_dollar(&inner, &mut buf)?;
+                inner = buf;
+            }
+            // `(D)` collapses a `$HOME` prefix into `~`.
+            if flags.dir_abbrev {
+                inner = self.abbreviate_home_prefix(inner);
+            }
+            return Ok(self.finish_flag_pipeline(&flags, alloc::vec![inner]));
         }
         // `.sh.*` introspection variables. Resolved first so the
         // dotted reserved namespace never falls into the regular
@@ -6144,6 +6321,32 @@ pub struct ExpansionFlags {
     /// `(u)` — drop duplicate elements from the post-split
     /// array. Stable: first occurrence wins.
     unique: bool,
+    /// `(P)` — indirect. Treat the body's value as a variable
+    /// name and look that up. Composes with subsequent flags.
+    indirect: bool,
+    /// `(t)` — type query. Returns the body variable's type
+    /// string (`scalar`, `compound`, `indexed`, `assoc`,
+    /// `unset`) instead of its value.
+    type_query: bool,
+    /// `(e)` — re-evaluate. Run the post-lookup value as kash
+    /// source via the command-substitution pipeline. Blocked
+    /// under the `-secure` modifier per
+    /// `project_kash_security_policy.md`.
+    reeval: bool,
+    /// `(D)` — directory abbreviation. Collapse a leading
+    /// `$HOME` prefix into `~`.
+    dir_abbrev: bool,
+    /// `(@)` — preserve as array. The single-string expansion
+    /// context still has to collapse to one string; this flag
+    /// instructs the join step to use the first IFS character
+    /// rather than the empty separator, so each element
+    /// survives field-splitting later.
+    at_preserve: bool,
+    /// `(k)` — keys. For an associative array returns its
+    /// keys; for a compound variable returns the member names.
+    compound_keys: bool,
+    /// `(v)` — values. Same as `(k)` but for the values.
+    compound_values: bool,
 }
 
 /// `(o)` / `(O)` — sort direction.
@@ -6171,6 +6374,13 @@ impl ExpansionFlags {
             && !self.sort_numeric
             && !self.sort_case_insensitive
             && !self.unique
+            && !self.indirect
+            && !self.type_query
+            && !self.reeval
+            && !self.dir_abbrev
+            && !self.at_preserve
+            && !self.compound_keys
+            && !self.compound_values
     }
 }
 
@@ -6307,9 +6517,37 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
                 flags.unique = true;
                 idx += 1;
             }
+            b'P' => {
+                flags.indirect = true;
+                idx += 1;
+            }
+            b't' => {
+                flags.type_query = true;
+                idx += 1;
+            }
+            b'e' => {
+                flags.reeval = true;
+                idx += 1;
+            }
+            b'D' => {
+                flags.dir_abbrev = true;
+                idx += 1;
+            }
+            b'@' => {
+                flags.at_preserve = true;
+                idx += 1;
+            }
+            b'k' => {
+                flags.compound_keys = true;
+                idx += 1;
+            }
+            b'v' => {
+                flags.compound_values = true;
+                idx += 1;
+            }
             other => {
                 return Err(KashError::Parse(alloc::format!(
-                    "unsupported expansion flag `{}` (split/join/sort/case/quote families are wired in this commit; others follow)",
+                    "unsupported expansion flag `{}` (path-modifier / misc families come in the final sub-commit)",
                     other as char,
                 )));
             }
@@ -6320,13 +6558,22 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
     ))
 }
 
-/// Apply the flag-block transformations to `value` in zsh's
-/// fixed evaluation order: unquote → split → join → quote →
-/// case. The interior pipeline carries a `Vec<String>` so
-/// split + join compose naturally. `ExpansionFlags::is_empty`
-/// callers can skip this entirely.
+/// Apply the flag-block transformations to a single starting
+/// value. Wrapper over [`apply_expansion_flags_parts`] for
+/// call sites that haven't pre-split into an array.
 pub fn apply_expansion_flags(flags: &ExpansionFlags, value: String) -> String {
-    let mut parts: Vec<String> = alloc::vec![value];
+    apply_expansion_flags_parts(flags, alloc::vec![value])
+}
+
+/// Apply the flag-block transformations to `parts` in zsh's
+/// fixed evaluation order: unquote → split → join → quote →
+/// case. The caller-supplied `Vec<String>` is the starting
+/// "array" — multi-element inputs (e.g. compound `(k)` /
+/// `(v)`) go through here directly.
+pub fn apply_expansion_flags_parts(
+    flags: &ExpansionFlags,
+    mut parts: Vec<String>,
+) -> String {
     if matches!(flags.quote, Some(QuoteFlag::Unquote)) {
         for p in &mut parts {
             *p = dequote_value(p);
@@ -6360,10 +6607,15 @@ pub fn apply_expansion_flags(flags: &ExpansionFlags, value: String) -> String {
     // Join collapses the array back to a scalar. With no flag
     // we use an empty separator — kash's expansion contract is
     // "this returns one string" — but `(j…)` / `(F)` override.
+    // `(@)` widens that to a single space (the typical IFS
+    // first char) so each element stays field-splittable in
+    // unquoted contexts downstream.
     let sep = if let Some(j) = flags.join.as_deref() {
         j.to_string()
     } else if flags.f_join {
         "\n".to_string()
+    } else if flags.at_preserve {
+        " ".to_string()
     } else {
         String::new()
     };
@@ -12399,13 +12651,14 @@ mod tests {
 
     #[test]
     fn zsh_flag_unsupported_char_rejected() {
-        // `(P)` indirect is wired in a later sub-commit; until
-        // then unsupported characters must report a clear error.
-        let prog = parse("x=hi\necho \"${(P)x}\"\n").unwrap();
+        // `(g)` is a path-modifier-family flag still pending.
+        // Until the final sub-commit lands it, an unknown flag
+        // must report a clear error.
+        let prog = parse("x=hi\necho \"${(g)x}\"\n").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("P"), "got: {msg}");
+        assert!(msg.contains("g"), "got: {msg}");
     }
 
     #[test]
@@ -12510,6 +12763,87 @@ mod tests {
         // Numeric values come first; non-numeric ones land
         // after.
         assert_eq!(out, "1,3,foo\n");
+    }
+
+    // ===== zsh-style expansion flags (indirect/meta/compound) =====
+
+    #[test]
+    fn zsh_flag_p_indirect_lookup() {
+        let (_, out, _) = run("name=value\nref=name\necho \"${(P)ref}\"\n");
+        assert_eq!(out, "value\n");
+    }
+
+    #[test]
+    fn zsh_flag_t_type_scalar() {
+        let (_, out, _) = run("x=hi\necho \"${(t)x}\"\n");
+        assert_eq!(out, "scalar\n");
+    }
+
+    #[test]
+    fn zsh_flag_t_type_compound() {
+        let (_, out, _) = run("p.x=1\np.y=2\necho \"${(t)p}\"\n");
+        assert_eq!(out, "compound\n");
+    }
+
+    #[test]
+    fn zsh_flag_t_type_unset() {
+        let (_, out, _) = run("echo \"${(t)nothing}\"\n");
+        assert_eq!(out, "unset\n");
+    }
+
+    #[test]
+    fn zsh_flag_k_compound_member_names() {
+        let (_, out, _) = run(
+            "p.alpha=1\np.beta=2\np.gamma=3\necho \"${(kj.,.)p}\"\n",
+        );
+        assert_eq!(out, "alpha,beta,gamma\n");
+    }
+
+    #[test]
+    fn zsh_flag_v_compound_member_values() {
+        let (_, out, _) = run(
+            "p.x=10\np.y=20\np.z=30\necho \"${(vj.,.)p}\"\n",
+        );
+        assert_eq!(out, "10,20,30\n");
+    }
+
+    #[test]
+    fn zsh_flag_kv_interleaves_keys_and_values() {
+        let (_, out, _) = run(
+            "p.a=1\np.b=2\necho \"${(kvj.=.)p}\"\n",
+        );
+        // Stable order: a then b → "a=1=b=2".
+        assert_eq!(out, "a=1=b=2\n");
+    }
+
+    #[test]
+    fn zsh_flag_d_collapses_home_prefix() {
+        let (_, out, _) = run(
+            "HOME=/home/x\np=/home/x/projects\necho \"${(D)p}\"\n",
+        );
+        assert_eq!(out, "~/projects\n");
+    }
+
+    #[test]
+    fn zsh_flag_d_passthrough_when_no_home_prefix() {
+        let (_, out, _) = run(
+            "HOME=/home/x\np=/etc/passwd\necho \"${(D)p}\"\n",
+        );
+        assert_eq!(out, "/etc/passwd\n");
+    }
+
+    #[test]
+    fn zsh_flag_e_reexpands_value() {
+        let (_, out, _) = run(
+            "e=DOL\nexpr='hello $e world'\necho \"${(e)expr}\"\n",
+        );
+        assert_eq!(out, "hello DOL world\n");
+    }
+
+    #[test]
+    fn zsh_flag_at_widens_join_separator() {
+        let (_, out, _) = run("x=a,b,c\necho \"${(s.,.@)x}\"\n");
+        assert_eq!(out, "a b c\n");
     }
 
     #[test]
