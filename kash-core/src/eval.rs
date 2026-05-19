@@ -1283,6 +1283,7 @@ impl<B: MapBackend> Evaluator<B> {
             "source" | "." => self.builtin_source(&argv[1..]),
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
+            "printf" => self.builtin_printf(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1478,6 +1479,37 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(Outcome::Status(0))
     }
 
+    /// `printf FORMAT [ARG …]` — POSIX format-string output. The
+    /// format string honours `\n` / `\t` / `\r` / `\\` / `\0`
+    /// escapes; conversions cover `%s`, `%d` / `%i`, `%x`, `%o`,
+    /// `%c`, and `%%`. Width / precision modifiers are ignored
+    /// (the conversion char is what we dispatch on). Missing
+    /// arguments substitute the empty string for `%s` and zero
+    /// for numeric conversions; surplus arguments cycle the
+    /// format string until they're exhausted. Output streams into
+    /// the evaluator's stdout buffer like every other builtin.
+    fn builtin_printf(&mut self, args: &[String]) -> Result<Outcome> {
+        if args.is_empty() {
+            return Err(KashError::Runtime(
+                "printf: missing format string".into(),
+            ));
+        }
+        let format = printf_unescape(&args[0]);
+        let mut params = &args[1..];
+        loop {
+            let (chunk, consumed) = printf_format(&format, params)?;
+            self.output.push_str(&chunk);
+            if params.is_empty() || consumed == 0 {
+                break;
+            }
+            params = &params[consumed.min(params.len())..];
+            if params.is_empty() {
+                break;
+            }
+        }
+        Ok(Outcome::Status(0))
+    }
+
     /// `command [-v | -V] NAME [ARG …]` — POSIX bypass of the
     /// function / alias dispatch step. Two surface modes:
     ///
@@ -1619,6 +1651,7 @@ impl<B: MapBackend> Evaluator<B> {
             "source" | "." => self.builtin_source(&argv[1..]),
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
+            "printf" => self.builtin_printf(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -4378,6 +4411,7 @@ ifstd!({
             "source" | "." => self.builtin_source(&argv[1..]),
             "eval" => self.builtin_eval(&argv[1..]),
             "command" => self.builtin_command(&argv[1..]),
+            "printf" => self.builtin_printf(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -4886,9 +4920,120 @@ fn word_first_field_hint(w: &Word) -> String {
 }
 
 fn is_pure_output_builtin(name: &str) -> bool {
-    // `printf` would belong here once it lands as a builtin; for
-    // now `echo` is the practical case the bridge handles.
-    matches!(name, "echo" | ":" | "true" | "false" | "test" | "[")
+    matches!(name, "echo" | "printf" | ":" | "true" | "false" | "test" | "[")
+}
+
+/// Resolve POSIX `\` escape sequences inside the printf format
+/// string. Bash also honours these inside `%b` arguments; that
+/// extension can land alongside the conversion-side `%b`.
+fn printf_unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('0') => out.push('\0'),
+            Some('a') => out.push('\u{07}'),
+            Some('b') => out.push('\u{08}'),
+            Some('f') => out.push('\u{0c}'),
+            Some('v') => out.push('\u{0b}'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Apply `format` to `params` once, returning the rendered text
+/// and how many params were consumed. Width / precision are
+/// permitted in the format spec but currently *ignored* — only
+/// the conversion character drives output. Missing args
+/// substitute the empty string for `%s` and zero for numerics.
+fn printf_format(format: &str, params: &[String]) -> Result<(String, usize)> {
+    let mut out = String::new();
+    let mut p_idx: usize = 0;
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Collect flag / width / precision until we hit a letter.
+        let mut spec = String::new();
+        loop {
+            let Some(&n) = chars.peek() else {
+                break;
+            };
+            if n.is_ascii_alphabetic() || n == '%' {
+                chars.next();
+                spec.push(n);
+                break;
+            }
+            chars.next();
+            spec.push(n);
+        }
+        if spec.is_empty() {
+            out.push('%');
+            continue;
+        }
+        let conv = spec.chars().last().unwrap();
+        match conv {
+            '%' => out.push('%'),
+            's' => {
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                out.push_str(&v);
+            }
+            'c' => {
+                // %c: first char of the arg, empty for missing arg.
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                if let Some(ch) = v.chars().next() {
+                    out.push(ch);
+                }
+            }
+            'd' | 'i' => {
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                let n: i64 = v.trim().parse().unwrap_or(0);
+                out.push_str(&alloc::format!("{n}"));
+            }
+            'x' => {
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                let n: i64 = v.trim().parse().unwrap_or(0);
+                out.push_str(&alloc::format!("{n:x}"));
+            }
+            'X' => {
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                let n: i64 = v.trim().parse().unwrap_or(0);
+                out.push_str(&alloc::format!("{n:X}"));
+            }
+            'o' => {
+                let v = params.get(p_idx).cloned().unwrap_or_default();
+                p_idx += 1;
+                let n: i64 = v.trim().parse().unwrap_or(0);
+                out.push_str(&alloc::format!("{n:o}"));
+            }
+            _ => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "printf: unsupported conversion `%{conv}`"
+                )));
+            }
+        }
+    }
+    Ok((out, p_idx))
 }
 
 fn is_builtin_name(name: &str) -> bool {
@@ -4917,6 +5062,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "."
             | "eval"
             | "command"
+            | "printf"
     )
 }
 
@@ -9621,6 +9767,53 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== `printf` builtin =====
+
+    #[test]
+    fn printf_substitutes_s_conversion() {
+        let (_, out, _) = run("printf 'hello %s\\n' world\n");
+        assert_eq!(out, "hello world\n");
+    }
+
+    #[test]
+    fn printf_substitutes_d_conversion() {
+        let (_, out, _) = run("printf '%d\\n' 42\n");
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn printf_hex_and_octal() {
+        let (_, out, _) = run("printf '%x %o\\n' 255 8\n");
+        assert_eq!(out, "ff 10\n");
+    }
+
+    #[test]
+    fn printf_cycles_format_over_remaining_args() {
+        let (_, out, _) = run("printf '<%s>' a b c\n");
+        assert_eq!(out, "<a><b><c>");
+    }
+
+    #[test]
+    fn printf_missing_arg_substitutes_empty_or_zero() {
+        let (_, out, _) = run("printf '<%s|%d>\\n'\n");
+        assert_eq!(out, "<|0>\n");
+    }
+
+    #[test]
+    fn printf_percent_percent_literal() {
+        let (_, out, _) = run("printf '%%d=%d\\n' 7\n");
+        assert_eq!(out, "%d=7\n");
+    }
+
+    #[test]
+    fn printf_no_args_errors() {
+        let prog = parse("printf\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("missing format"), "got: {msg}");
     }
 
     // ===== `command` builtin =====
