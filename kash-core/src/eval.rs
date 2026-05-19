@@ -212,6 +212,15 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// that wants to route it elsewhere (a real `stderr` fd, a debug
     /// pane, …) can drain just this buffer.
     trace_output: String,
+    /// PID of the most-recently-spawned background job (the `$!`
+    /// special parameter). Zero before any `cmd &` has run.
+    last_bg_pid: i32,
+    /// Live background-job handles. Std-only because `Child` is
+    /// itself std. Kept just so each spawn doesn't immediately drop
+    /// the handle and orphan the process — full job-control
+    /// (`jobs`, `fg`, `bg`, `wait`) lands later.
+    #[cfg(feature = "std")]
+    background_jobs: Vec<std::process::Child>,
     /// Stderr-style diagnostic buffer for shell-emitted messages
     /// like `kash: cmd: command not found` and capability-denied
     /// notices. Distinct from `trace_output` (xtrace) because the
@@ -311,6 +320,9 @@ impl<B: MapBackend> Evaluator<B> {
             output: String::new(),
             trace_output: String::new(),
             stderr_output: String::new(),
+            last_bg_pid: 0,
+            #[cfg(feature = "std")]
+            background_jobs: Vec::new(),
             mode,
             positionals: Vec::new(),
             positionals_stack: Vec::new(),
@@ -724,9 +736,91 @@ impl<B: MapBackend> Evaluator<B> {
     }
 
     fn eval_statement(&mut self, stmt: &Statement) -> Result<Outcome> {
-        let outcome = self.eval_and_or(&stmt.list)?;
+        let outcome = match stmt.terminator {
+            crate::ast::Terminator::Background => self.eval_background(&stmt.list)?,
+            crate::ast::Terminator::Sync => self.eval_and_or(&stmt.list)?,
+        };
         self.last_status = outcome.status();
         Ok(outcome)
+    }
+
+    /// Run a list backgrounded. Minimum: the list is a single
+    /// simple external command; spawn it, record the PID as `$!`,
+    /// and return status 0 immediately. Other shapes
+    /// (builtin/function background, pipeline background, compound
+    /// background) raise an explicit "not yet supported" so the
+    /// limitation is visible.
+    fn eval_background(&mut self, list: &AndOrList) -> Result<Outcome> {
+        if !list.tail.is_empty() {
+            return Err(KashError::Runtime(
+                "backgrounding an `&&`/`||` list isn't supported yet".into(),
+            ));
+        }
+        let pipe = &list.head;
+        if pipe.stages.len() != 1 {
+            return Err(KashError::Runtime(
+                "backgrounding a pipeline isn't supported yet".into(),
+            ));
+        }
+        let crate::ast::Command::Simple(simple) = &pipe.stages[0] else {
+            return Err(KashError::Runtime(
+                "backgrounding a compound command isn't supported yet".into(),
+            ));
+        };
+        if !simple.redirects.is_empty() {
+            return Err(KashError::Runtime(
+                "backgrounding with redirects isn't supported yet".into(),
+            ));
+        }
+        let mut argv: Vec<String> = Vec::with_capacity(simple.words.len());
+        for w in &simple.words {
+            argv.extend(self.expand_word_to_fields(w)?);
+        }
+        if argv.is_empty() {
+            return Err(KashError::Runtime(
+                "background stage expanded to nothing".into(),
+            ));
+        }
+        let name = argv[0].clone();
+        if is_builtin_name(&name) || self.resolve_function_name(&name).is_some() {
+            return Err(KashError::Runtime(alloc::format!(
+                "backgrounding builtin / function `{name}` isn't supported yet"
+            )));
+        }
+        self.check_external_spawn(&name)?;
+        self.spawn_background(argv)
+    }
+
+    #[cfg(feature = "std")]
+    fn spawn_background(&mut self, argv: Vec<String>) -> Result<Outcome> {
+        use std::process::{Command, Stdio};
+        let resolved = resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
+        let mut cmd = Command::new(&resolved);
+        cmd.args(&argv[1..]);
+        self.apply_exported_env(&mut cmd);
+        // Detach stdin so the background process can't fight the
+        // foreground for terminal reads. stdout / stderr inherit
+        // so the user sees output the way real shells do.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        let child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                KashError::ExternalNotFound(argv[0].clone())
+            } else {
+                KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
+            }
+        })?;
+        self.last_bg_pid = child.id() as i32;
+        self.background_jobs.push(child);
+        Ok(Outcome::Status(0))
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn spawn_background(&mut self, _argv: Vec<String>) -> Result<Outcome> {
+        Err(KashError::Runtime(
+            "background jobs require the std feature".into(),
+        ))
     }
 
     fn eval_and_or(&mut self, list: &AndOrList) -> Result<Outcome> {
@@ -2675,6 +2769,9 @@ impl<B: MapBackend> Evaluator<B> {
             } else if next == '#' {
                 chars.next();
                 self.positionals.len().to_string()
+            } else if next == '!' {
+                chars.next();
+                self.last_bg_pid.to_string()
             } else if next == '$' {
                 chars.next();
                 "0".into()
@@ -2901,6 +2998,9 @@ impl<B: MapBackend> Evaluator<B> {
             } else if next == '#' {
                 chars.next();
                 out.push_str(&self.positionals.len().to_string());
+            } else if next == '!' {
+                chars.next();
+                out.push_str(&self.last_bg_pid.to_string());
             } else if next == '$' {
                 chars.next();
                 // Process ID — stable PID source needs `std::process::id`.
@@ -3497,6 +3597,9 @@ impl<B: MapBackend> Evaluator<B> {
         if name == "#" {
             return self.positionals.len().to_string();
         }
+        if name == "!" {
+            return self.last_bg_pid.to_string();
+        }
         if name.len() == 1
             && let Some(d) = name.chars().next().and_then(|c| c.to_digit(10))
         {
@@ -3538,6 +3641,9 @@ impl<B: MapBackend> Evaluator<B> {
         }
         if name == "#" {
             return Ok(self.positionals.len().to_string());
+        }
+        if name == "!" {
+            return Ok(self.last_bg_pid.to_string());
         }
         if name.len() == 1
             && let Some(d) = name.chars().next().and_then(|c| c.to_digit(10))
@@ -8222,6 +8328,40 @@ mod tests {
             let mut ev = Evaluator::new();
             ev.eval_program(&prog).unwrap();
             assert_eq!(ev.take_output().trim(), "4");
+        }
+
+        #[test]
+        fn background_external_command_spawns_and_sets_bang_pid() {
+            if !have("/bin/sleep") {
+                return;
+            }
+            let prog = parse("/bin/sleep 0 &\necho \"pid=$!\"\n").unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            let out = ev.take_output();
+            assert!(out.starts_with("pid="), "got: {out}");
+            // PID is some positive integer.
+            let pid_str = out.trim_start_matches("pid=").trim();
+            let pid: i32 = pid_str.parse().expect("numeric pid");
+            assert!(pid > 0);
+        }
+
+        #[test]
+        fn background_builtin_rejected() {
+            let prog = parse("echo hi &").unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("backgrounding builtin"), "got: {msg}");
+        }
+
+        #[test]
+        fn background_pipeline_rejected() {
+            let prog = parse("/bin/echo a | /bin/cat &").unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("backgrounding a pipeline"), "got: {msg}");
         }
 
         #[test]
