@@ -96,6 +96,11 @@ pub struct ShellOptions {
     /// to the trace buffer prefixed with the value of `PS4` (default
     /// `"+ "`) before running it.
     pub xtrace: bool,
+    /// `warn-integer-overflow` — when a value assigned to a typed
+    /// integer variable (`int8`, `uint32`, …) doesn't fit, emit a
+    /// warning to stderr noting the wrap. The wrap happens
+    /// regardless; this option just makes it audible.
+    pub warn_integer_overflow: bool,
 }
 
 /// One registered typeclass. Tracks both members that carry a
@@ -1571,15 +1576,27 @@ impl<B: MapBackend> Evaluator<B> {
         // we just persist them, and revisit when external exec lands.
         for a in &cmd.assignments {
             let value = self.expand_word(&a.value)?;
-            // Respect the `-i` attribute on the existing binding (if
-            // any): the right-hand side is evaluated as arithmetic
-            // before being stored.
-            let integer = self
+            // Pick up `-i` / primitive-numeric attributes from the
+            // existing binding (if any) so plain `a=300` honours a
+            // prior `int8 a=…` declaration. `numeric_type` implies
+            // `integer`: we run the RHS through arithmetic and
+            // then wrap.
+            let (integer, numeric_type) = self
                 .scope
                 .get_binding(&a.name)
-                .map(|b| b.attrs.integer)
-                .unwrap_or(false);
-            let value = if integer {
+                .map(|b| (b.attrs.integer, b.attrs.numeric_type))
+                .unwrap_or((false, None));
+            let value = if let Some(nt) = numeric_type {
+                let raw = i128::from(self.eval_arith(&value)?);
+                let wrapped = nt.wrap(raw);
+                if wrapped != raw && self.options.warn_integer_overflow {
+                    self.stderr_output.push_str(&alloc::format!(
+                        "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
+                        nt.name(),
+                    ));
+                }
+                alloc::format!("{wrapped}")
+            } else if integer {
                 let n = self.eval_arith(&value)?;
                 alloc::format!("{n}")
             } else {
@@ -1730,6 +1747,14 @@ impl<B: MapBackend> Evaluator<B> {
             "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
             "export" => self.builtin_export(&argv[1..]),
             "use" => self.builtin_use(&argv[1..]),
+            name if crate::scope::NumericType::from_name(name).is_some() => {
+                // Bare primitive-type declaration form, e.g.
+                // `int8 x=42` — treated as `typeset int8 x=42` so
+                // the same attribute + wrap pipeline runs. The
+                // type-name stays at `argv[0]` for the inner
+                // parser to consume.
+                self.builtin_typeset(&argv)
+            }
             _ => self.run_external(&argv),
         }
     }
@@ -1840,6 +1865,7 @@ impl<B: MapBackend> Evaluator<B> {
             "nounset" => self.options.nounset = on,
             "pipefail" => self.options.pipefail = on,
             "xtrace" => self.options.xtrace = on,
+            "warn-integer-overflow" => self.options.warn_integer_overflow = on,
             other => {
                 return Err(KashError::Runtime(alloc::format!(
                     "set -o: unknown option `{other}`"
@@ -2402,6 +2428,9 @@ impl<B: MapBackend> Evaluator<B> {
             "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
             "export" => self.builtin_export(&argv[1..]),
             "use" => self.builtin_use(&argv[1..]),
+            name if crate::scope::NumericType::from_name(name).is_some() => {
+                self.builtin_typeset(&argv)
+            }
             other => Err(KashError::Runtime(alloc::format!(
                 "command: `{other}` is not a known builtin"
             ))),
@@ -2641,6 +2670,16 @@ impl<B: MapBackend> Evaluator<B> {
                 i += 1;
                 break;
             }
+            // Bare primitive type-name positions before operands,
+            // e.g. `typeset int8 x=42` / `typeset uint32 -r n`.
+            // The name is consumed *as an attribute*, not as a
+            // target.
+            if let Some(nt) = crate::scope::NumericType::from_name(a) {
+                attrs.numeric_type = Some(nt);
+                attrs.integer = true;
+                i += 1;
+                continue;
+            }
             if let Some(rest) = a.strip_prefix('-') {
                 if rest.is_empty() {
                     i += 1;
@@ -2800,7 +2839,21 @@ impl<B: MapBackend> Evaluator<B> {
         attrs: &AttrSet,
         value: String,
     ) -> Result<String> {
-        let value = if attrs.integer {
+        let value = if let Some(nt) = attrs.numeric_type {
+            // Typed integer: evaluate the RHS as arithmetic, then
+            // wrap to the type's range. Wrap-on-overflow is the
+            // policy; surfacing the wrap as a warning is gated on
+            // the `warn-integer-overflow` set option.
+            let raw = i128::from(self.eval_arith(&value)?);
+            let wrapped = nt.wrap(raw);
+            if wrapped != raw && self.options.warn_integer_overflow {
+                self.stderr_output.push_str(&alloc::format!(
+                    "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
+                    nt.name(),
+                ));
+            }
+            alloc::format!("{wrapped}")
+        } else if attrs.integer {
             let n = self.eval_arith(&value)?;
             alloc::format!("{n}")
         } else {
@@ -5296,6 +5349,9 @@ ifstd!({
                 "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
                 "export" => self.builtin_export(&argv[1..]),
                 "use" => self.builtin_use(&argv[1..]),
+                name if crate::scope::NumericType::from_name(name).is_some() => {
+                    self.builtin_typeset(&argv)
+                }
                 other => Err(KashError::Runtime(alloc::format!(
                     "internal: dispatch_builtin called for `{other}`"
                 ))),
@@ -5912,6 +5968,9 @@ fn printf_format(format: &str, params: &[String]) -> Result<(String, usize)> {
 }
 
 fn is_builtin_name(name: &str) -> bool {
+    if crate::scope::NumericType::from_name(name).is_some() {
+        return true;
+    }
     matches!(
         name,
         ":" | "true"
@@ -11086,6 +11145,67 @@ mod tests {
             "typedef T { function helper { :; }; }\n",
         );
         assert!(res.is_err(), "expected parse error for typedef method");
+    }
+
+    // ===== primitive numeric types (typed integers) =====
+
+    #[test]
+    fn typed_int8_wraps_on_overflow() {
+        let (_, out, _) = run("int8 a=300\necho $a\n");
+        // 300 mod 256, signed → 44 (i.e. (300 as i8) as i64).
+        assert_eq!(out, "44\n");
+    }
+
+    #[test]
+    fn typed_uint8_wraps_negative_to_modular() {
+        let (_, out, _) = run("uint8 c=-1\necho $c\n");
+        assert_eq!(out, "255\n");
+    }
+
+    #[test]
+    fn typed_int_carries_through_subsequent_assignment() {
+        // Once `a` has the int8 attribute, plain `a=300` still
+        // routes through the wrap path — the type is sticky.
+        let (_, out, _) = run("int8 a=0\na=300\necho $a\n");
+        assert_eq!(out, "44\n");
+    }
+
+    #[test]
+    fn typed_uint16_wraps_arithmetic_result() {
+        let (_, out, _) = run("uint16 u=65535\nu=$((u + 1))\necho $u\n");
+        assert_eq!(out, "0\n");
+    }
+
+    #[test]
+    fn typed_int32_min_via_wrap() {
+        // 2_147_483_648 is one past i32::MAX → wraps to i32::MIN.
+        let (_, out, _) = run("int32 b=2147483648\necho $b\n");
+        assert_eq!(out, "-2147483648\n");
+    }
+
+    #[test]
+    fn typeset_form_accepts_primitive_type_name() {
+        // `typeset int8 x=…` produces the same result as the bare
+        // `int8 x=…` declarative form.
+        let (_, out, _) = run("typeset int8 a=300\necho $a\n");
+        assert_eq!(out, "44\n");
+    }
+
+    #[test]
+    fn warn_integer_overflow_emits_to_stderr() {
+        let (_, _out, mut ev) = run(
+            "set -o warn-integer-overflow\nint8 a=300\nint8 b=42\n",
+        );
+        let err = ev.take_stderr();
+        assert!(err.contains("int8"), "stderr was: {err}");
+        assert!(err.contains("300"), "stderr was: {err}");
+    }
+
+    #[test]
+    fn warn_integer_overflow_silent_by_default() {
+        let (_, _out, mut ev) = run("int8 a=300\n");
+        let err = ev.take_stderr();
+        assert_eq!(err, "");
     }
 
     // ===== compound member access =====

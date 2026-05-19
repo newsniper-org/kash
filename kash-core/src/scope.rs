@@ -51,6 +51,95 @@ impl Binding {
     }
 }
 
+/// Built-in primitive integer types — the half of kash's numeric
+/// type set that lands in this commit. Float and complex variants
+/// come in a follow-up. Stored on [`AttrSet::numeric_type`]; the
+/// arithmetic engine wraps store-time values to the type's range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericType {
+    /// 8-bit signed.
+    Int8,
+    /// 16-bit signed.
+    Int16,
+    /// 32-bit signed.
+    Int32,
+    /// 64-bit signed (the default for `typeset -i`).
+    Int64,
+    /// 128-bit signed.
+    Int128,
+    /// 8-bit unsigned.
+    UInt8,
+    /// 16-bit unsigned.
+    UInt16,
+    /// 32-bit unsigned.
+    UInt32,
+    /// 64-bit unsigned.
+    UInt64,
+    /// 128-bit unsigned (stored as `i128`; values above
+    /// `i128::MAX` round-trip into negative, matching the
+    /// shell's wrap-on-overflow policy).
+    UInt128,
+}
+
+impl NumericType {
+    /// Parse the kash spelling of a primitive integer type.
+    /// Returns `None` for anything we don't (yet) recognise.
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "int8" => Self::Int8,
+            "int16" => Self::Int16,
+            "int32" => Self::Int32,
+            "int64" => Self::Int64,
+            "int128" => Self::Int128,
+            "uint8" => Self::UInt8,
+            "uint16" => Self::UInt16,
+            "uint32" => Self::UInt32,
+            "uint64" => Self::UInt64,
+            "uint128" => Self::UInt128,
+            _ => return None,
+        })
+    }
+
+    /// Wrap `v` into this type's representable range and return
+    /// the canonical `i128` round-trip. Lossy on overflow — that
+    /// matches ksh93's `typeset -i` wrap semantics and is what
+    /// the `warn-integer-overflow` option flags.
+    #[must_use]
+    pub fn wrap(self, v: i128) -> i128 {
+        match self {
+            Self::Int8 => (v as i8) as i128,
+            Self::Int16 => (v as i16) as i128,
+            Self::Int32 => (v as i32) as i128,
+            Self::Int64 => (v as i64) as i128,
+            Self::Int128 => v,
+            Self::UInt8 => i128::from(v as u8),
+            Self::UInt16 => i128::from(v as u16),
+            Self::UInt32 => i128::from(v as u32),
+            Self::UInt64 => i128::from(v as u64),
+            Self::UInt128 => v,
+        }
+    }
+
+    /// Canonical lowercase name (`"int32"`, `"uint8"`, …).
+    /// Symmetric to [`Self::from_name`].
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "int8",
+            Self::Int16 => "int16",
+            Self::Int32 => "int32",
+            Self::Int64 => "int64",
+            Self::Int128 => "int128",
+            Self::UInt8 => "uint8",
+            Self::UInt16 => "uint16",
+            Self::UInt32 => "uint32",
+            Self::UInt64 => "uint64",
+            Self::UInt128 => "uint128",
+        }
+    }
+}
+
 /// `typeset`-style attribute set. Variant fields cover the ksh93
 /// surface we ship in this commit; the rest of the ksh93 surface
 /// (`-n` nameref, `-T` user-defined types) is named but inactive in
@@ -83,6 +172,12 @@ pub struct AttrSet {
     /// `-T` — user-defined type. Holds the type's name. **Not yet
     /// wired**; reserved for the typeclass / OOP integration.
     pub pending_typedef: Option<String>,
+    /// Primitive numeric type the binding has been declared as
+    /// (`int32`, `uint8`, …). Drives store-time arithmetic wrap
+    /// and (when `warn-integer-overflow` is on) the overflow
+    /// warning. `None` for untyped string variables. Implies
+    /// `integer = true` for the assignment path.
+    pub numeric_type: Option<NumericType>,
 }
 
 impl AttrSet {
@@ -103,6 +198,9 @@ impl AttrSet {
         }
         if other.pending_typedef.is_some() {
             self.pending_typedef = other.pending_typedef.clone();
+        }
+        if other.numeric_type.is_some() {
+            self.numeric_type = other.numeric_type;
         }
     }
 
