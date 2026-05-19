@@ -360,6 +360,9 @@ impl<'src> Parser<'src> {
         if self.peek_bare_word()? == Some("venv") {
             return self.parse_venv_decl().map(Command::Compound);
         }
+        if self.peek_bare_word()? == Some("typedef") {
+            return self.parse_typedef_decl().map(Command::Compound);
+        }
         // Function-definition dispatch (must come before reserved-word
         // dispatch so e.g. `function for` falls through to a proper
         // error rather than tripping the `for` arm).
@@ -804,6 +807,100 @@ impl<'src> Parser<'src> {
             redirects,
             span: Span::new(start, end),
         })
+    }
+
+    // ---------- typedef ----------
+
+    /// Parse `typedef NAME { member=default; … }` (type
+    /// definition) or `typedef NAME var` (instance creation).
+    /// kash's surface for ksh93's `typeset -T` — split into two
+    /// forms because `=(…)` isn't part of our regular word grammar.
+    fn parse_typedef_decl(&mut self) -> Result<CompoundCommand> {
+        let kw = self.bump()?;
+        let start = kw.span.start;
+        let name = self.expect_bare_identifier("typedef name")?;
+        // Definition form: `typedef NAME { member=default; … }`
+        if matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
+            self.bump()?;
+            let mut members: Vec<(String, Word)> = Vec::new();
+            loop {
+                self.skip_newlines()?;
+                if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
+                    break;
+                }
+                if matches!(self.peek_kind()?, TokenKind::Eof) {
+                    return Err(KashError::Parse(
+                        "unterminated `typedef { … }` block".into(),
+                    ));
+                }
+                // Each entry: `NAME=DEFAULT` as a single Word —
+                // lexer keeps `=` inside word bytes.
+                let token = self.parse_word()?;
+                let raw = match token.segments.first() {
+                    Some(WordSegment::Bare(s)) => s.clone(),
+                    _ => {
+                        return Err(KashError::Parse(
+                            "typedef member must be `NAME=DEFAULT`".into(),
+                        ));
+                    }
+                };
+                let Some(eq) = raw.find('=') else {
+                    return Err(KashError::Parse(alloc::format!(
+                        "typedef member `{raw}` missing `=DEFAULT`"
+                    )));
+                };
+                let member_name = raw[..eq].to_string();
+                let default_text = raw[eq + 1..].to_string();
+                if !is_valid_identifier(&member_name) {
+                    return Err(KashError::Parse(alloc::format!(
+                        "typedef member name `{member_name}` is invalid"
+                    )));
+                }
+                let mut default_segments = Vec::new();
+                if !default_text.is_empty() {
+                    default_segments.push(WordSegment::Bare(default_text));
+                }
+                for s in token.segments.into_iter().skip(1) {
+                    default_segments.push(s);
+                }
+                let default_word = Word {
+                    segments: default_segments,
+                    span: token.span,
+                };
+                members.push((member_name, default_word));
+                if matches!(
+                    self.peek_kind()?,
+                    TokenKind::Op(Op::Semi) | TokenKind::Newline
+                ) {
+                    self.bump()?;
+                }
+            }
+            let close = self.bump()?;
+            let redirects = self.parse_trailing_redirects()?;
+            let end = redirects.last().map_or(close.span.end, |r| r.span.end);
+            return Ok(CompoundCommand {
+                kind: CompoundKind::TypeDef { name, members },
+                redirects,
+                span: Span::new(start, end),
+            });
+        }
+        // Instance form: `typedef NAME var`
+        if matches!(self.peek_kind()?, TokenKind::Word(_)) {
+            let var_name = self.expect_bare_identifier("typedef instance var name")?;
+            let redirects = self.parse_trailing_redirects()?;
+            let end = redirects.last().map_or(start, |r| r.span.end);
+            return Ok(CompoundCommand {
+                kind: CompoundKind::TypeInstance {
+                    type_name: name,
+                    var_name,
+                },
+                redirects,
+                span: Span::new(start, end),
+            });
+        }
+        Err(KashError::Parse(
+            "expected `{` (type body) or VAR name after `typedef NAME`".into(),
+        ))
     }
 
     // ---------- venv ----------

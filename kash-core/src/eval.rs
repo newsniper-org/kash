@@ -215,6 +215,11 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// PID of the most-recently-spawned background job (the `$!`
     /// special parameter). Zero before any `cmd &` has run.
     last_bg_pid: i32,
+    /// User-defined type registry — `typedef NAME { … }`. Each
+    /// entry stores the member list with default-value words; an
+    /// instance (`typedef NAME var`) copies those defaults into
+    /// `var.member` bindings on creation.
+    type_defs: alloc::collections::BTreeMap<String, Vec<(String, crate::ast::Word)>>,
     /// Effective stdin for *external* commands inside the active
     /// compound body. Set by `{ … } < file` (and similar) on
     /// enter; restored on exit. The spawn paths consult this
@@ -329,6 +334,7 @@ impl<B: MapBackend> Evaluator<B> {
             trace_output: String::new(),
             stderr_output: String::new(),
             last_bg_pid: 0,
+            type_defs: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "std")]
             compound_input: None,
             #[cfg(feature = "std")]
@@ -2818,6 +2824,28 @@ impl<B: MapBackend> Evaluator<B> {
             CompoundKind::ModeDecl { spec, form } => self.eval_mode_decl(spec, form),
             CompoundKind::VenvDecl { name, sections } => {
                 self.eval_venv_decl(name, sections)
+            }
+            CompoundKind::TypeDef { name, members } => {
+                self.type_defs.insert(name.clone(), members.clone());
+                Ok(Outcome::Status(0))
+            }
+            CompoundKind::TypeInstance { type_name, var_name } => {
+                let members = self
+                    .type_defs
+                    .get(type_name)
+                    .ok_or_else(|| {
+                        KashError::NotFound(alloc::format!(
+                            "type `{type_name}` (use `typedef {type_name} {{ … }}` first)"
+                        ))
+                    })?
+                    .clone();
+                for (member, default) in members {
+                    let value = self.expand_word(&default)?;
+                    let binding_name = alloc::format!("{var_name}.{member}");
+                    let target = self.qualify_var_for_write(&binding_name);
+                    self.scope.assign(&target, Value::Scalar(value))?;
+                }
+                Ok(Outcome::Status(0))
             }
         }
     }
@@ -10242,6 +10270,42 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== `typedef` (user-defined type) =====
+
+    #[test]
+    fn typedef_instance_copies_defaults() {
+        let (_, out, _) = run(
+            "typedef Point { x=1; y=2; }\ntypedef Point p\necho \"${p.x} ${p.y}\"\n",
+        );
+        assert_eq!(out, "1 2\n");
+    }
+
+    #[test]
+    fn typedef_instance_members_writable() {
+        let (_, out, _) = run(
+            "typedef Pair { a=0; b=0; }\ntypedef Pair p\np.a=10\np.b=20\necho \"${p.a},${p.b}\"\n",
+        );
+        assert_eq!(out, "10,20\n");
+    }
+
+    #[test]
+    fn typedef_unknown_type_errors() {
+        // Declarative NotFound (not an external-command miss) —
+        // propagates as `Err(NotFound)` so scripts can't proceed
+        // past a typo in a type name.
+        let prog = parse("typedef NoSuch v\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("NoSuch"), "got: {msg}");
+    }
+
+    #[test]
+    fn typedef_definition_alone_succeeds() {
+        let (outcome, _, _) = run("typedef Foo { a=1; b=2; }\n");
+        assert_eq!(outcome.status(), 0);
     }
 
     // ===== compound member access =====

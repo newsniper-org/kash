@@ -287,6 +287,27 @@ pub enum CompoundKind {
         /// Sections in source order.
         sections: Vec<VenvSection>,
     },
+    /// A `typedef NAME { member=default; … }` declaration —
+    /// kash's surface for ksh93's `typeset -T` user-defined
+    /// types. The body lists members with default values; the
+    /// declaration registers `NAME` so subsequent `typedef NAME
+    /// var` instances copy the defaults into `var.member`
+    /// bindings.
+    TypeDef {
+        /// Type name.
+        name: String,
+        /// `(member-name, default-value)` pairs in source order.
+        members: Vec<(String, Word)>,
+    },
+    /// `typedef NAME var` — instance of a previously-defined
+    /// type. Evaluation copies each `member=default` from the
+    /// type's body into `var.<member>` bindings.
+    TypeInstance {
+        /// Name of the previously-defined type.
+        type_name: String,
+        /// Variable name to bind.
+        var_name: String,
+    },
     /// A `mode` declaration. Three source forms, all carried by the
     /// [`ModeForm`] tag:
     ///
