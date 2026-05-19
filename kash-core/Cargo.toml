@@ -26,6 +26,10 @@ kash-macros = { path = "../kash-macros", default-features = false }
 # format — never executable, never source-able. Std-only because
 # `toml` itself needs std.
 toml = { version = "0.8", optional = true, default-features = false, features = ["parse"] }
+# Half-precision floats: `f16` (IEEE 754 binary16) and `bf16`
+# (Google Brain bfloat16). no_std-compatible, used by the typed
+# float primitives (float16 / bfloat16).
+half = { version = "2", default-features = false }
 
 [dev-dependencies]
 # Used by the backend-comparison integration test in `tests/`. The

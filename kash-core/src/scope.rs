@@ -79,6 +79,16 @@ pub enum NumericType {
     /// `i128::MAX` round-trip into negative, matching the
     /// shell's wrap-on-overflow policy).
     UInt128,
+    /// IEEE 754 binary16 (`f16` via the `half` crate). Half
+    /// precision — round-tripped through `half::f16` on store.
+    Float16,
+    /// IEEE 754 binary32 (`f32`).
+    Float32,
+    /// IEEE 754 binary64 (`f64`) — kash's default float.
+    Float64,
+    /// Google Brain bfloat16 (`bf16` via the `half` crate) —
+    /// same exponent as `f32`, narrower mantissa, ML-friendly.
+    BFloat16,
 }
 
 impl NumericType {
@@ -97,14 +107,44 @@ impl NumericType {
             "uint32" => Self::UInt32,
             "uint64" => Self::UInt64,
             "uint128" => Self::UInt128,
+            "float16" => Self::Float16,
+            "float32" => Self::Float32,
+            "float64" => Self::Float64,
+            "bfloat16" => Self::BFloat16,
             _ => return None,
         })
+    }
+
+    /// True iff this type is an integer (not a float). Drives the
+    /// "wrap on store" branch in [`crate::eval::Evaluator`].
+    #[must_use]
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Int16
+                | Self::Int32
+                | Self::Int64
+                | Self::Int128
+                | Self::UInt8
+                | Self::UInt16
+                | Self::UInt32
+                | Self::UInt64
+                | Self::UInt128
+        )
+    }
+
+    /// True iff this type is a float.
+    #[must_use]
+    pub fn is_float(self) -> bool {
+        !self.is_integer()
     }
 
     /// Wrap `v` into this type's representable range and return
     /// the canonical `i128` round-trip. Lossy on overflow — that
     /// matches ksh93's `typeset -i` wrap semantics and is what
-    /// the `warn-integer-overflow` option flags.
+    /// the `warn-integer-overflow` option flags. Float variants
+    /// panic: callers must consult [`Self::is_integer`] first.
     #[must_use]
     pub fn wrap(self, v: i128) -> i128 {
         match self {
@@ -118,6 +158,25 @@ impl NumericType {
             Self::UInt32 => i128::from(v as u32),
             Self::UInt64 => i128::from(v as u64),
             Self::UInt128 => v,
+            Self::Float16 | Self::Float32 | Self::Float64 | Self::BFloat16 => {
+                panic!("NumericType::wrap called on a float type — use project_float")
+            }
+        }
+    }
+
+    /// Project a `f64` value into this float type's precision
+    /// and return the round-trip. For `float64` this is a no-op;
+    /// `float32` round-trips through `f32`; `float16` and
+    /// `bfloat16` round-trip through `half::f16` and `half::bf16`
+    /// respectively. Integer variants panic.
+    #[must_use]
+    pub fn project_float(self, v: f64) -> f64 {
+        match self {
+            Self::Float64 => v,
+            Self::Float32 => v as f32 as f64,
+            Self::Float16 => f64::from(half::f16::from_f64(v)),
+            Self::BFloat16 => f64::from(half::bf16::from_f64(v)),
+            _ => panic!("NumericType::project_float called on an integer type"),
         }
     }
 
@@ -136,6 +195,10 @@ impl NumericType {
             Self::UInt32 => "uint32",
             Self::UInt64 => "uint64",
             Self::UInt128 => "uint128",
+            Self::Float16 => "float16",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+            Self::BFloat16 => "bfloat16",
         }
     }
 }

@@ -1587,15 +1587,24 @@ impl<B: MapBackend> Evaluator<B> {
                 .map(|b| (b.attrs.integer, b.attrs.numeric_type))
                 .unwrap_or((false, None));
             let value = if let Some(nt) = numeric_type {
-                let raw = i128::from(self.eval_arith(&value)?);
-                let wrapped = nt.wrap(raw);
-                if wrapped != raw && self.options.warn_integer_overflow {
-                    self.stderr_output.push_str(&alloc::format!(
-                        "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
-                        nt.name(),
-                    ));
+                if nt.is_integer() {
+                    let raw = i128::from(self.eval_arith(&value)?);
+                    let wrapped = nt.wrap(raw);
+                    if wrapped != raw && self.options.warn_integer_overflow {
+                        self.stderr_output.push_str(&alloc::format!(
+                            "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
+                            nt.name(),
+                        ));
+                    }
+                    alloc::format!("{wrapped}")
+                } else {
+                    let raw = match value.trim().parse::<f64>() {
+                        Ok(f) => f,
+                        Err(_) => self.eval_arith(&value)? as f64,
+                    };
+                    let projected = nt.project_float(raw);
+                    format_float_value(projected)
                 }
-                alloc::format!("{wrapped}")
             } else if integer {
                 let n = self.eval_arith(&value)?;
                 alloc::format!("{n}")
@@ -2840,19 +2849,34 @@ impl<B: MapBackend> Evaluator<B> {
         value: String,
     ) -> Result<String> {
         let value = if let Some(nt) = attrs.numeric_type {
-            // Typed integer: evaluate the RHS as arithmetic, then
-            // wrap to the type's range. Wrap-on-overflow is the
-            // policy; surfacing the wrap as a warning is gated on
-            // the `warn-integer-overflow` set option.
-            let raw = i128::from(self.eval_arith(&value)?);
-            let wrapped = nt.wrap(raw);
-            if wrapped != raw && self.options.warn_integer_overflow {
-                self.stderr_output.push_str(&alloc::format!(
-                    "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
-                    nt.name(),
-                ));
+            if nt.is_integer() {
+                // Typed integer: evaluate the RHS as arithmetic,
+                // then wrap to the type's range. Wrap-on-overflow
+                // is the policy; surfacing the wrap as a warning
+                // is gated on the `warn-integer-overflow` set
+                // option.
+                let raw = i128::from(self.eval_arith(&value)?);
+                let wrapped = nt.wrap(raw);
+                if wrapped != raw && self.options.warn_integer_overflow {
+                    self.stderr_output.push_str(&alloc::format!(
+                        "kash: warning: value {raw} wrapped to {wrapped} for type `{}`\n",
+                        nt.name(),
+                    ));
+                }
+                alloc::format!("{wrapped}")
+            } else {
+                // Typed float: parse the RHS as `f64`, falling
+                // back to the arithmetic engine for integer-only
+                // forms like `$((2 + 3))`. Project to the type's
+                // precision and format back. No overflow warning
+                // — IEEE 754 already encodes Inf / NaN on its own.
+                let raw = match value.trim().parse::<f64>() {
+                    Ok(f) => f,
+                    Err(_) => self.eval_arith(&value)? as f64,
+                };
+                let projected = nt.project_float(raw);
+                format_float_value(projected)
             }
-            alloc::format!("{wrapped}")
         } else if attrs.integer {
             let n = self.eval_arith(&value)?;
             alloc::format!("{n}")
@@ -5965,6 +5989,27 @@ fn printf_format(format: &str, params: &[String]) -> Result<(String, usize)> {
         }
     }
     Ok((out, p_idx))
+}
+
+/// Render a `f64` for storage in a kash variable. Special-cases
+/// NaN / ±Inf to ksh93's lowercase spellings (`nan`, `inf`,
+/// `-inf`) and prints whole-valued floats as `N.0` so the result
+/// round-trips back through `parse::<f64>()`.
+fn format_float_value(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    // `{v}` for an exact integer like 3.0 prints as "3", which
+    // would lose the float-ness on re-parse. Keep `.0` in that
+    // case so the type identity round-trips.
+    let s = alloc::format!("{v}");
+    if !s.contains(['.', 'e', 'E', 'n', 'i']) {
+        return alloc::format!("{s}.0");
+    }
+    s
 }
 
 fn is_builtin_name(name: &str) -> bool {
@@ -11206,6 +11251,60 @@ mod tests {
         let (_, _out, mut ev) = run("int8 a=300\n");
         let err = ev.take_stderr();
         assert_eq!(err, "");
+    }
+
+    // ===== primitive numeric types (typed floats) =====
+
+    #[test]
+    fn typed_float64_stores_exactly() {
+        let (_, out, _) = run("float64 b=2.718281828459045\necho $b\n");
+        assert_eq!(out, "2.718281828459045\n");
+    }
+
+    #[test]
+    fn typed_float32_rounds_through_f32() {
+        // 3.14 doesn't round-trip exactly through f32 — it lands
+        // on the closest binary32, 3.14000010490417…
+        let (_, out, _) = run("float32 a=3.14\necho $a\n");
+        assert!(
+            out.starts_with("3.140000"),
+            "expected f32 round-trip near 3.14, got: {out}",
+        );
+    }
+
+    #[test]
+    fn typed_float16_rounds_through_half_precision() {
+        // 0.1 → nearest f16 is 0.09997558593750…
+        let (_, out, _) = run("float16 c=0.1\necho $c\n");
+        assert!(
+            out.starts_with("0.099"),
+            "expected f16 round-trip near 0.1, got: {out}",
+        );
+    }
+
+    #[test]
+    fn typed_bfloat16_stores_exactly_for_powers_of_two() {
+        let (_, out, _) = run("bfloat16 d=0.5\necho $d\n");
+        assert_eq!(out, "0.5\n");
+    }
+
+    #[test]
+    fn typed_float_accepts_integer_arithmetic_rhs() {
+        let (_, out, _) = run("float32 e=$((2 + 3))\necho $e\n");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn typed_float_handles_negative() {
+        let (_, out, _) = run("float64 n=-1.25\necho $n\n");
+        assert_eq!(out, "-1.25\n");
+    }
+
+    #[test]
+    fn typed_float_carries_through_subsequent_assignment() {
+        // Like the int case, the float type is sticky.
+        let (_, out, _) = run("float32 a=0.0\na=3.14\necho $a\n");
+        assert!(out.starts_with("3.140000"), "got: {out}");
     }
 
     // ===== compound member access =====
