@@ -944,6 +944,7 @@ impl<B: MapBackend> Evaluator<B> {
             "local" => self.builtin_local(&argv[1..]),
             "read" => self.builtin_read(&argv[1..]),
             "source" | "." => self.builtin_source(&argv[1..]),
+            "eval" => self.builtin_eval(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1137,6 +1138,26 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign_local(&name, Value::Scalar(value))?;
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `eval ARGS …` — join the args with spaces, parse the result
+    /// as kash source, and evaluate in the current scope. Blocked
+    /// under the `-secure` modifier per the locked security policy
+    /// (`project_kash_security_policy.md`).
+    fn builtin_eval(&mut self, args: &[String]) -> Result<Outcome> {
+        use crate::collections::SetStorage;
+        if self.mode.modifiers.contains(&crate::mode::Modifier::Secure) {
+            return Err(KashError::SecureViolation(
+                "`eval` is disabled under the `-secure` modifier".into(),
+            ));
+        }
+        if args.is_empty() {
+            return Ok(Outcome::Status(0));
+        }
+        let source = args.join(" ");
+        let prog = crate::parser::parse(&source)
+            .map_err(|e| KashError::Parse(alloc::format!("eval: {e}")))?;
+        self.eval_program(&prog)
     }
 
     /// `source PATH` / `. PATH` — read PATH and evaluate its
@@ -3842,6 +3863,7 @@ ifstd!({
                 "local" => self.builtin_local(&argv[1..]),
             "read" => self.builtin_read(&argv[1..]),
             "source" | "." => self.builtin_source(&argv[1..]),
+            "eval" => self.builtin_eval(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -4109,6 +4131,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "read"
             | "source"
             | "."
+            | "eval"
     )
 }
 
@@ -8619,6 +8642,45 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== `eval` builtin =====
+
+    #[test]
+    fn eval_runs_joined_source() {
+        let (_, out, _) = run("eval 'x=42; echo $x'\n");
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn eval_joins_multiple_args_with_spaces() {
+        let (_, out, _) = run("eval 'echo' 'a' 'b'\n");
+        assert_eq!(out, "a b\n");
+    }
+
+    #[test]
+    fn eval_no_args_succeeds_silently() {
+        let (outcome, out, _) = run("eval\n");
+        assert_eq!(outcome.status(), 0);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn eval_blocked_under_secure_modifier() {
+        let src = "mode default-secure\neval 'echo blocked'\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("-secure"), "got: {msg}");
+    }
+
+    #[test]
+    fn eval_propagates_status() {
+        let (outcome, _, _) = run("eval 'true'\n");
+        assert_eq!(outcome.status(), 0);
+        let (outcome, _, _) = run("eval 'false'\n");
+        assert_eq!(outcome.status(), 1);
     }
 
     // ===== `source` / `.` builtin =====
