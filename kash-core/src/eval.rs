@@ -6111,6 +6111,24 @@ pub struct ExpansionFlags {
     /// 3 → double-quoted form, 4 → `$'…'` form. `(Q)` strips
     /// shell quoting.
     quote: Option<QuoteFlag>,
+    /// `(s.D.)` — split the value on the literal delimiter
+    /// captured between the paired delim characters. Empty
+    /// string means "split on every character".
+    split: Option<String>,
+    /// `(j.D.)` — join the multi-element result with this
+    /// separator. Without this flag, a split's array result is
+    /// re-joined on `""` so the expansion still surfaces as a
+    /// single string.
+    join: Option<String>,
+    /// `(f)` — convenience for `(s.\n.)` (split on newlines).
+    f_split: bool,
+    /// `(F)` — convenience for `(j.\n.)` (join on newlines).
+    f_join: bool,
+    /// `(z)` — split into shell tokens. v1 collapses this to
+    /// whitespace-aware shell-like splitting that respects
+    /// single / double quotes; full shell-grammar tokenisation
+    /// arrives with the lexer-driven implementation.
+    z_split: bool,
 }
 
 impl ExpansionFlags {
@@ -6118,7 +6136,13 @@ impl ExpansionFlags {
     /// (e.g. the mode gate) skip work when no flag actually
     /// asked for anything.
     pub fn is_empty(&self) -> bool {
-        self.case.is_none() && self.quote.is_none()
+        self.case.is_none()
+            && self.quote.is_none()
+            && self.split.is_none()
+            && self.join.is_none()
+            && !self.f_split
+            && !self.f_join
+            && !self.z_split
     }
 }
 
@@ -6211,9 +6235,33 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
                 q_count = q_count.saturating_add(1);
                 idx += 1;
             }
+            b's' => {
+                idx += 1;
+                let (delim, next) = read_paired_delim_arg(after, idx, 's')?;
+                flags.split = Some(delim);
+                idx = next;
+            }
+            b'j' => {
+                idx += 1;
+                let (delim, next) = read_paired_delim_arg(after, idx, 'j')?;
+                flags.join = Some(delim);
+                idx = next;
+            }
+            b'f' => {
+                flags.f_split = true;
+                idx += 1;
+            }
+            b'F' => {
+                flags.f_join = true;
+                idx += 1;
+            }
+            b'z' => {
+                flags.z_split = true;
+                idx += 1;
+            }
             other => {
                 return Err(KashError::Parse(alloc::format!(
-                    "unsupported expansion flag `{}` (only `U` / `L` / `C` / `q` / `Q` are wired in this commit)",
+                    "unsupported expansion flag `{}` (split/join/case/quote families are wired in this commit; others follow)",
                     other as char,
                 )));
             }
@@ -6225,12 +6273,38 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
 }
 
 /// Apply the flag-block transformations to `value` in zsh's
-/// fixed evaluation order: unquote → quote → case.
-/// `ExpansionFlags::is_empty` callers can skip this entirely.
-pub fn apply_expansion_flags(flags: &ExpansionFlags, mut value: String) -> String {
+/// fixed evaluation order: unquote → split → join → quote →
+/// case. The interior pipeline carries a `Vec<String>` so
+/// split + join compose naturally. `ExpansionFlags::is_empty`
+/// callers can skip this entirely.
+pub fn apply_expansion_flags(flags: &ExpansionFlags, value: String) -> String {
+    let mut parts: Vec<String> = alloc::vec![value];
     if matches!(flags.quote, Some(QuoteFlag::Unquote)) {
-        value = dequote_value(&value);
+        for p in &mut parts {
+            *p = dequote_value(p);
+        }
     }
+    // Split happens before join — `(s.,.j.+.)` is the natural
+    // composition. `(f)` is `(s.\n.)` and `(z)` is shell-token
+    // splitting; the explicit `s` flag wins if both appear.
+    if let Some(delim) = flags.split.as_deref() {
+        parts = split_with_delim(&parts, delim);
+    } else if flags.f_split {
+        parts = split_with_delim(&parts, "\n");
+    } else if flags.z_split {
+        parts = split_shell_tokens_many(&parts);
+    }
+    // Join collapses the array back to a scalar. With no flag
+    // we use an empty separator — kash's expansion contract is
+    // "this returns one string" — but `(j…)` / `(F)` override.
+    let sep = if let Some(j) = flags.join.as_deref() {
+        j.to_string()
+    } else if flags.f_join {
+        "\n".to_string()
+    } else {
+        String::new()
+    };
+    let mut value = parts.join(&sep);
     value = match flags.quote {
         Some(QuoteFlag::Backslash) => quote_backslash(&value),
         Some(QuoteFlag::Single) => quote_single(&value),
@@ -6245,6 +6319,133 @@ pub fn apply_expansion_flags(flags: &ExpansionFlags, mut value: String) -> Strin
         None => value,
     };
     value
+}
+
+/// Read a paired-delim argument that follows a flag character.
+/// `after` is the body of the flag block (the slice after the
+/// opening `(`); `start` is the byte offset of the first char
+/// of the delim arg. Returns the inner string and the byte
+/// offset to resume parsing at.
+///
+/// zsh-style paired delims accept *any* byte as the open delim;
+/// the close delim is the same byte (`s.,.`, `s:,:`, `s/,/`,
+/// `s«,»`). A missing closing delim is a parse error.
+fn read_paired_delim_arg(
+    after: &str,
+    start: usize,
+    flag: char,
+) -> Result<(String, usize)> {
+    let bytes = after.as_bytes();
+    if start >= bytes.len() {
+        return Err(KashError::Parse(alloc::format!(
+            "expansion flag `({flag})` is missing its paired-delim argument"
+        )));
+    }
+    let open = bytes[start];
+    let mut idx = start + 1;
+    let body_start = idx;
+    while idx < bytes.len() && bytes[idx] != open {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return Err(KashError::Parse(alloc::format!(
+            "expansion flag `({flag}…)` paired-delim `{}` was never closed",
+            open as char,
+        )));
+    }
+    let body = after[body_start..idx].to_string();
+    Ok((body, idx + 1))
+}
+
+/// Split every element of `parts` on the literal `delim`,
+/// returning the flat-mapped result. An empty `delim` splits on
+/// every Unicode boundary — that mirrors zsh's `(s..)`.
+fn split_with_delim(parts: &[String], delim: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        if delim.is_empty() {
+            for c in p.chars() {
+                out.push(alloc::format!("{c}"));
+            }
+        } else {
+            for piece in p.split(delim) {
+                out.push(piece.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `(z)` — split each part into shell-like tokens. Respects
+/// `'…'` / `"…"` / `\X` runs (their content stays glued); other
+/// whitespace separates tokens. Empty tokens are dropped, like
+/// the shell's regular word-splitting.
+fn split_shell_tokens_many(parts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        out.extend(split_shell_tokens_one(p));
+    }
+    out
+}
+
+fn split_shell_tokens_one(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace.
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let mut token = String::new();
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_whitespace() {
+                break;
+            }
+            match bytes[i] {
+                b'\'' => {
+                    // Verbatim until matching `'`.
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        token.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            token.push(bytes[i + 1] as char);
+                            i += 2;
+                        } else {
+                            token.push(bytes[i] as char);
+                            i += 1;
+                        }
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'\\' if i + 1 < bytes.len() => {
+                    token.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                _ => {
+                    token.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out.push(token);
+    }
+    out
 }
 
 /// Title-case `s` — first letter of each whitespace-delimited
@@ -12082,14 +12283,13 @@ mod tests {
 
     #[test]
     fn zsh_flag_unsupported_char_rejected() {
-        // Pick a char that the follow-up commits will wire in
-        // (`s`) — for now it should produce a clear "this commit
-        // doesn't support it" error.
-        let prog = parse("x=hi\necho \"${(s.,.)x}\"\n").unwrap();
+        // Sort flag `(o)` is wired in a later sub-commit; until
+        // then unsupported characters must report a clear error.
+        let prog = parse("x=hi\necho \"${(o)x}\"\n").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("s"), "got: {msg}");
+        assert!(msg.contains("o"), "got: {msg}");
     }
 
     #[test]
@@ -12099,6 +12299,69 @@ mod tests {
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
         assert!(msg.contains("unterminated") || msg.contains("flag"), "got: {msg}");
+    }
+
+    // ===== zsh-style expansion flags (split + join subset) =====
+
+    #[test]
+    fn zsh_flag_split_with_paired_delim() {
+        // `${(s.,.)x}` splits on `,`. With no `j` flag the
+        // array re-joins on `""` so the parts collapse.
+        let (_, out, _) = run("x=a,b,c\necho \"${(s.,.)x}\"\n");
+        assert_eq!(out, "abc\n");
+    }
+
+    #[test]
+    fn zsh_flag_split_then_join() {
+        // `(s.,.j.+.)` and the reversed-order form `(j.+.s.,.)`
+        // must produce identical results — the order inside the
+        // block is irrelevant.
+        let (_, out, _) = run("x=a,b,c\necho \"${(s.,.j.+.)x}\"\n");
+        assert_eq!(out, "a+b+c\n");
+        let (_, out, _) = run("x=a,b,c\necho \"${(j.+.s.,.)x}\"\n");
+        assert_eq!(out, "a+b+c\n");
+    }
+
+    #[test]
+    fn zsh_flag_split_empty_delim_per_char() {
+        let (_, out, _) = run("x=abc\necho \"${(s..j.-.)x}\"\n");
+        assert_eq!(out, "a-b-c\n");
+    }
+
+    #[test]
+    fn zsh_flag_f_split_on_newline() {
+        // Embed real newlines in the literal — the shell layer's
+        // `$'\\n'` parser is unrelated to what `(f)` does. `(f)`
+        // splits on the newline byte; `(F)` joins back on it.
+        let (_, out, _) = run("x='line1\nline2\nline3'\necho \"${(fF)x}\"\n");
+        assert_eq!(out, "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn zsh_flag_z_split_respects_quotes() {
+        // Single-quoted value avoids the shell layer eating any
+        // backslashes; `(z)` then keeps the quoted run glued.
+        let (_, out, _) = run(
+            "toks='first \"two words\" three'\necho \"${(z)toks}|\"\n",
+        );
+        assert_eq!(out, "firsttwo wordsthree|\n");
+    }
+
+    #[test]
+    fn zsh_flag_split_then_uppercase() {
+        // Per the fixed order — split / join → case mapping
+        // applies to the final scalar.
+        let (_, out, _) = run("x=a,b,c\necho \"${(s.,.j.+.U)x}\"\n");
+        assert_eq!(out, "A+B+C\n");
+    }
+
+    #[test]
+    fn zsh_flag_split_missing_delim_rejected() {
+        let prog = parse("x=hi\necho \"${(s)x}\"\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("paired") || msg.contains("delim"), "got: {msg}");
     }
 
     #[test]
