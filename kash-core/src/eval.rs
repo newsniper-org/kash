@@ -230,6 +230,14 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// Updated at every `eval_statement` entry; surfaced as
     /// `${.sh.lineno}`.
     current_lineno: u32,
+    /// Most-recent `[[ $s =~ pat ]]` match text — exposed as
+    /// `${.sh.match}`. Empty when no match has happened (or the
+    /// last one failed).
+    sh_match: String,
+    /// Index of the last array element accessed via `${arr[i]}`
+    /// or assigned via `arr[i]=v`. Exposed as `${.sh.subscript}`
+    /// — same contract ksh93's variable-discipline context uses.
+    sh_subscript: String,
     /// Stack of variable names whose discipline hooks are
     /// currently in flight. The top is what `${.sh.name}` returns
     /// — same contract ksh93 documents. Empty outside a hook.
@@ -364,6 +372,8 @@ impl<B: MapBackend> Evaluator<B> {
             discipline_value: String::new(),
             subshell_level: 0,
             current_lineno: 0,
+            sh_match: String::new(),
+            sh_subscript: String::new(),
             discipline_name_stack: Vec::new(),
             discipline_guard: alloc::collections::BTreeSet::new(),
             type_defs: alloc::collections::BTreeMap::new(),
@@ -2831,6 +2841,10 @@ impl<B: MapBackend> Evaluator<B> {
                 for t in tokens {
                     args.push(self.expand_word(t)?);
                 }
+                // Snapshot `=~` regex-match text into `${.sh.match}`
+                // — before evaluating the test so a failing match
+                // clears it.
+                self.sh_match = first_regex_match_capture(&args).unwrap_or_default();
                 let ok = eval_double_bracket(&args)?;
                 Ok(Outcome::Status(if ok { 0 } else { 1 }))
             }
@@ -4047,6 +4061,8 @@ impl<B: MapBackend> Evaluator<B> {
             }
             "subshell" => Ok(Some(alloc::format!("{}", self.subshell_level))),
             "lineno" => Ok(Some(alloc::format!("{}", self.current_lineno))),
+            "match" => Ok(Some(self.sh_match.clone())),
+            "subscript" => Ok(Some(self.sh_subscript.clone())),
             "name" => Ok(Some(
                 self.discipline_name_stack
                     .last()
@@ -4220,6 +4236,8 @@ impl<B: MapBackend> Evaluator<B> {
         idx: &str,
         value: String,
     ) -> Result<()> {
+        self.sh_subscript = idx.to_string();
+        let value = self.apply_set_discipline(name, value)?;
         let existing = self
             .scope
             .get_binding(name)
@@ -4283,17 +4301,23 @@ impl<B: MapBackend> Evaluator<B> {
 
     /// Look up `name[idx]`. Returns `None` if the binding is unset,
     /// the index is out-of-range, or the value isn't array-shaped.
-    fn lookup_indexed(&self, name: &str, idx: &str) -> Option<String> {
+    /// Sets `${.sh.subscript}` to `idx` as a side effect so any
+    /// in-flight discipline hook can read which index triggered it.
+    fn lookup_indexed(&mut self, name: &str, idx: &str) -> Option<String> {
+        self.sh_subscript = idx.to_string();
         let resolved = self.resolve_var_name(name)?;
-        let b = self.scope.get_binding(&resolved)?;
-        match &b.value {
-            Value::Array(v) => {
-                let i: usize = idx.parse().ok()?;
-                v.get(i).cloned()
+        let raw = {
+            let b = self.scope.get_binding(&resolved)?;
+            match &b.value {
+                Value::Array(v) => {
+                    let i: usize = idx.parse().ok()?;
+                    v.get(i).cloned()
+                }
+                Value::AssocArray(m) => m.get(idx).cloned(),
+                _ => None,
             }
-            Value::AssocArray(m) => m.get(idx).cloned(),
-            _ => None,
-        }
+        }?;
+        Some(self.apply_get_discipline(&resolved, raw))
     }
 
     /// Render `name[@]` / `name[*]` as a list of strings. For
@@ -5937,6 +5961,65 @@ fn bracket_binary(lhs: &str, op: &str, rhs: &str) -> Result<bool> {
         ">" => Ok(lhs > rhs),
         _ => test_binary(lhs, op, rhs),
     }
+}
+
+/// Scan a `[[ … ]]` arg list for the first `=~` form and, on
+/// success, return the matched substring of the LHS. Used to
+/// populate `${.sh.match}` ahead of evaluating the test itself.
+/// Brute-force linear search over starting / ending positions —
+/// `regex_match`'s recursive matcher doesn't carry length back,
+/// so we probe substrings instead.
+pub fn first_regex_match_capture(args: &[String]) -> Option<String> {
+    // Walk the arg list looking for `X =~ Y`.
+    for i in 1..args.len().saturating_sub(1) {
+        if args[i] == "=~" {
+            let lhs = &args[i - 1];
+            let rhs = &args[i + 1];
+            return regex_first_match_substring(rhs, lhs);
+        }
+    }
+    None
+}
+
+/// Find the first (leftmost-longest) substring of `text` that
+/// matches `pattern`. Returns `None` on no match. Built on top of
+/// the existing `regex_match` matcher by probing candidate spans.
+pub fn regex_first_match_substring(pattern: &str, text: &str) -> Option<String> {
+    let anchored = pattern.starts_with('^');
+    let inner_pat = if anchored { &pattern[1..] } else { pattern };
+    let trailing_dollar = inner_pat.ends_with('$') && !inner_pat.ends_with("\\$");
+    let body_pat = if trailing_dollar {
+        &inner_pat[..inner_pat.len() - 1]
+    } else {
+        inner_pat
+    };
+    // Anchored on both sides so each `regex_match` call tests the
+    // candidate substring *exactly*, not a prefix of it.
+    let exact_pat = alloc::format!("^{body_pat}$");
+    let bytes = text.as_bytes();
+    let starts: Vec<usize> = if anchored {
+        alloc::vec![0]
+    } else {
+        (0..=bytes.len())
+            .filter(|i| text.is_char_boundary(*i))
+            .collect()
+    };
+    for start in starts {
+        let mut end_choices: Vec<usize> = (start..=bytes.len())
+            .filter(|i| text.is_char_boundary(*i))
+            .collect();
+        // Longest match wins at each starting position.
+        end_choices.reverse();
+        for end in end_choices {
+            if trailing_dollar && end != bytes.len() {
+                continue;
+            }
+            if regex_match(&exact_pat, &text[start..end]) {
+                return Some(text[start..end].to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Match `text` against a POSIX-ERE-subset `pattern`. Supports:
@@ -10509,6 +10592,51 @@ mod tests {
     fn sh_name_empty_outside_discipline() {
         let (_, out, _) = run("echo \"[${.sh.name}]\"\n");
         assert_eq!(out, "[]\n");
+    }
+
+    // ===== .sh.match =====
+
+    #[test]
+    fn sh_match_captures_regex_substring() {
+        let (_, out, _) = run(
+            "[[ \"hello world\" =~ wor.. ]] && echo \"m=${.sh.match}\"\n",
+        );
+        assert_eq!(out, "m=world\n");
+    }
+
+    #[test]
+    fn sh_match_captures_quantified_pattern() {
+        let (_, out, _) = run(
+            "[[ \"v1.2.3\" =~ [0-9]+\\.[0-9]+ ]] && echo \"v=${.sh.match}\"\n",
+        );
+        assert_eq!(out, "v=1.2\n");
+    }
+
+    #[test]
+    fn sh_match_empty_before_any_match() {
+        let (_, out, _) = run("echo \"[${.sh.match}]\"\n");
+        assert_eq!(out, "[]\n");
+    }
+
+    // ===== .sh.subscript =====
+
+    #[test]
+    fn sh_subscript_exposed_to_set_discipline() {
+        let (_, out, _) = run(
+            "function .arr.set { echo \"i=${.sh.subscript} v=${.sh.value}\"; }\narr[0]=a\narr[1]=b\n",
+        );
+        assert_eq!(out, "i=0 v=a\ni=1 v=b\n");
+    }
+
+    #[test]
+    fn sh_subscript_set_on_indexed_lookup() {
+        // Seed three elements through plain `arr[i]=…` to avoid the
+        // array-literal parse path; the get hook then fires on lookup
+        // and `${.sh.subscript}` carries the index back out.
+        let (_, out, _) = run(
+            "arr[0]=x\narr[1]=y\narr[2]=z\nfunction .arr.get { .sh.value=\"i=${.sh.subscript}\"; }\necho ${arr[2]}\n",
+        );
+        assert_eq!(out, "i=2\n");
     }
 
     // ===== discipline functions =====
