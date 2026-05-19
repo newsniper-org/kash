@@ -945,6 +945,7 @@ impl<B: MapBackend> Evaluator<B> {
             "read" => self.builtin_read(&argv[1..]),
             "source" | "." => self.builtin_source(&argv[1..]),
             "eval" => self.builtin_eval(&argv[1..]),
+            "command" => self.builtin_command(&argv[1..]),
             "readonly" => self.builtin_readonly(&argv[1..]),
             "test" => builtin_test(false, &argv[1..]),
             "[" => builtin_test(true, &argv[1..]),
@@ -1138,6 +1139,162 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign_local(&name, Value::Scalar(value))?;
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// `command [-v | -V] NAME [ARG …]` — POSIX bypass of the
+    /// function / alias dispatch step. Two surface modes:
+    ///
+    /// * Bare form: `command NAME …` runs NAME against the
+    ///   builtin table first, falling through to external lookup.
+    ///   Any same-named function / alias is ignored.
+    /// * Probe form: `command -v NAME` prints what NAME would
+    ///   resolve to (alias / function / builtin / absolute path)
+    ///   and exits 0; an unknown name exits 1 with no output.
+    ///   `-V` is the verbose variant.
+    fn builtin_command(&mut self, args: &[String]) -> Result<Outcome> {
+        let mut probe_v = false;
+        let mut probe_caps = false;
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "-v" {
+                probe_v = true;
+                i += 1;
+            } else if a == "-V" {
+                probe_caps = true;
+                i += 1;
+            } else if a == "--" {
+                i += 1;
+                break;
+            } else if a.starts_with('-') && a.len() > 1 {
+                return Err(KashError::Runtime(alloc::format!(
+                    "command: unknown option `{a}`"
+                )));
+            } else {
+                break;
+            }
+        }
+        let rest = &args[i..];
+        if rest.is_empty() {
+            return Err(KashError::Runtime("command: missing command name".into()));
+        }
+        let name = &rest[0];
+        if probe_v || probe_caps {
+            return self.builtin_command_probe(name, probe_caps);
+        }
+        // Bare form — dispatch like a simple command, but skip
+        // function / alias lookup.
+        self.builtin_command_invoke(rest)
+    }
+
+    fn builtin_command_probe(&mut self, name: &str, verbose: bool) -> Result<Outcome> {
+        // Alias?
+        if self.aliases.contains_key(name) {
+            let body = self.aliases.get(name).cloned().unwrap_or_default();
+            let line = if verbose {
+                alloc::format!("{name} is aliased to `{body}`\n")
+            } else {
+                alloc::format!("alias {name}='{body}'\n")
+            };
+            self.output.push_str(&line);
+            return Ok(Outcome::Status(0));
+        }
+        // Function?
+        if let Some(resolved) = self.resolve_function_name(name) {
+            let line = if verbose {
+                alloc::format!("{name} is a function ({resolved})\n")
+            } else {
+                alloc::format!("{name}\n")
+            };
+            self.output.push_str(&line);
+            return Ok(Outcome::Status(0));
+        }
+        // Builtin?
+        if is_builtin_name(name) {
+            let line = if verbose {
+                alloc::format!("{name} is a shell builtin\n")
+            } else {
+                alloc::format!("{name}\n")
+            };
+            self.output.push_str(&line);
+            return Ok(Outcome::Status(0));
+        }
+        // External — std-feature only; alloc-only build has no
+        // way to spot a PATH hit so we just report "not found".
+        #[cfg(feature = "std")]
+        {
+            // Absolute / relative paths: check the file directly
+            // instead of walking PATH (resolve_in_path skips
+            // anything containing a slash).
+            if name.contains('/') {
+                if std::path::Path::new(name).is_file() {
+                    let line = if verbose {
+                        alloc::format!("{name} is {name}\n")
+                    } else {
+                        alloc::format!("{name}\n")
+                    };
+                    self.output.push_str(&line);
+                    return Ok(Outcome::Status(0));
+                }
+            } else if let Some(path) = resolve_in_path(self, name) {
+                let line = if verbose {
+                    alloc::format!("{name} is {path}\n")
+                } else {
+                    alloc::format!("{path}\n")
+                };
+                self.output.push_str(&line);
+                return Ok(Outcome::Status(0));
+            }
+        }
+        Ok(Outcome::Status(1))
+    }
+
+    fn builtin_command_invoke(&mut self, argv: &[String]) -> Result<Outcome> {
+        // The bare-form dispatch is just "builtin or external"
+        // skipping the function / alias steps.
+        let name = &argv[0];
+        if is_builtin_name(name) {
+            self.dispatch_known_builtin(argv)
+        } else {
+            self.run_external(argv)
+        }
+    }
+
+    /// Dispatch a builtin by name without going through the full
+    /// command-resolution pipeline. Available on both alloc and
+    /// std builds (unlike `dispatch_builtin`, which is std-only
+    /// and shaped for the redirect-bearing path).
+    fn dispatch_known_builtin(&mut self, argv: &[String]) -> Result<Outcome> {
+        let name = argv[0].as_str();
+        match name {
+            ":" | "true" => Ok(Outcome::Status(0)),
+            "false" => Ok(Outcome::Status(1)),
+            "echo" => {
+                self.builtin_echo(&argv[1..]);
+                Ok(Outcome::Status(0))
+            }
+            "exit" => self.builtin_exit(&argv[1..]),
+            "set" => self.builtin_set(&argv[1..]),
+            "unset" => self.builtin_unset(&argv[1..]),
+            "shift" => self.builtin_shift(&argv[1..]),
+            "local" => self.builtin_local(&argv[1..]),
+            "read" => self.builtin_read(&argv[1..]),
+            "source" | "." => self.builtin_source(&argv[1..]),
+            "eval" => self.builtin_eval(&argv[1..]),
+            "command" => self.builtin_command(&argv[1..]),
+            "readonly" => self.builtin_readonly(&argv[1..]),
+            "test" => builtin_test(false, &argv[1..]),
+            "[" => builtin_test(true, &argv[1..]),
+            "trap" => self.builtin_trap(&argv[1..]),
+            "alias" => self.builtin_alias(&argv[1..]),
+            "unalias" => self.builtin_unalias(&argv[1..]),
+            "typeset" | "declare" => self.builtin_typeset(&argv[1..]),
+            "export" => self.builtin_export(&argv[1..]),
+            "use" => self.builtin_use(&argv[1..]),
+            other => Err(KashError::Runtime(alloc::format!(
+                "command: `{other}` is not a known builtin"
+            ))),
+        }
     }
 
     /// `eval ARGS …` — join the args with spaces, parse the result
@@ -3864,6 +4021,7 @@ ifstd!({
             "read" => self.builtin_read(&argv[1..]),
             "source" | "." => self.builtin_source(&argv[1..]),
             "eval" => self.builtin_eval(&argv[1..]),
+            "command" => self.builtin_command(&argv[1..]),
                 "readonly" => self.builtin_readonly(&argv[1..]),
                 "test" => builtin_test(false, &argv[1..]),
                 "[" => builtin_test(true, &argv[1..]),
@@ -4132,6 +4290,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "source"
             | "."
             | "eval"
+            | "command"
     )
 }
 
@@ -8642,6 +8801,52 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== `command` builtin =====
+
+    #[test]
+    fn command_bypasses_function_dispatch() {
+        // Define a `echo` function that absorbs the arg silently;
+        // the function dispatch normally wins, but `command echo`
+        // bypasses functions and reaches the builtin.
+        let (_, out, _) = run(
+            "echo() { :; }\n\
+             echo \"function call\"\n\
+             command echo \"builtin call\"\n",
+        );
+        assert_eq!(out, "builtin call\n");
+    }
+
+    #[test]
+    fn command_v_finds_builtin() {
+        let (_, out, _) = run("command -v echo\n");
+        assert_eq!(out, "echo\n");
+    }
+
+    #[test]
+    fn command_v_finds_function() {
+        let (_, out, _) = run("greet() { :; }\ncommand -v greet\n");
+        assert_eq!(out, "greet\n");
+    }
+
+    #[test]
+    fn command_v_finds_alias() {
+        let (_, out, _) = run("alias g='echo hi'\ncommand -v g\n");
+        assert!(out.contains("alias g="), "got: {out}");
+    }
+
+    #[test]
+    fn command_v_missing_returns_status_1() {
+        let (outcome, out, _) = run("command -v no_such_thing_xyz\n");
+        assert_eq!(outcome.status(), 1);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn command_capital_v_verbose_format() {
+        let (_, out, _) = run("command -V echo\n");
+        assert!(out.contains("echo is a shell builtin"), "got: {out}");
     }
 
     // ===== `eval` builtin =====
