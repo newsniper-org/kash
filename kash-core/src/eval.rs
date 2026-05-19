@@ -438,6 +438,77 @@ impl<B: MapBackend> Evaluator<B> {
         self.qualify_decl_name(name)
     }
 
+    /// Follow a chain of `typeset -n` namerefs starting from
+    /// `name`. Returns the storage name the chain *terminates* on —
+    /// the binding that actually holds the value. Cycles are
+    /// truncated at a hop budget to avoid infinite recursion.
+    fn follow_nameref_chain(&self, name: &str) -> String {
+        let mut current = name.to_string();
+        for _ in 0..16 {
+            let Some(resolved) = self.resolve_var_name_skipping_nameref(&current) else {
+                return current;
+            };
+            let Some(binding) = self.scope.get_binding(&resolved) else {
+                return current;
+            };
+            match &binding.attrs.pending_nameref {
+                Some(target) if !target.is_empty() && target != &current => {
+                    current = target.clone();
+                }
+                _ => return resolved,
+            }
+        }
+        current
+    }
+
+    /// Inner half of `resolve_var_name` that ignores the
+    /// nameref-following step. Used by `follow_nameref_chain` to
+    /// resolve each hop without re-entering itself.
+    fn resolve_var_name_skipping_nameref(&self, name: &str) -> Option<String> {
+        if self.scope.get(name).is_some() {
+            return Some(name.to_string());
+        }
+        if name.starts_with('.') {
+            return None;
+        }
+        for i in (1..=self.namespace_path.len()).rev() {
+            let candidate = build_qualified_name(&self.namespace_path[..i], name);
+            if self.scope.get(&candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+        if let Some(frame) = self.imports.last() {
+            for entry in frame {
+                match entry {
+                    ImportEntry::Wildcard { source } => {
+                        if name.starts_with('_') {
+                            continue;
+                        }
+                        let candidate = build_qualified_name(source, name);
+                        if self.scope.get(&candidate).is_some() {
+                            return Some(candidate);
+                        }
+                    }
+                    ImportEntry::Symbol {
+                        source_path,
+                        source_name,
+                        alias,
+                    } => {
+                        let bound = alias.as_deref().unwrap_or(source_name);
+                        if name == bound {
+                            let candidate = build_qualified_name(source_path, source_name);
+                            if self.scope.get(&candidate).is_some() {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                    ImportEntry::Aliased { .. } => {}
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve a *variable* reference for read. Returns the storage
     /// name we should look up (the bare name as written, or a
     /// path-prefixed one). Mirrors `resolve_function_name`: the
@@ -1173,7 +1244,10 @@ impl<B: MapBackend> Evaluator<B> {
             } else {
                 value
             };
-            let target = self.qualify_var_for_write(&a.name);
+            let qualified = self.qualify_var_for_write(&a.name);
+            // If `qualified` is itself a `typeset -n` nameref, the
+            // write follows the chain to the target binding.
+            let target = self.follow_nameref_chain(&qualified);
             if let Some(sub) = &a.subscript {
                 let idx = self.expand_word(sub)?;
                 self.assign_array_element(&target, &idx, value)?;
@@ -2194,6 +2268,12 @@ impl<B: MapBackend> Evaluator<B> {
                         'u' => attrs.uppercase = true,
                         'a' => attrs.indexed = true,
                         'A' => attrs.assoc = true,
+                        'n' => {
+                            // Marker — the actual target name lives
+                            // in the operand's `=value` half, which
+                            // the loop below pulls out.
+                            attrs.pending_nameref = Some(String::new());
+                        }
                         'p' => print_mode = true,
                         other => {
                             return Err(KashError::Runtime(alloc::format!(
@@ -2215,6 +2295,7 @@ impl<B: MapBackend> Evaluator<B> {
         }
 
         let in_func = self.scope.in_function();
+        let is_nameref = attrs.pending_nameref.is_some();
         while i < args.len() {
             let arg = &args[i];
             if let Some(eq) = arg.find('=') {
@@ -2226,7 +2307,23 @@ impl<B: MapBackend> Evaluator<B> {
                 }
                 let raw_value = rest[1..].to_string();
                 let target = self.qualify_var_for_write(name);
-                self.scope.apply_attrs(&target, &attrs)?;
+                let attrs_for_name = if is_nameref {
+                    // nameref target lives in the `=` half — fold it
+                    // into `pending_nameref` instead of the value.
+                    AttrSet {
+                        pending_nameref: Some(raw_value.clone()),
+                        ..attrs.clone()
+                    }
+                } else {
+                    attrs.clone()
+                };
+                self.scope.apply_attrs(&target, &attrs_for_name)?;
+                if is_nameref {
+                    // Reference: the binding's value is never read;
+                    // skip the value-store step.
+                    i += 1;
+                    continue;
+                }
                 let value = self.coerce_for_attrs(&attrs, raw_value)?;
                 if in_func {
                     self.scope.assign_local(&target, Value::Scalar(value))?;
@@ -4087,13 +4184,13 @@ impl<B: MapBackend> Evaluator<B> {
                 .cloned()
                 .unwrap_or_default();
         }
-        // venv env overlay wins over the regular scope — that's
-        // what makes `echo $PYTHONHOME` inside a venv see the
-        // overlay value, not the parent shell's.
-        if let Some(v) = self.venv_env_value(name) {
+        // Follow `typeset -n` namerefs through to the bound name.
+        let effective = self.follow_nameref_chain(name);
+        // venv env overlay wins over the regular scope.
+        if let Some(v) = self.venv_env_value(&effective) {
             return v;
         }
-        match self.resolve_var_name(name) {
+        match self.resolve_var_name(&effective) {
             Some(resolved) => self
                 .scope
                 .get(&resolved)
@@ -4132,11 +4229,12 @@ impl<B: MapBackend> Evaluator<B> {
                 .cloned()
                 .unwrap_or_default());
         }
-        // venv overlay first.
-        if let Some(v) = self.venv_env_value(name) {
+        let effective = self.follow_nameref_chain(name);
+        if let Some(v) = self.venv_env_value(&effective) {
             return Ok(v);
         }
-        let resolved = self.resolve_var_name(name);
+        let resolved = self.resolve_var_name(&effective);
+        let name = effective.as_str();
         match resolved.as_ref().and_then(|n| self.scope.get(n)) {
             Some(v) => Ok(v.to_scalar_string()),
             None => {
@@ -10125,6 +10223,41 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== `typeset -n` (nameref) =====
+
+    #[test]
+    fn nameref_reads_through_to_target() {
+        let (_, out, _) = run("real=42\ntypeset -n alias=real\necho $alias\n");
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn nameref_writes_through_to_target() {
+        let (_, out, _) = run(
+            "real=initial\ntypeset -n alias=real\nalias=updated\necho $real\n",
+        );
+        assert_eq!(out, "updated\n");
+    }
+
+    #[test]
+    fn nameref_chain_follows_through() {
+        let (_, out, _) = run(
+            "a=hello\ntypeset -n b=a\ntypeset -n c=b\necho $c\n",
+        );
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn nameref_cycle_bounded() {
+        // Self-loop / cycle — `follow_nameref_chain` caps the
+        // hop budget instead of looping forever.
+        let (_, out, _) = run(
+            "typeset -n a=b\ntypeset -n b=a\necho $a\n",
+        );
+        // No infinite loop; output may be empty (cycle aborts).
+        let _ = out;
     }
 
     // ===== `getopts` builtin =====
