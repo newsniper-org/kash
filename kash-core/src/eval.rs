@@ -789,9 +789,9 @@ impl<B: MapBackend> Evaluator<B> {
         #[cfg(not(feature = "std"))]
         {
             let _ = c;
-            return Err(KashError::Runtime(
+            Err(KashError::Runtime(
                 "redirections on compound commands require the std feature".into(),
-            ));
+            ))
         }
         #[cfg(feature = "std")]
         {
