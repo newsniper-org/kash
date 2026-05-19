@@ -222,6 +222,14 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// mutate it and have the caller see the result. Always
     /// readable / writable; default empty.
     discipline_value: String,
+    /// Subshell nesting level. `0` at the top, `+1` per
+    /// `( … )` (subshell) entry, `-1` on exit. Surfaced as
+    /// `${.sh.subshell}`.
+    subshell_level: u32,
+    /// Stack of variable names whose discipline hooks are
+    /// currently in flight. The top is what `${.sh.name}` returns
+    /// — same contract ksh93 documents. Empty outside a hook.
+    discipline_name_stack: Vec<String>,
     /// Re-entry guards for discipline-function hooks. When the
     /// set / get / unset hook for `name` is in flight, further
     /// assignment / lookup / unset of `name` skips the hook (so
@@ -350,6 +358,8 @@ impl<B: MapBackend> Evaluator<B> {
             stderr_output: String::new(),
             last_bg_pid: 0,
             discipline_value: String::new(),
+            subshell_level: 0,
+            discipline_name_stack: Vec::new(),
             discipline_guard: alloc::collections::BTreeSet::new(),
             type_defs: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "std")]
@@ -482,7 +492,9 @@ impl<B: MapBackend> Evaluator<B> {
         // the hook can read / mutate it through `${.sh.value}`.
         let saved = core::mem::replace(&mut self.discipline_value, raw_value);
         self.discipline_guard.insert((name.to_string(), "set"));
+        self.discipline_name_stack.push(name.to_string());
         let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_name_stack.pop();
         self.discipline_guard.remove(&(name.to_string(), "set"));
         let stored = core::mem::replace(&mut self.discipline_value, saved);
         Ok(stored)
@@ -505,7 +517,9 @@ impl<B: MapBackend> Evaluator<B> {
         }
         let saved = core::mem::replace(&mut self.discipline_value, current);
         self.discipline_guard.insert((name.to_string(), "get"));
+        self.discipline_name_stack.push(name.to_string());
         let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_name_stack.pop();
         self.discipline_guard.remove(&(name.to_string(), "get"));
         core::mem::replace(&mut self.discipline_value, saved)
     }
@@ -522,7 +536,9 @@ impl<B: MapBackend> Evaluator<B> {
         }
         self.discipline_guard
             .insert((name.to_string(), "unset"));
+        self.discipline_name_stack.push(name.to_string());
         let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_name_stack.pop();
         self.discipline_guard
             .remove(&(name.to_string(), "unset"));
     }
@@ -2788,7 +2804,9 @@ impl<B: MapBackend> Evaluator<B> {
                 let saved_scope = self.scope.clone();
                 let saved_positionals = self.positionals.clone();
                 let saved_functions = self.functions.clone();
+                self.subshell_level += 1;
                 let result = self.eval_statements(body);
+                self.subshell_level -= 1;
                 self.scope = saved_scope;
                 self.positionals = saved_positionals;
                 self.functions = saved_functions;
@@ -3998,6 +4016,36 @@ impl<B: MapBackend> Evaluator<B> {
                 Ok(Some(out))
             }
             "value" => Ok(Some(self.discipline_value.clone())),
+            "pid" => {
+                #[cfg(feature = "std")]
+                {
+                    Ok(Some(alloc::format!("{}", std::process::id())))
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    Ok(Some("0".into()))
+                }
+            }
+            "ppid" => {
+                #[cfg(all(feature = "std", unix))]
+                {
+                    Ok(Some(alloc::format!(
+                        "{}",
+                        std::os::unix::process::parent_id()
+                    )))
+                }
+                #[cfg(not(all(feature = "std", unix)))]
+                {
+                    Ok(Some("0".into()))
+                }
+            }
+            "subshell" => Ok(Some(alloc::format!("{}", self.subshell_level))),
+            "name" => Ok(Some(
+                self.discipline_name_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or_default(),
+            )),
             other => Err(KashError::Parse(alloc::format!(
                 "unknown `.sh.{other}` introspection variable"
             ))),
@@ -10378,6 +10426,62 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== .sh.pid / .sh.ppid / .sh.subshell / .sh.name =====
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn sh_pid_is_numeric() {
+        let (_, out, _) = run("echo ${.sh.pid}\n");
+        // Should be a positive integer on std builds.
+        let pid: i64 = out.trim().parse().expect("numeric pid");
+        assert!(pid > 0);
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn sh_pid_is_zero_on_alloc_only() {
+        // alloc-only build has no `std::process::id`, so we
+        // surface a sentinel `0`.
+        let (_, out, _) = run("echo ${.sh.pid}\n");
+        assert_eq!(out, "0\n");
+    }
+
+    #[test]
+    fn sh_subshell_starts_at_zero() {
+        let (_, out, _) = run("echo ${.sh.subshell}\n");
+        assert_eq!(out, "0\n");
+    }
+
+    #[test]
+    fn sh_subshell_increments_in_parens() {
+        let (_, out, _) = run(
+            "echo a=${.sh.subshell}\n(echo b=${.sh.subshell}; (echo c=${.sh.subshell}))\n",
+        );
+        assert_eq!(out, "a=0\nb=1\nc=2\n");
+    }
+
+    #[test]
+    fn sh_subshell_pops_on_exit() {
+        let (_, out, _) = run(
+            "(echo inner=${.sh.subshell})\necho after=${.sh.subshell}\n",
+        );
+        assert_eq!(out, "inner=1\nafter=0\n");
+    }
+
+    #[test]
+    fn sh_name_holds_active_discipline_var() {
+        let (_, out, _) = run(
+            "function .v.set { echo \"name=${.sh.name}\"; }\nv=1\n",
+        );
+        assert_eq!(out, "name=v\n");
+    }
+
+    #[test]
+    fn sh_name_empty_outside_discipline() {
+        let (_, out, _) = run("echo \"[${.sh.name}]\"\n");
+        assert_eq!(out, "[]\n");
     }
 
     // ===== discipline functions =====
