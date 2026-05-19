@@ -4208,7 +4208,7 @@ impl<B: MapBackend> Evaluator<B> {
     /// Like [`lookup_param`](Self::lookup_param) but never triggers
     /// `nounset`. Used by modifier forms (`${VAR:-…}`, `${VAR:+…}`,
     /// …) that explicitly handle the unset case themselves.
-    fn lookup_param_raw(&self, name: &str) -> String {
+    fn lookup_param_raw(&mut self, name: &str) -> String {
         if name == "?" {
             return self.last_status.to_string();
         }
@@ -4252,7 +4252,7 @@ impl<B: MapBackend> Evaluator<B> {
     /// an unset name raises [`KashError::Runtime`] when the option is
     /// on. Specials (`?`, `#`, `$`, `!`) and positional `$0`-`$9` are
     /// always considered set.
-    fn lookup_param(&self, name: &str) -> Result<String> {
+    fn lookup_param(&mut self, name: &str) -> Result<String> {
         // Specials are always present.
         if name == "?" {
             return Ok(self.last_status.to_string());
@@ -4328,7 +4328,7 @@ ifstd!({
     /// or nothing was found (let the spawn-time `execvp` raise
     /// `NotFound`).
     fn resolve_in_path<B: crate::collections::MapBackend>(
-        ev: &Evaluator<B>,
+        ev: &mut Evaluator<B>,
         cmd: &str,
     ) -> Option<String> {
         if cmd.contains('/') {
