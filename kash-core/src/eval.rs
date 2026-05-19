@@ -2872,6 +2872,22 @@ impl<B: MapBackend> Evaluator<B> {
     /// goes through `scope.assign*`: `-i` runs the string through
     /// arithmetic, `-l` / `-u` fold case. Errors propagate (e.g.
     /// bad arithmetic).
+    /// Refuse zsh `${(…)body}` flag-block expansions inside
+    /// the strict modes that disable zsh extensions. POSIX-
+    /// strict and `ksh93u-strict` are both no-extensions modes
+    /// per `project_shell_modes.md`.
+    fn check_zsh_flag_mode(&self) -> Result<()> {
+        match self.mode.base {
+            crate::mode::BaseMode::PosixStrict
+            | crate::mode::BaseMode::Ksh93uStrict => Err(KashError::Mode(alloc::format!(
+                "zsh-style `${{(flags)…}}` expansion is not available inside `{}`; \
+                 switch to an `*-aware` or `default` mode",
+                self.mode,
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Store a complex literal into `name`. Parses the input,
     /// projects each component through the type's float
     /// precision, and writes three bindings: `name`, `name.re`,
@@ -4175,6 +4191,19 @@ impl<B: MapBackend> Evaluator<B> {
     /// - `${NAME?WORD}` / `${NAME:?WORD}` — error if unset/null
     /// - `${NAME+WORD}` / `${NAME:+WORD}` — alternate
     fn expand_braced(&mut self, body: &str) -> Result<String> {
+        // zsh-style flag block: `${(flags)body}`. Parsed once and
+        // peeled off; the rest of the expansion runs unaware, and
+        // we re-apply the flags' transformations afterwards in
+        // zsh's fixed evaluation order. Strict modes that disable
+        // zsh extensions are gated below.
+        if body.starts_with('(') {
+            let (flags, rest) = parse_expansion_flag_block(body)?;
+            if !flags.is_empty() {
+                self.check_zsh_flag_mode()?;
+            }
+            let inner = self.expand_braced(rest)?;
+            return Ok(apply_expansion_flags(&flags, inner));
+        }
         // `.sh.*` introspection variables. Resolved first so the
         // dotted reserved namespace never falls into the regular
         // identifier-parsing path (which would reject the leading
@@ -6063,6 +6092,429 @@ fn printf_format(format: &str, params: &[String]) -> Result<(String, usize)> {
         }
     }
     Ok((out, p_idx))
+}
+
+/// Per-flag-block parameter expansion modifiers extracted from
+/// a `${(…)body}` form. v1 ships the case + quote subset; the
+/// remaining categories (split / join / sort / dedup / indirect
+/// / compound / path-modifier / misc) come in follow-up
+/// commits. Unsupported flag characters surface as a parse
+/// error from [`parse_expansion_flag_block`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpansionFlags {
+    /// Case transformation: `(U)` upper, `(L)` lower, `(C)`
+    /// title-case (first letter of each whitespace-delimited
+    /// word).
+    case: Option<CaseFlag>,
+    /// Quote / unquote transformation. `(q)` count drives the
+    /// level — 1 → backslash-escape, 2 → single-quoted form,
+    /// 3 → double-quoted form, 4 → `$'…'` form. `(Q)` strips
+    /// shell quoting.
+    quote: Option<QuoteFlag>,
+}
+
+impl ExpansionFlags {
+    /// True iff this flag block is the empty `()`. Lets callers
+    /// (e.g. the mode gate) skip work when no flag actually
+    /// asked for anything.
+    pub fn is_empty(&self) -> bool {
+        self.case.is_none() && self.quote.is_none()
+    }
+}
+
+/// `(U)` / `(L)` / `(C)` — case projection applied to the
+/// expanded value after quoting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseFlag {
+    /// `(U)` — uppercase every character.
+    Upper,
+    /// `(L)` — lowercase every character.
+    Lower,
+    /// `(C)` — capitalise the first letter of each
+    /// whitespace-delimited word, lowercase the rest.
+    Title,
+}
+
+/// `(q)` count or `(Q)` — controls whether the value is
+/// rendered as a shell-quoted literal or stripped of its
+/// outer quoting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuoteFlag {
+    /// `(q)` — backslash-escape characters that would be
+    /// special unquoted (whitespace, shell metacharacters).
+    Backslash,
+    /// `(qq)` — single-quote the value (`'…'`), doubling
+    /// any embedded apostrophes via the standard `'\''`
+    /// escape.
+    Single,
+    /// `(qqq)` — double-quote the value (`"…"`), escaping
+    /// `"`, `\`, `$`, and backtick.
+    Double,
+    /// `(qqqq)` — emit `$'…'` ANSI-C form. Non-printable
+    /// bytes round-trip through `\xHH`.
+    AnsiC,
+    /// `(Q)` — dequote. Removes shell quoting (single,
+    /// double, ANSI-C, backslash) from the value.
+    Unquote,
+}
+
+/// Parse a leading `(flags)` block from `body`. Returns the
+/// extracted flag set and the remaining body slice past the
+/// closing paren. Errors on unknown / unterminated flag
+/// blocks.
+///
+/// v1 recognises the case + quote characters only (`U` / `L` /
+/// `C` / `q` / `Q`). Any other character causes a parse error
+/// — the follow-up commits flip those into "supported".
+pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> {
+    debug_assert!(body.starts_with('('));
+    let after = &body[1..];
+    let bytes = after.as_bytes();
+    let mut idx = 0;
+    let mut flags = ExpansionFlags::default();
+    let mut q_count: u8 = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b')' => {
+                if q_count > 0 {
+                    flags.quote = Some(match q_count {
+                        1 => QuoteFlag::Backslash,
+                        2 => QuoteFlag::Single,
+                        3 => QuoteFlag::Double,
+                        4 => QuoteFlag::AnsiC,
+                        _ => {
+                            return Err(KashError::Parse(alloc::format!(
+                                "expansion flag `q` may repeat at most 4 times, got {q_count}"
+                            )));
+                        }
+                    });
+                }
+                return Ok((flags, &after[idx + 1..]));
+            }
+            b'U' => {
+                flags.case = Some(CaseFlag::Upper);
+                idx += 1;
+            }
+            b'L' => {
+                flags.case = Some(CaseFlag::Lower);
+                idx += 1;
+            }
+            b'C' => {
+                flags.case = Some(CaseFlag::Title);
+                idx += 1;
+            }
+            b'Q' => {
+                flags.quote = Some(QuoteFlag::Unquote);
+                idx += 1;
+            }
+            b'q' => {
+                q_count = q_count.saturating_add(1);
+                idx += 1;
+            }
+            other => {
+                return Err(KashError::Parse(alloc::format!(
+                    "unsupported expansion flag `{}` (only `U` / `L` / `C` / `q` / `Q` are wired in this commit)",
+                    other as char,
+                )));
+            }
+        }
+    }
+    Err(KashError::Parse(
+        "unterminated `${(…)` flag block".into(),
+    ))
+}
+
+/// Apply the flag-block transformations to `value` in zsh's
+/// fixed evaluation order: unquote → quote → case.
+/// `ExpansionFlags::is_empty` callers can skip this entirely.
+pub fn apply_expansion_flags(flags: &ExpansionFlags, mut value: String) -> String {
+    if matches!(flags.quote, Some(QuoteFlag::Unquote)) {
+        value = dequote_value(&value);
+    }
+    value = match flags.quote {
+        Some(QuoteFlag::Backslash) => quote_backslash(&value),
+        Some(QuoteFlag::Single) => quote_single(&value),
+        Some(QuoteFlag::Double) => quote_double(&value),
+        Some(QuoteFlag::AnsiC) => quote_ansi_c(&value),
+        Some(QuoteFlag::Unquote) | None => value,
+    };
+    value = match flags.case {
+        Some(CaseFlag::Upper) => value.to_uppercase(),
+        Some(CaseFlag::Lower) => value.to_lowercase(),
+        Some(CaseFlag::Title) => title_case(&value),
+        None => value,
+    };
+    value
+}
+
+/// Title-case `s` — first letter of each whitespace-delimited
+/// run upper-cased, rest lower-cased. Whitespace runs preserve
+/// their original character.
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            out.push(c);
+            at_word_start = true;
+        } else if at_word_start {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+            at_word_start = false;
+        } else {
+            for l in c.to_lowercase() {
+                out.push(l);
+            }
+        }
+    }
+    out
+}
+
+/// `(q)` — backslash-escape shell-special bytes (whitespace,
+/// quote characters, glob / expansion metacharacters). Round-
+/// trips back through the regular shell unquoter.
+fn quote_backslash(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let special = matches!(
+            c,
+            ' ' | '\t'
+                | '\n'
+                | '\''
+                | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '&'
+                | ';'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '#'
+                | '~'
+                | '!'
+                | '='
+        );
+        if special {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `(qq)` — wrap in single quotes, escaping any embedded
+/// apostrophes via the POSIX `'\''` close-reopen trick.
+fn quote_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `(qqq)` — wrap in double quotes, escaping `"`, `\`, `$`,
+/// and backtick (the four characters that retain their special
+/// meaning inside a POSIX double-quoted string).
+fn quote_double(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `(qqqq)` — emit `$'…'` ANSI-C form. Common control bytes
+/// use their canonical escapes; everything else printable goes
+/// through verbatim; the rest emits `\xHH`.
+fn quote_ansi_c(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 3);
+    out.push_str("$'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                out.push_str(&alloc::format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `(Q)` — strip shell quoting. Recognises `'…'`,
+/// `"…"`, `$'…'`, and backslash escapes inside an unquoted
+/// run. Closing quotes are required; the function returns the
+/// value as-is on malformed input rather than erroring (zsh
+/// behaviour).
+fn dequote_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                // `'…'` — verbatim until next `'`.
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'\'' {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    out.push_str(&s[i..]);
+                    return out;
+                }
+                out.push_str(&s[i + 1..j]);
+                i = j + 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    out.push_str(&s[i..]);
+                    return out;
+                }
+                // Copy interior, undoing `\X` escapes for the
+                // four POSIX-special characters.
+                let inner = &s[i + 1..j];
+                let inner_bytes = inner.as_bytes();
+                let mut k = 0;
+                while k < inner_bytes.len() {
+                    if inner_bytes[k] == b'\\'
+                        && k + 1 < inner_bytes.len()
+                        && matches!(inner_bytes[k + 1], b'"' | b'\\' | b'$' | b'`')
+                    {
+                        out.push(inner_bytes[k + 1] as char);
+                        k += 2;
+                    } else {
+                        out.push(inner_bytes[k] as char);
+                        k += 1;
+                    }
+                }
+                i = j + 1;
+            }
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                // `$'…'` — handle the canonical ANSI-C escapes.
+                let mut j = i + 2;
+                while j < bytes.len() && bytes[j] != b'\'' {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    out.push_str(&s[i..]);
+                    return out;
+                }
+                let inner = &s[i + 2..j];
+                out.push_str(&ansi_c_decode(inner));
+                i = j + 1;
+            }
+            b'\\' if i + 1 < bytes.len() => {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Decode the inside of a `$'…'` ANSI-C string. Recognises
+/// `\n` `\r` `\t` `\\` `\'` `\"` `\0` and `\xHH`.
+fn ansi_c_decode(inner: &str) -> String {
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => {
+                    out.push('\n');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push('\r');
+                    i += 2;
+                }
+                b't' => {
+                    out.push('\t');
+                    i += 2;
+                }
+                b'\\' => {
+                    out.push('\\');
+                    i += 2;
+                }
+                b'\'' => {
+                    out.push('\'');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push('"');
+                    i += 2;
+                }
+                b'0' => {
+                    out.push('\0');
+                    i += 2;
+                }
+                b'x' if i + 3 < bytes.len() => {
+                    if let Ok(byte) = u8::from_str_radix(
+                        core::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or(""),
+                        16,
+                    ) {
+                        out.push(byte as char);
+                        i += 4;
+                        continue;
+                    }
+                    out.push('\\');
+                    i += 1;
+                }
+                other => {
+                    out.push(other as char);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Parse a kash complex literal into a `(real, imaginary)`
@@ -11551,6 +12003,102 @@ mod tests {
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
         assert!(msg.contains("complex"), "got: {msg}");
+    }
+
+    // ===== zsh-style expansion flags (case + quote subset) =====
+
+    #[test]
+    fn zsh_flag_uppercase() {
+        let (_, out, _) = run("x=hello\necho \"${(U)x}\"\n");
+        assert_eq!(out, "HELLO\n");
+    }
+
+    #[test]
+    fn zsh_flag_lowercase() {
+        let (_, out, _) = run("x=HELLO\necho \"${(L)x}\"\n");
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn zsh_flag_title_case() {
+        let (_, out, _) = run("x=\"hello world\"\necho \"${(C)x}\"\n");
+        assert_eq!(out, "Hello World\n");
+    }
+
+    #[test]
+    fn zsh_flag_backslash_quote() {
+        let (_, out, _) = run("x=\"hello world\"\necho \"${(q)x}\"\n");
+        assert_eq!(out, "hello\\ world\n");
+    }
+
+    #[test]
+    fn zsh_flag_single_quote() {
+        let (_, out, _) = run("x=\"hello world\"\necho \"${(qq)x}\"\n");
+        assert_eq!(out, "'hello world'\n");
+    }
+
+    #[test]
+    fn zsh_flag_double_quote() {
+        let (_, out, _) = run("x=\"hello world\"\necho \"${(qqq)x}\"\n");
+        assert_eq!(out, "\"hello world\"\n");
+    }
+
+    #[test]
+    fn zsh_flag_ansi_c_quote() {
+        let (_, out, _) = run("x=\"hello world\"\necho \"${(qqqq)x}\"\n");
+        assert_eq!(out, "$'hello world'\n");
+    }
+
+    #[test]
+    fn zsh_flag_dequote_single_form() {
+        let (_, out, _) = run("x=\"'hello'\"\necho \"${(Q)x}\"\n");
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn zsh_flag_dequote_double_form() {
+        let (_, out, _) = run("x='\"hi\\\"there\"'\necho \"${(Q)x}\"\n");
+        assert_eq!(out, "hi\"there\n");
+    }
+
+    #[test]
+    fn zsh_flag_evaluation_order_quote_then_case() {
+        // Per the zsh order, quoting happens *before* case
+        // mapping — so `(qU)` quotes then upper-cases, which
+        // upper-cases the literal `'` glyphs to themselves but
+        // leaves the structure intact.
+        let (_, out, _) = run("x=hello\necho \"${(qqU)x}\"\n");
+        assert_eq!(out, "'HELLO'\n");
+    }
+
+    #[test]
+    fn zsh_flag_combined_juxtaposition() {
+        // `(UL)` — both flag chars take effect; `L` wins because
+        // it's the most recent case-flag write. Matches zsh
+        // behaviour: latest wins for same-category flags.
+        let (_, out, _) = run("x=Mixed\necho \"${(UL)x}\"\n");
+        assert_eq!(out, "mixed\n");
+    }
+
+    #[test]
+    fn zsh_flag_unsupported_char_rejected() {
+        // Pick a char that the follow-up commits will wire in
+        // (`s`) — for now it should produce a clear "this commit
+        // doesn't support it" error.
+        let prog = parse("x=hi\necho \"${(s.,.)x}\"\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("s"), "got: {msg}");
+    }
+
+    #[test]
+    fn zsh_flag_unterminated_block_rejected() {
+        let prog = parse("x=hi\necho \"${(Ux}\"\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("unterminated") || msg.contains("flag"), "got: {msg}");
     }
 
     #[test]
