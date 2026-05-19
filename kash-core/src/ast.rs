@@ -289,15 +289,18 @@ pub enum CompoundKind {
     },
     /// A `typedef NAME { member=default; … }` declaration —
     /// kash's surface for ksh93's `typeset -T` user-defined
-    /// types. The body lists members with default values; the
-    /// declaration registers `NAME` so subsequent `typedef NAME
-    /// var` instances copy the defaults into `var.member`
-    /// bindings.
+    /// types. The body lists members (fields with default
+    /// values, optionally `private` or `static`) and the two
+    /// lifecycle dunders `__init` / `__del`. The declaration
+    /// registers `NAME` so subsequent `typedef NAME var`
+    /// instances copy the per-instance fields into `var.field`
+    /// bindings, install the static fields under
+    /// `${NAME.field}`, and run `__init` (and later `__del`).
     TypeDef {
         /// Type name.
         name: String,
-        /// `(member-name, default-value)` pairs in source order.
-        members: Vec<(String, Word)>,
+        /// Body items in source order.
+        members: Vec<TypeMember>,
     },
     /// `typedef NAME var` — instance of a previously-defined
     /// type. Evaluation copies each `member=default` from the
@@ -364,6 +367,41 @@ pub enum CompoundKind {
         /// `None` covers both other forms (no capture list at all).
         captures: Option<Vec<String>>,
         /// Function body. Always a compound command.
+        body: alloc::boxed::Box<CompoundCommand>,
+    },
+}
+
+/// One item inside a [`CompoundKind::TypeDef`] body. Carries
+/// the visibility (`private`) and storage class (`static`)
+/// modifiers as plain booleans — the parser sets them based on
+/// preceding keywords; the evaluator enforces them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeMember {
+    /// A data field with a default-value expression. `private`
+    /// fields refuse external access; `static` fields live on the
+    /// type itself (shared across instances) instead of on each
+    /// instance.
+    Field {
+        /// Bare field name (no leading dot, no embedded dots).
+        name: String,
+        /// Default-value expression; runs at instance-creation
+        /// time (or at type-registration time for `static`).
+        default: Word,
+        /// `private` modifier was present.
+        private: bool,
+        /// `static` modifier was present.
+        static_: bool,
+    },
+    /// The `__init` lifecycle hook — runs once per instance,
+    /// right after the per-instance fields are seeded.
+    Init {
+        /// Body statements; always a compound command body.
+        body: alloc::boxed::Box<CompoundCommand>,
+    },
+    /// The `__del` lifecycle hook — runs right before an
+    /// instance binding is unset.
+    Del {
+        /// Body statements; always a compound command body.
         body: alloc::boxed::Box<CompoundCommand>,
     },
 }

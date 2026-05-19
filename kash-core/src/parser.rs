@@ -839,7 +839,7 @@ impl<'src> Parser<'src> {
         // Definition form: `typedef NAME { member=default; … }`
         if matches!(self.peek_kind()?, TokenKind::Op(Op::Lbrace)) {
             self.bump()?;
-            let mut members: Vec<(String, Word)> = Vec::new();
+            let mut members: Vec<crate::ast::TypeMember> = Vec::new();
             loop {
                 self.skip_newlines()?;
                 if matches!(self.peek_kind()?, TokenKind::Op(Op::Rbrace)) {
@@ -850,7 +850,58 @@ impl<'src> Parser<'src> {
                         "unterminated `typedef { … }` block".into(),
                     ));
                 }
-                // Each entry: `NAME=DEFAULT` as a single Word —
+                // Optional `private` / `static` modifiers (order
+                // free, each at most once).
+                let mut private = false;
+                let mut static_ = false;
+                loop {
+                    match self.peek_bare_word()? {
+                        Some("private") if !private => {
+                            self.bump()?;
+                            private = true;
+                        }
+                        Some("static") if !static_ => {
+                            self.bump()?;
+                            static_ = true;
+                        }
+                        _ => break,
+                    }
+                }
+                // Lifecycle dunder methods (`function __init …` /
+                // `function __del …`). Other in-body methods are
+                // reserved for a follow-up commit.
+                if self.peek_bare_word()? == Some("function") {
+                    if private || static_ {
+                        return Err(KashError::Parse(
+                            "`private` / `static` on typedef methods is reserved \
+                             for a follow-up commit"
+                                .into(),
+                        ));
+                    }
+                    let fd = self.parse_function_def()?;
+                    let (fname, fbody) = match fd.kind {
+                        CompoundKind::FunctionDef { name, body, .. } => (name, body),
+                        _ => unreachable!("parse_function_def returns FunctionDef"),
+                    };
+                    match fname.as_str() {
+                        "__init" => members.push(crate::ast::TypeMember::Init { body: fbody }),
+                        "__del" => members.push(crate::ast::TypeMember::Del { body: fbody }),
+                        other => {
+                            return Err(KashError::Parse(alloc::format!(
+                                "typedef body method `{other}` is not supported \
+                                 yet — only `__init` / `__del` are recognised"
+                            )));
+                        }
+                    }
+                    if matches!(
+                        self.peek_kind()?,
+                        TokenKind::Op(Op::Semi) | TokenKind::Newline
+                    ) {
+                        self.bump()?;
+                    }
+                    continue;
+                }
+                // Field form: `NAME=DEFAULT` as a single Word —
                 // lexer keeps `=` inside word bytes.
                 let token = self.parse_word()?;
                 let raw = match token.segments.first() {
@@ -884,7 +935,12 @@ impl<'src> Parser<'src> {
                     segments: default_segments,
                     span: token.span,
                 };
-                members.push((member_name, default_word));
+                members.push(crate::ast::TypeMember::Field {
+                    name: member_name,
+                    default: default_word,
+                    private,
+                    static_,
+                });
                 if matches!(
                     self.peek_kind()?,
                     TokenKind::Op(Op::Semi) | TokenKind::Newline

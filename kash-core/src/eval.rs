@@ -251,10 +251,28 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// active concurrently.
     discipline_guard: alloc::collections::BTreeSet<(String, &'static str)>,
     /// User-defined type registry — `typedef NAME { … }`. Each
-    /// entry stores the member list with default-value words; an
-    /// instance (`typedef NAME var`) copies those defaults into
-    /// `var.member` bindings on creation.
-    type_defs: alloc::collections::BTreeMap<String, Vec<(String, crate::ast::Word)>>,
+    /// entry stores the full body (per-instance fields, static
+    /// fields, and lifecycle dunders); an instance copies
+    /// per-instance fields into `var.field`, seeds static fields
+    /// at `<NAME>.<field>` on first registration, and runs
+    /// `__init` / `__del` against the active instance var.
+    type_defs:
+        alloc::collections::BTreeMap<String, Vec<crate::ast::TypeMember>>,
+    /// Maps a live instance variable name to the type it was
+    /// minted from. Drives `__del` dispatch on `unset` and
+    /// `private` access enforcement on `var.field` reads /
+    /// writes.
+    type_instances: alloc::collections::BTreeMap<String, String>,
+    /// Name of the type whose `__init` / `__del` body is
+    /// currently executing — used to permit `private` field
+    /// access only from inside the owning type's lifecycle
+    /// methods. `None` outside a typedef body.
+    in_type_method: Option<String>,
+    /// Variable name of the instance whose lifecycle method is
+    /// currently running. `_.field` reads / writes resolve
+    /// against this name so the body's `_` prefix points at the
+    /// active instance. `None` outside a typedef body.
+    self_instance_var: Option<String>,
     /// Effective stdin for *external* commands inside the active
     /// compound body. Set by `{ … } < file` (and similar) on
     /// enter; restored on exit. The spawn paths consult this
@@ -377,6 +395,9 @@ impl<B: MapBackend> Evaluator<B> {
             discipline_name_stack: Vec::new(),
             discipline_guard: alloc::collections::BTreeSet::new(),
             type_defs: alloc::collections::BTreeMap::new(),
+            type_instances: alloc::collections::BTreeMap::new(),
+            in_type_method: None,
+            self_instance_var: None,
             #[cfg(feature = "std")]
             compound_input: None,
             #[cfg(feature = "std")]
@@ -480,6 +501,12 @@ impl<B: MapBackend> Evaluator<B> {
     /// `foo=val` inside `namespace utils { … }` registers as
     /// `.utils.foo`. Absolute paths (`.foo.bar`) are pass-through.
     fn qualify_var_for_write(&self, name: &str) -> String {
+        // Resolve `_` / `_.field` against the active instance var
+        // first — that turns the lexical self-reference into a
+        // regular qualified name before the namespace prefixing
+        // pass runs.
+        let rewritten = self.rewrite_self_ref(name);
+        let name = rewritten.as_ref();
         if name.starts_with('.') || self.scope.in_function() || self.namespace_path.is_empty() {
             return name.to_string();
         }
@@ -556,6 +583,199 @@ impl<B: MapBackend> Evaluator<B> {
         self.discipline_name_stack.pop();
         self.discipline_guard
             .remove(&(name.to_string(), "unset"));
+    }
+
+    /// Register a `typedef NAME { … }` declaration. Stores the
+    /// full body so later instances can re-read it; also seeds
+    /// any `static` fields under `<NAME>.<field>` so they exist
+    /// from registration time on.
+    fn register_type_def(
+        &mut self,
+        name: &str,
+        members: &[crate::ast::TypeMember],
+    ) -> Result<()> {
+        // Compute static-field defaults *before* we register the
+        // members, so re-registering doesn't accidentally reset
+        // static state if the user reloads the same typedef.
+        let already_registered = self.type_defs.contains_key(name);
+        self.type_defs.insert(name.to_string(), members.to_vec());
+        // Install `__init` / `__del` bodies as hidden functions
+        // under `.<Type>.__init` / `.<Type>.__del` so they go
+        // through the normal `call_function` path (which gives
+        // them a function frame — `local`, `return`, etc.).
+        let defining_ns = self.namespace_path.clone();
+        for m in members {
+            match m {
+                crate::ast::TypeMember::Init { body } => {
+                    let key = alloc::format!(".{name}.__init");
+                    self.functions.insert(
+                        key,
+                        FunctionEntry {
+                            // Lifecycle dunders run with dynamic
+                            // scope so writes to the instance's
+                            // own `var.field` (and to type-level
+                            // `<Type>.field` static storage)
+                            // reach the surrounding scope. A
+                            // strict static frame would trap
+                            // every write inside the body and
+                            // make the hook write-only-to-itself.
+                            scope: crate::ast::FunctionScope::Dynamic,
+                            captures: None,
+                            body: body.clone(),
+                            defining_namespace: defining_ns.clone(),
+                        },
+                    );
+                }
+                crate::ast::TypeMember::Del { body } => {
+                    let key = alloc::format!(".{name}.__del");
+                    self.functions.insert(
+                        key,
+                        FunctionEntry {
+                            scope: crate::ast::FunctionScope::Dynamic,
+                            captures: None,
+                            body: body.clone(),
+                            defining_namespace: defining_ns.clone(),
+                        },
+                    );
+                }
+                crate::ast::TypeMember::Field { .. } => {}
+            }
+        }
+        if !already_registered {
+            for m in members {
+                if let crate::ast::TypeMember::Field {
+                    name: field,
+                    default,
+                    static_: true,
+                    ..
+                } = m
+                {
+                    let value = self.expand_word(default)?;
+                    let binding = alloc::format!("{name}.{field}");
+                    let target = self.qualify_var_for_write(&binding);
+                    self.scope.assign(&target, Value::Scalar(value))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialise a `typedef NAME var` instance — copy each
+    /// per-instance field default into `<var>.<field>`, record the
+    /// var→type mapping (so `__del` fires on unset and `private`
+    /// access can be gated), then run the optional `__init` body
+    /// under `in_type_method = Some(type)` so its body may touch
+    /// private fields freely.
+    fn instantiate_type(
+        &mut self,
+        type_name: &str,
+        var_name: &str,
+    ) -> Result<()> {
+        let members = self
+            .type_defs
+            .get(type_name)
+            .ok_or_else(|| {
+                KashError::NotFound(alloc::format!(
+                    "type `{type_name}` (use `typedef {type_name} {{ … }}` first)"
+                ))
+            })?
+            .clone();
+        for m in &members {
+            if let crate::ast::TypeMember::Field {
+                name: field,
+                default,
+                static_: false,
+                ..
+            } = m
+            {
+                let value = self.expand_word(default)?;
+                let binding = alloc::format!("{var_name}.{field}");
+                let target = self.qualify_var_for_write(&binding);
+                self.scope.assign(&target, Value::Scalar(value))?;
+            }
+        }
+        self.type_instances
+            .insert(var_name.to_string(), type_name.to_string());
+        // Run `__init` if defined.
+        let init_name = alloc::format!(".{type_name}.__init");
+        if self.functions.contains_key(&init_name) {
+            let saved_t = self.in_type_method.replace(type_name.to_string());
+            let saved_self = self.self_instance_var.replace(var_name.to_string());
+            let res = self.call_function(&alloc::vec![init_name]);
+            self.self_instance_var = saved_self;
+            self.in_type_method = saved_t;
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Run a type's `__del` body if one is defined. Called from
+    /// the `unset` path right before the instance's field
+    /// bindings are removed, so the body still sees `var.field`.
+    fn run_del_hook(&mut self, var_name: &str) -> Result<()> {
+        let Some(type_name) = self.type_instances.get(var_name).cloned() else {
+            return Ok(());
+        };
+        let del_name = alloc::format!(".{type_name}.__del");
+        if self.functions.contains_key(&del_name) {
+            let saved_t = self.in_type_method.replace(type_name.clone());
+            let saved_self = self.self_instance_var.replace(var_name.to_string());
+            let res = self.call_function(&alloc::vec![del_name]);
+            self.self_instance_var = saved_self;
+            self.in_type_method = saved_t;
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the leading `_` in `_.<rest>` (or a bare `_`) to
+    /// the active instance variable name when a lifecycle
+    /// method is running. Outside a lifecycle body — or for any
+    /// name that doesn't start with `_` — `name` is returned
+    /// unchanged.
+    fn rewrite_self_ref<'a>(&self, name: &'a str) -> alloc::borrow::Cow<'a, str> {
+        let Some(self_var) = self.self_instance_var.as_deref() else {
+            return alloc::borrow::Cow::Borrowed(name);
+        };
+        if name == "_" {
+            return alloc::borrow::Cow::Owned(self_var.to_string());
+        }
+        if let Some(rest) = name.strip_prefix("_.") {
+            return alloc::borrow::Cow::Owned(alloc::format!("{self_var}.{rest}"));
+        }
+        alloc::borrow::Cow::Borrowed(name)
+    }
+
+    /// Refuse external reads / writes to a `private` field of a
+    /// live typed instance. `binding_name` is the qualified
+    /// `var.field` form; the check is a no-op for any binding
+    /// that isn't a private field of a recorded instance.
+    fn check_private_member_access(&self, binding_name: &str) -> Result<()> {
+        let Some((var, field)) = binding_name.split_once('.') else {
+            return Ok(());
+        };
+        let Some(type_name) = self.type_instances.get(var) else {
+            return Ok(());
+        };
+        let Some(members) = self.type_defs.get(type_name) else {
+            return Ok(());
+        };
+        for m in members {
+            if let crate::ast::TypeMember::Field {
+                name,
+                private: true,
+                static_: false,
+                ..
+            } = m
+                && name == field
+                && self.in_type_method.as_deref() != Some(type_name.as_str())
+            {
+                return Err(KashError::Runtime(alloc::format!(
+                    "field `{var}.{field}` is private to type `{type_name}`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Follow a chain of `typeset -n` namerefs starting from
@@ -1379,8 +1599,10 @@ impl<B: MapBackend> Evaluator<B> {
             }
             if let Some(sub) = &a.subscript {
                 let idx = self.expand_word(sub)?;
+                self.check_private_member_access(&target)?;
                 self.assign_array_element(&target, &idx, value)?;
             } else {
+                self.check_private_member_access(&target)?;
                 // Discipline `.<target>.set` hook gets a chance to
                 // transform the incoming value before storage.
                 let stored = self.apply_set_discipline(&target, value)?;
@@ -1673,15 +1895,45 @@ impl<B: MapBackend> Evaluator<B> {
             if self.scope.is_readonly(name) {
                 return Err(KashError::Readonly(name.clone()));
             }
+            // Lifecycle: run `__del` for a typed instance *before*
+            // we strip any state, so the body still sees the
+            // instance's fields.
+            self.run_del_hook(name)?;
             // Discipline `.<name>.unset` hook gets notified before
             // the binding actually disappears.
             self.apply_unset_discipline(name);
+            // For a typed instance, sweep its per-instance
+            // `var.field` bindings out alongside the bare `var`.
+            self.tear_down_type_instance(name);
             // A non-existent name returning 0 matches POSIX behaviour.
             let _ = self.scope.unset(name);
             // Allow unsetting a function as a convenience.
             self.functions.remove(name);
         }
         Ok(Outcome::Status(0))
+    }
+
+    /// Sweep every `var.field` binding for the named instance and
+    /// drop the var→type entry. Called from `builtin_unset` after
+    /// `__del` has already run.
+    fn tear_down_type_instance(&mut self, var_name: &str) {
+        let Some(type_name) = self.type_instances.remove(var_name) else {
+            return;
+        };
+        let Some(members) = self.type_defs.get(&type_name).cloned() else {
+            return;
+        };
+        for m in &members {
+            if let crate::ast::TypeMember::Field {
+                name: field,
+                static_: false,
+                ..
+            } = m
+            {
+                let binding = alloc::format!("{var_name}.{field}");
+                let _ = self.scope.unset(&binding);
+            }
+        }
     }
 
     fn builtin_local(&mut self, args: &[String]) -> Result<Outcome> {
@@ -2961,25 +3213,11 @@ impl<B: MapBackend> Evaluator<B> {
                 self.eval_venv_decl(name, sections)
             }
             CompoundKind::TypeDef { name, members } => {
-                self.type_defs.insert(name.clone(), members.clone());
+                self.register_type_def(name, members)?;
                 Ok(Outcome::Status(0))
             }
             CompoundKind::TypeInstance { type_name, var_name } => {
-                let members = self
-                    .type_defs
-                    .get(type_name)
-                    .ok_or_else(|| {
-                        KashError::NotFound(alloc::format!(
-                            "type `{type_name}` (use `typedef {type_name} {{ … }}` first)"
-                        ))
-                    })?
-                    .clone();
-                for (member, default) in members {
-                    let value = self.expand_word(&default)?;
-                    let binding_name = alloc::format!("{var_name}.{member}");
-                    let target = self.qualify_var_for_write(&binding_name);
-                    self.scope.assign(&target, Value::Scalar(value))?;
-                }
+                self.instantiate_type(type_name, var_name)?;
                 Ok(Outcome::Status(0))
             }
         }
@@ -4386,6 +4624,18 @@ impl<B: MapBackend> Evaluator<B> {
     /// `nounset`. Used by modifier forms (`${VAR:-…}`, `${VAR:+…}`,
     /// …) that explicitly handle the unset case themselves.
     fn lookup_param_raw(&mut self, name: &str) -> String {
+        // Apply `_` self-reference rewriting before any other
+        // lookup work — `_.field` inside a lifecycle hook should
+        // behave identically to a literal `<instance>.field`.
+        let rewritten = self.rewrite_self_ref(name);
+        let name = rewritten.as_ref();
+        // Block external reads of `private` typedef fields. The
+        // empty string surfaces the same way as an unset variable
+        // because this code path is `Result`-free; callers that
+        // need to fail loudly use `lookup_param` instead.
+        if self.check_private_member_access(name).is_err() {
+            return String::new();
+        }
         if name == "?" {
             return self.last_status.to_string();
         }
@@ -4432,6 +4682,10 @@ impl<B: MapBackend> Evaluator<B> {
     /// on. Specials (`?`, `#`, `$`, `!`) and positional `$0`-`$9` are
     /// always considered set.
     fn lookup_param(&mut self, name: &str) -> Result<String> {
+        let rewritten = self.rewrite_self_ref(name);
+        let name = rewritten.as_ref();
+        // Refuse external reads of `private` typedef fields.
+        self.check_private_member_access(name)?;
         // Specials are always present.
         if name == "?" {
             return Ok(self.last_status.to_string());
@@ -10719,6 +10973,119 @@ mod tests {
     fn typedef_definition_alone_succeeds() {
         let (outcome, _, _) = run("typedef Foo { a=1; b=2; }\n");
         assert_eq!(outcome.status(), 0);
+    }
+
+    // ===== typedef OOP extensions (private / static / __init / __del) =====
+
+    #[test]
+    fn typedef_static_field_initialised_at_registration() {
+        // `static` fields live at `<TypeName>.<field>` and exist
+        // from the moment `typedef NAME { … }` runs — no instance
+        // needed.
+        let (_, out, _) = run("typedef Counter { static total=7; }\necho ${Counter.total}\n");
+        assert_eq!(out, "7\n");
+    }
+
+    #[test]
+    fn typedef_init_runs_on_instantiation() {
+        // Lifecycle bodies see the active instance as `_` — the
+        // assignment to `_.x` lands on `t.x` because `__init` is
+        // running with `self_instance_var = Some("t")`.
+        let (_, out, _) = run(
+            "typedef T { x=0; function __init { _.x=42; }; }\ntypedef T t\necho ${t.x}\n",
+        );
+        assert_eq!(out, "42\n");
+    }
+
+    #[test]
+    fn typedef_self_ref_reads_active_instance_field() {
+        // `${_.field}` inside a lifecycle body resolves to
+        // `<var>.field` of the instance being initialised.
+        let (_, out, _) = run(
+            "typedef T { x=seed; function __init { echo \"from-init=${_.x}\"; }; }\n\
+             typedef T t\n",
+        );
+        assert_eq!(out, "from-init=seed\n");
+    }
+
+    #[test]
+    fn typedef_del_runs_on_unset() {
+        let (_, out, _) = run(
+            "typedef T { function __init { echo init; }; function __del { echo del; }; }\n\
+             typedef T t\nunset t\n",
+        );
+        assert_eq!(out, "init\ndel\n");
+    }
+
+    #[test]
+    fn typedef_static_field_mutated_by_init() {
+        // Lifecycle bodies run with dynamic scope so writes to
+        // `<Type>.<field>` reach the outer binding, not a local
+        // copy. Each instance bumps the shared counter.
+        let (_, out, _) = run(
+            "typedef Counter { static total=0; function __init { local n=${Counter.total}; Counter.total=$((n + 1)); }; }\n\
+             typedef Counter a\ntypedef Counter b\ntypedef Counter c\necho ${Counter.total}\n",
+        );
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn typedef_private_field_blocks_external_read() {
+        // External `${b.secret}` must fail; the empty-string path
+        // is via `lookup_param_raw` (specifically the unquoted
+        // `echo` arg) and the hard-error path is through
+        // `lookup_param`. We exercise the hard path here.
+        let prog = parse(
+            "typedef Box { private secret=hidden; }\ntypedef Box b\nx=${b.secret}\n",
+        )
+        .unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("private"), "got: {msg}");
+    }
+
+    #[test]
+    fn typedef_private_field_blocks_external_write() {
+        let prog = parse(
+            "typedef Box { private secret=hidden; }\ntypedef Box b\nb.secret=leaked\n",
+        )
+        .unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("private"), "got: {msg}");
+    }
+
+    #[test]
+    fn typedef_private_field_visible_inside_lifecycle_hook() {
+        let (_, out, _) = run(
+            "typedef Box { private secret=hidden; function __init { echo \"from-init=${b.secret}\"; }; }\n\
+             typedef Box b\n",
+        );
+        assert_eq!(out, "from-init=hidden\n");
+    }
+
+    #[test]
+    fn typedef_del_unset_clears_instance_fields() {
+        // After `unset`, the per-instance `var.field` bindings
+        // are swept out alongside the bare var — `${b.x}` reads
+        // empty.
+        let (_, out, _) = run(
+            "typedef T { x=alive; }\ntypedef T b\necho before=${b.x}\nunset b\necho after=[${b.x}]\n",
+        );
+        assert_eq!(out, "before=alive\nafter=[]\n");
+    }
+
+    #[test]
+    fn typedef_unknown_method_rejected() {
+        // v1 OOP commit only models the `__init` / `__del`
+        // lifecycle hooks. Other methods are reserved for a
+        // follow-up.
+        let res = parse(
+            "typedef T { function helper { :; }; }\n",
+        );
+        assert!(res.is_err(), "expected parse error for typedef method");
     }
 
     // ===== compound member access =====
