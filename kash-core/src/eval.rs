@@ -2985,6 +2985,56 @@ impl<B: MapBackend> Evaluator<B> {
         out
     }
 
+    /// `(%)` — prompt-style escape expansion. v1 understands a
+    /// small fixed vocabulary: `%n` → `USER`, `%~` → cwd with
+    /// `$HOME` collapsed to `~`, `%/` → cwd, `%%` → literal
+    /// `%`. Anything else passes through verbatim so a future
+    /// commit can extend the table without breaking callers.
+    fn expand_prompt_escapes(&mut self, s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'%' => {
+                        out.push('%');
+                        i += 2;
+                        continue;
+                    }
+                    b'n' => {
+                        if let Some(v) = self.scope.get("USER") {
+                            out.push_str(&v.to_scalar_string());
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    b'/' => {
+                        #[cfg(feature = "std")]
+                        if let Ok(p) = std::env::current_dir() {
+                            out.push_str(&p.to_string_lossy());
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    b'~' => {
+                        #[cfg(feature = "std")]
+                        if let Ok(p) = std::env::current_dir() {
+                            let s = p.to_string_lossy().to_string();
+                            out.push_str(&self.abbreviate_home_prefix(s));
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
     /// `(D)` — replace a leading `$HOME` prefix with `~`. No-op
     /// when `HOME` is unset or the value doesn't start with it.
     fn abbreviate_home_prefix(&mut self, value: String) -> String {
@@ -4374,6 +4424,29 @@ impl<B: MapBackend> Evaluator<B> {
                 let mut buf = String::new();
                 self.expand_dollar(&inner, &mut buf)?;
                 inner = buf;
+            }
+            // `(#)` — interpret the value as an arithmetic
+            // expression yielding a Unicode codepoint, then
+            // replace the value with the resulting character.
+            if flags.sharp_char {
+                let n = self.eval_arith(&inner)?;
+                if let Some(c) = char::from_u32(n as u32) {
+                    inner = alloc::format!("{c}");
+                } else {
+                    inner = String::new();
+                }
+            }
+            // `(g)` — ANSI-C escape decode (`\n` → newline,
+            // `\xHH` → byte, etc.). Re-uses the same decoder
+            // as the `$'…'` literal handler.
+            if flags.g_decode {
+                inner = ansi_c_decode(&inner);
+            }
+            // `(%)` — prompt-style escapes. v1 understands a
+            // tiny vocabulary; the full surface lands once the
+            // prompt system is in place.
+            if flags.pct_prompt {
+                inner = self.expand_prompt_escapes(&inner);
             }
             // `(D)` collapses a `$HOME` prefix into `~`.
             if flags.dir_abbrev {
@@ -6347,6 +6420,47 @@ pub struct ExpansionFlags {
     compound_keys: bool,
     /// `(v)` — values. Same as `(k)` but for the values.
     compound_values: bool,
+    /// `:h` / `:t` / `:r` / `:e` — path-component modifier.
+    /// Applied right after the value is fetched, before split.
+    path_modifier: Option<PathModifier>,
+    /// `(g)` — GLOB-style ANSI-C escape decode of the value.
+    /// `\n`, `\t`, `\\`, etc. round-trip back to their byte
+    /// values.
+    g_decode: bool,
+    /// `(V)` — visible escapes. Control and high bytes render
+    /// as `\xHH` so the resulting string is safe to print on
+    /// any terminal.
+    v_visible: bool,
+    /// `(c)` — character count. Replaces the value with the
+    /// count of Unicode scalar values it contains.
+    c_count: bool,
+    /// `(#)` — character from code. Interpret the value as an
+    /// arithmetic expression yielding a Unicode codepoint, then
+    /// replace it with the corresponding character.
+    sharp_char: bool,
+    /// `(%)` — prompt expansion. v1 recognises a small
+    /// fixed-vocabulary subset: `%n` user, `%~` cwd, `%%`
+    /// literal percent. Full ksh / zsh prompt escapes arrive
+    /// once the prompt system lands.
+    pct_prompt: bool,
+}
+
+/// `:h` / `:t` / `:r` / `:e` — path modifiers from the zsh
+/// expansion-flag block. The same set of glyphs appear as
+/// bare modifiers (`${var:h}`); this enum names the variant
+/// either path uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathModifier {
+    /// `:h` — head: strip the last `/`-separated component
+    /// (`dirname`).
+    Head,
+    /// `:t` — tail: keep only the last component
+    /// (`basename`).
+    Tail,
+    /// `:r` — root: strip the trailing `.ext`.
+    Root,
+    /// `:e` — extension: keep only the trailing extension.
+    Extension,
 }
 
 /// `(o)` / `(O)` — sort direction.
@@ -6381,6 +6495,12 @@ impl ExpansionFlags {
             && !self.at_preserve
             && !self.compound_keys
             && !self.compound_values
+            && self.path_modifier.is_none()
+            && !self.g_decode
+            && !self.v_visible
+            && !self.c_count
+            && !self.sharp_char
+            && !self.pct_prompt
     }
 }
 
@@ -6545,9 +6665,53 @@ pub fn parse_expansion_flag_block(body: &str) -> Result<(ExpansionFlags, &str)> 
                 flags.compound_values = true;
                 idx += 1;
             }
+            b':' => {
+                // Path modifier: `:h` / `:t` / `:r` / `:e`. The
+                // next byte selects the variant; anything else
+                // is a parse error.
+                idx += 1;
+                if idx >= bytes.len() {
+                    return Err(KashError::Parse(
+                        "expansion modifier `:` is missing the variant character (h/t/r/e)".into(),
+                    ));
+                }
+                flags.path_modifier = Some(match bytes[idx] {
+                    b'h' => PathModifier::Head,
+                    b't' => PathModifier::Tail,
+                    b'r' => PathModifier::Root,
+                    b'e' => PathModifier::Extension,
+                    other => {
+                        return Err(KashError::Parse(alloc::format!(
+                            "unknown path modifier `:{}` (expected `h`/`t`/`r`/`e`)",
+                            other as char,
+                        )));
+                    }
+                });
+                idx += 1;
+            }
+            b'g' => {
+                flags.g_decode = true;
+                idx += 1;
+            }
+            b'V' => {
+                flags.v_visible = true;
+                idx += 1;
+            }
+            b'c' => {
+                flags.c_count = true;
+                idx += 1;
+            }
+            b'#' => {
+                flags.sharp_char = true;
+                idx += 1;
+            }
+            b'%' => {
+                flags.pct_prompt = true;
+                idx += 1;
+            }
             other => {
                 return Err(KashError::Parse(alloc::format!(
-                    "unsupported expansion flag `{}` (path-modifier / misc families come in the final sub-commit)",
+                    "unknown expansion flag `{}`",
                     other as char,
                 )));
             }
@@ -6577,6 +6741,14 @@ pub fn apply_expansion_flags_parts(
     if matches!(flags.quote, Some(QuoteFlag::Unquote)) {
         for p in &mut parts {
             *p = dequote_value(p);
+        }
+    }
+    // Path modifier — applied before split so each element of
+    // an already-multi-element list (e.g. from `(k)` / `(v)`)
+    // gets its path component computed independently.
+    if let Some(m) = flags.path_modifier {
+        for p in &mut parts {
+            *p = apply_path_modifier(p, m);
         }
     }
     // Split happens before join — `(s.,.j.+.)` is the natural
@@ -6633,7 +6805,80 @@ pub fn apply_expansion_flags_parts(
         Some(CaseFlag::Title) => title_case(&value),
         None => value,
     };
+    // `(V)` — make invisible bytes visible. Runs last so the
+    // user sees the *final* value's bytes if any earlier flag
+    // produced unprintable output.
+    if flags.v_visible {
+        value = make_visible(&value);
+    }
+    // `(c)` — replace the value with its character count. The
+    // counter sees the post-everything string so it agrees
+    // with what the user would otherwise see.
+    if flags.c_count {
+        value = alloc::format!("{}", value.chars().count());
+    }
     value
+}
+
+/// Apply a single path modifier (`:h` / `:t` / `:r` / `:e`)
+/// to `s`.
+fn apply_path_modifier(s: &str, m: PathModifier) -> String {
+    match m {
+        PathModifier::Head => {
+            // Strip everything from the final `/` onwards. A
+            // value with no `/` collapses to the empty string,
+            // matching `dirname`'s behaviour on a bare file
+            // name returning `.` — but ksh / zsh path modifiers
+            // return empty here, so do the same.
+            match s.rfind('/') {
+                Some(i) => s[..i].to_string(),
+                None => String::new(),
+            }
+        }
+        PathModifier::Tail => match s.rfind('/') {
+            Some(i) => s[i + 1..].to_string(),
+            None => s.to_string(),
+        },
+        PathModifier::Root => {
+            // Strip the trailing `.ext`. A leading `.` (dot-
+            // file) does not count: `.bashrc:r` → `.bashrc`.
+            let tail_start = s.rfind('/').map(|i| i + 1).unwrap_or(0);
+            let tail = &s[tail_start..];
+            if tail.starts_with('.') && tail[1..].find('.').is_none() {
+                return s.to_string();
+            }
+            match s.rfind('.') {
+                Some(i) if i > tail_start => s[..i].to_string(),
+                _ => s.to_string(),
+            }
+        }
+        PathModifier::Extension => {
+            let tail_start = s.rfind('/').map(|i| i + 1).unwrap_or(0);
+            let tail = &s[tail_start..];
+            if tail.starts_with('.') && tail[1..].find('.').is_none() {
+                return String::new();
+            }
+            match s.rfind('.') {
+                Some(i) if i > tail_start => s[i + 1..].to_string(),
+                _ => String::new(),
+            }
+        }
+    }
+}
+
+/// `(V)` — render unprintable bytes (`< 0x20` and `0x7f`) as
+/// `\xHH` so the final string is safe to send to a terminal.
+fn make_visible(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let code = c as u32;
+        if code < 0x20 || code == 0x7f {
+            out.push_str(&alloc::format!("\\x{code:02x}"));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Read a paired-delim argument that follows a flag character.
@@ -12651,14 +12896,13 @@ mod tests {
 
     #[test]
     fn zsh_flag_unsupported_char_rejected() {
-        // `(g)` is a path-modifier-family flag still pending.
-        // Until the final sub-commit lands it, an unknown flag
-        // must report a clear error.
-        let prog = parse("x=hi\necho \"${(g)x}\"\n").unwrap();
+        // Genuinely unknown flag character; all real zsh flags
+        // are wired up after this commit.
+        let prog = parse("x=hi\necho \"${(Z)x}\"\n").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
-        assert!(msg.contains("g"), "got: {msg}");
+        assert!(msg.contains("Z"), "got: {msg}");
     }
 
     #[test]
@@ -12844,6 +13088,95 @@ mod tests {
     fn zsh_flag_at_widens_join_separator() {
         let (_, out, _) = run("x=a,b,c\necho \"${(s.,.@)x}\"\n");
         assert_eq!(out, "a b c\n");
+    }
+
+    // ===== zsh-style expansion flags (path modifier + misc) =====
+
+    #[test]
+    fn zsh_flag_path_modifier_h() {
+        let (_, out, _) =
+            run("p=/home/user/projects/foo.rs\necho \"${(:h)p}\"\n");
+        assert_eq!(out, "/home/user/projects\n");
+    }
+
+    #[test]
+    fn zsh_flag_path_modifier_t() {
+        let (_, out, _) =
+            run("p=/home/user/projects/foo.rs\necho \"${(:t)p}\"\n");
+        assert_eq!(out, "foo.rs\n");
+    }
+
+    #[test]
+    fn zsh_flag_path_modifier_r() {
+        let (_, out, _) =
+            run("p=/home/user/projects/foo.rs\necho \"${(:r)p}\"\n");
+        assert_eq!(out, "/home/user/projects/foo\n");
+    }
+
+    #[test]
+    fn zsh_flag_path_modifier_e() {
+        let (_, out, _) =
+            run("p=/home/user/projects/foo.rs\necho \"${(:e)p}\"\n");
+        assert_eq!(out, "rs\n");
+    }
+
+    #[test]
+    fn zsh_flag_path_modifier_no_extension() {
+        // `foo` has no extension; `:e` returns empty, `:r`
+        // returns the unchanged name.
+        let (_, out, _) = run("p=plain\necho \"[${(:e)p}][${(:r)p}]\"\n");
+        assert_eq!(out, "[][plain]\n");
+    }
+
+    #[test]
+    fn zsh_flag_path_modifier_dotfile_keeps_name() {
+        // `.bashrc:r` should yield `.bashrc`, not the empty
+        // string — the leading dot does not count as an
+        // extension separator.
+        let (_, out, _) =
+            run("p=/home/u/.bashrc\necho \"${(:r)p}|${(:e)p}\"\n");
+        assert_eq!(out, "/home/u/.bashrc|\n");
+    }
+
+    #[test]
+    fn zsh_flag_g_decodes_ansi_c_escapes() {
+        let (_, out, _) = run("x='hello\\nworld'\necho \"${(g)x}|\"\n");
+        assert_eq!(out, "hello\nworld|\n");
+    }
+
+    #[test]
+    fn zsh_flag_v_renders_invisible_bytes() {
+        // `(g)` decodes the literal `\t`/`\n` into real control
+        // bytes; `(V)` then renders them as `\xHH`.
+        let (_, out, _) = run("x='a\\tb\\nc'\necho \"${(gV)x}|\"\n");
+        assert!(out.contains("\\x09") || out.contains("\\x0a"), "got: {out}");
+    }
+
+    #[test]
+    fn zsh_flag_c_counts_characters() {
+        let (_, out, _) = run("x=hello\necho \"${(c)x}\"\n");
+        assert_eq!(out, "5\n");
+    }
+
+    #[test]
+    fn zsh_flag_sharp_converts_codepoint() {
+        let (_, out, _) = run("n=65\necho \"${(#)n}\"\n");
+        assert_eq!(out, "A\n");
+    }
+
+    #[test]
+    fn zsh_flag_pct_expands_user() {
+        let (_, out, _) = run(
+            "USER=alice\npat='%n@host'\necho \"${(%)pat}\"\n",
+        );
+        assert_eq!(out, "alice@host\n");
+    }
+
+    #[test]
+    fn zsh_flag_pct_double_percent_literal() {
+        let (_, out, _) =
+            run("pat='100%%done'\necho \"${(%)pat}\"\n");
+        assert_eq!(out, "100%done\n");
     }
 
     #[test]
