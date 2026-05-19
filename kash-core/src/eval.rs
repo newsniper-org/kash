@@ -780,6 +780,88 @@ impl<B: MapBackend> Evaluator<B> {
         core::mem::take(&mut self.stderr_output)
     }
 
+    /// Run a compound command with redirects applied. Minimal
+    /// surface: `> file`, `>> file`, `&> file`, `&>> file` route
+    /// the body's captured stdout (and optionally stderr) into the
+    /// target file. Input / stderr-only / fd-dup redirects on
+    /// compound bodies aren't supported yet.
+    fn eval_compound_with_redirects(&mut self, c: &CompoundCommand) -> Result<Outcome> {
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = c;
+            return Err(KashError::Runtime(
+                "redirections on compound commands require the std feature".into(),
+            ));
+        }
+        #[cfg(feature = "std")]
+        {
+            self.eval_compound_with_redirects_std(c)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn eval_compound_with_redirects_std(&mut self, c: &CompoundCommand) -> Result<Outcome> {
+        use crate::ast::RedirectKind;
+        use std::io::Write;
+        // Reject input / fd-dup redirects before opening any
+        // files, so a missing path doesn't override the
+        // "not-supported" message.
+        for r in &c.redirects {
+            if matches!(
+                r.kind,
+                RedirectKind::Input
+                    | RedirectKind::HereString
+                    | RedirectKind::HereDoc { .. }
+                    | RedirectKind::DupInput
+            ) {
+                return Err(KashError::Runtime(
+                    "input redirect on a compound command isn't supported yet".into(),
+                ));
+            }
+        }
+        let io = self.resolve_stage_io(&c.redirects)?;
+        if io.in_file.is_some() || io.in_inline.is_some() {
+            return Err(KashError::Runtime(
+                "input redirect on a compound command isn't supported yet".into(),
+            ));
+        }
+        let Some(mut out_file) = io.stdout_file else {
+            return Err(KashError::Runtime(
+                "only `> file` / `>> file` / `&> file` redirects on compound commands are supported"
+                    .into(),
+            ));
+        };
+        // Capture everything the body writes to the evaluator's
+        // output buffer, then route the new tail into `out_file`.
+        // Builtins / function results land in `output` directly;
+        // external commands' stdout is captured into the same
+        // buffer by the spawn-time `stdout(Stdio::piped())`.
+        let mut stderr_file = if io.stderr_follows_stdout {
+            Some(
+                out_file
+                    .try_clone()
+                    .map_err(|e| KashError::Runtime(alloc::format!("dup: {e}")))?,
+            )
+        } else {
+            io.stderr_file
+        };
+        let old_len = self.output.len();
+        let result = self.eval_compound_inner(c);
+        let chunk = self.output[old_len..].as_bytes().to_vec();
+        self.output.truncate(old_len);
+        out_file
+            .write_all(&chunk)
+            .map_err(|e| KashError::Runtime(alloc::format!("compound redirect write: {e}")))?;
+        // Route any buffered stderr too — same drain pattern.
+        if let Some(stderr_file) = stderr_file.as_mut() {
+            let stderr_chunk = core::mem::take(&mut self.stderr_output);
+            stderr_file
+                .write_all(stderr_chunk.as_bytes())
+                .map_err(|e| KashError::Runtime(alloc::format!("compound stderr write: {e}")))?;
+        }
+        result
+    }
+
     fn eval_command(&mut self, cmd: &Command) -> Result<Outcome> {
         let result = match cmd {
             Command::Simple(s) => self.eval_simple(s),
@@ -1920,10 +2002,12 @@ impl<B: MapBackend> Evaluator<B> {
 
     fn eval_compound(&mut self, c: &CompoundCommand) -> Result<Outcome> {
         if !c.redirects.is_empty() {
-            return Err(KashError::Runtime(
-                "redirections on compound commands are not yet supported".into(),
-            ));
+            return self.eval_compound_with_redirects(c);
         }
+        self.eval_compound_inner(c)
+    }
+
+    fn eval_compound_inner(&mut self, c: &CompoundCommand) -> Result<Outcome> {
         match &c.kind {
             CompoundKind::BraceGroup { body } => self.eval_statements(body),
             CompoundKind::Subshell { body } => {
@@ -7862,6 +7946,58 @@ mod tests {
         }
 
         #[test]
+        fn compound_brace_group_stdout_redirect() {
+            let tmp = std::env::temp_dir().join("kash-cmp-redirect.txt");
+            let _ = std::fs::remove_file(&tmp);
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "{{ echo a; echo b; echo c; }} >{path}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&tmp).unwrap(),
+                "a\nb\nc\n"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn compound_for_loop_stdout_redirect() {
+            let tmp = std::env::temp_dir().join("kash-cmp-for-redirect.txt");
+            let _ = std::fs::remove_file(&tmp);
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!(
+                "for x in a b c; do echo \"item: $x\"; done >{path}\n"
+            );
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&tmp).unwrap(),
+                "item: a\nitem: b\nitem: c\n"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
+        fn compound_append_redirect_extends_file() {
+            let tmp = std::env::temp_dir().join("kash-cmp-append.txt");
+            std::fs::write(&tmp, "first\n").unwrap();
+            let path = tmp.to_str().unwrap();
+            let src = alloc::format!("{{ echo second; }} >>{path}\n");
+            let prog = parse(&src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&tmp).unwrap(),
+                "first\nsecond\n"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        #[test]
         fn here_doc_with_trailing_semicolon_separates_statements() {
             if !have("/bin/cat") {
                 return;
@@ -8801,6 +8937,23 @@ mod tests {
              f\n",
         );
         assert_eq!(out, "second\n");
+    }
+
+    // ===== compound redirect =====
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compound_input_redirect_rejected_with_message() {
+        // input redirect on compound bodies is explicit not-yet-
+        // supported. The exact wording is the contract. alloc-
+        // only builds get a different "requires std" message
+        // because the whole redirect path is std-gated there.
+        let src = "{ echo a; } < /tmp/nope.txt\n";
+        let prog = parse(src).unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        let msg = alloc::format!("{err}");
+        assert!(msg.contains("input redirect"), "got: {msg}");
     }
 
     // ===== `command` builtin =====
