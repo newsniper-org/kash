@@ -2102,20 +2102,34 @@ fn is_valid_identifier(s: &str) -> bool {
         .all(|b| *b == b'_' || b.is_ascii_alphanumeric())
 }
 
-/// Dotted compound name — `var`, `var.x`, `var.x.y`, … Each
+/// Dotted compound name — `var`, `var.x`, `var.x.y`, …. Each
 /// segment is itself a valid identifier; segments are separated
 /// by single `.` characters; no trailing dot or empty segment.
-/// Used by `var.member=val` assignments and `${var.member}`
-/// lookups.
+/// A leading `.` is allowed (`.sh.value`, `.foo.bar`) so absolute
+/// reserved-namespace paths can show up on the LHS of an
+/// assignment. Used by `var.member=val` assignments and
+/// `${var.member}` lookups.
 fn is_valid_compound_name(s: &str) -> bool {
-    !s.is_empty() && s.split('.').all(is_valid_identifier)
+    if s.is_empty() {
+        return false;
+    }
+    let body = s.strip_prefix('.').unwrap_or(s);
+    !body.is_empty() && body.split('.').all(is_valid_identifier)
 }
 
-/// A valid function name is a valid identifier that isn't a reserved
-/// keyword. Reserved words used as function names lead to confusing
-/// parses; reject them up front.
+/// A valid function name. Three shapes accepted:
+///   * Plain identifier (`f`, `myfunc`).
+///   * Compound-member path (`p.x.method`) — same surface as
+///     `is_valid_compound_name`.
+///   * Discipline path with a leading `.` (`.var.set`, `.var.get`,
+///     `.var.unset`, …) — used by the variable-discipline hooks.
+/// Reserved keywords are rejected up front.
 fn is_valid_function_name(s: &str) -> bool {
-    is_valid_identifier(s) && reserved_word(s).is_none()
+    if reserved_word(s).is_some() {
+        return false;
+    }
+    let inner = s.strip_prefix('.').unwrap_or(s);
+    is_valid_compound_name(inner)
 }
 
 /// True iff `s` starts with `NAME=` where `NAME` is a valid

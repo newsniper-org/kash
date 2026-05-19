@@ -215,6 +215,21 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// PID of the most-recently-spawned background job (the `$!`
     /// special parameter). Zero before any `cmd &` has run.
     last_bg_pid: i32,
+    /// Special `${.sh.value}` slot — the in-out channel between a
+    /// variable's discipline hook (`.var.set` / `.var.get`) and
+    /// the caller. Stored outside the ordinary scope stack so a
+    /// hook defined under `function NAME` (static scope) can still
+    /// mutate it and have the caller see the result. Always
+    /// readable / writable; default empty.
+    discipline_value: String,
+    /// Re-entry guards for discipline-function hooks. When the
+    /// set / get / unset hook for `name` is in flight, further
+    /// assignment / lookup / unset of `name` skips the hook (so
+    /// the hook itself can write to `.sh.value` or read the
+    /// binding without triggering a cascade). Stored as a set of
+    /// `(name, action)` pairs so multiple variables' hooks can be
+    /// active concurrently.
+    discipline_guard: alloc::collections::BTreeSet<(String, &'static str)>,
     /// User-defined type registry — `typedef NAME { … }`. Each
     /// entry stores the member list with default-value words; an
     /// instance (`typedef NAME var`) copies those defaults into
@@ -334,6 +349,8 @@ impl<B: MapBackend> Evaluator<B> {
             trace_output: String::new(),
             stderr_output: String::new(),
             last_bg_pid: 0,
+            discipline_value: String::new(),
+            discipline_guard: alloc::collections::BTreeSet::new(),
             type_defs: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "std")]
             compound_input: None,
@@ -442,6 +459,72 @@ impl<B: MapBackend> Evaluator<B> {
             return name.to_string();
         }
         self.qualify_decl_name(name)
+    }
+
+    /// Apply the `set` discipline hook (`.<name>.set`) when one
+    /// is registered. The raw value is placed in `.sh.value`, the
+    /// hook is invoked, and the (possibly mutated) `.sh.value` is
+    /// returned to the caller as the value to actually store.
+    /// Re-entry from inside the hook itself skips this path and
+    /// stores the value directly.
+    fn apply_set_discipline(
+        &mut self,
+        name: &str,
+        raw_value: String,
+    ) -> Result<String> {
+        let hook = alloc::format!(".{name}.set");
+        if self.discipline_guard.contains(&(name.to_string(), "set"))
+            || self.resolve_function_name(&hook).is_none()
+        {
+            return Ok(raw_value);
+        }
+        // Seed the discipline channel with the incoming value so
+        // the hook can read / mutate it through `${.sh.value}`.
+        let saved = core::mem::replace(&mut self.discipline_value, raw_value);
+        self.discipline_guard.insert((name.to_string(), "set"));
+        let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_guard.remove(&(name.to_string(), "set"));
+        let stored = core::mem::replace(&mut self.discipline_value, saved);
+        Ok(stored)
+    }
+
+    /// Apply the `get` discipline hook (`.<name>.get`) when one
+    /// is registered. The current binding's value is placed in
+    /// `.sh.value` before the hook runs; the hook can transform
+    /// it; the hook's resulting `.sh.value` is returned.
+    fn apply_get_discipline(
+        &mut self,
+        name: &str,
+        current: String,
+    ) -> String {
+        let hook = alloc::format!(".{name}.get");
+        if self.discipline_guard.contains(&(name.to_string(), "get"))
+            || self.resolve_function_name(&hook).is_none()
+        {
+            return current;
+        }
+        let saved = core::mem::replace(&mut self.discipline_value, current);
+        self.discipline_guard.insert((name.to_string(), "get"));
+        let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_guard.remove(&(name.to_string(), "get"));
+        core::mem::replace(&mut self.discipline_value, saved)
+    }
+
+    /// Apply the `unset` discipline hook (`.<name>.unset`) when
+    /// one is registered. The hook receives no value — it's a
+    /// notification. Re-entry skips.
+    fn apply_unset_discipline(&mut self, name: &str) {
+        let hook = alloc::format!(".{name}.unset");
+        if self.discipline_guard.contains(&(name.to_string(), "unset"))
+            || self.resolve_function_name(&hook).is_none()
+        {
+            return;
+        }
+        self.discipline_guard
+            .insert((name.to_string(), "unset"));
+        let _ = self.call_function(&alloc::vec![hook]);
+        self.discipline_guard
+            .remove(&(name.to_string(), "unset"));
     }
 
     /// Follow a chain of `typeset -n` namerefs starting from
@@ -1254,11 +1337,22 @@ impl<B: MapBackend> Evaluator<B> {
             // If `qualified` is itself a `typeset -n` nameref, the
             // write follows the chain to the target binding.
             let target = self.follow_nameref_chain(&qualified);
+            // `.sh.value` is the discipline-hook channel — it lives
+            // outside the scope stack so a hook defined under a
+            // static-scoped `function NAME` form can still mutate
+            // it visibly to its caller.
+            if target == ".sh.value" {
+                self.discipline_value = value;
+                continue;
+            }
             if let Some(sub) = &a.subscript {
                 let idx = self.expand_word(sub)?;
                 self.assign_array_element(&target, &idx, value)?;
             } else {
-                self.scope.assign(&target, Value::Scalar(value))?;
+                // Discipline `.<target>.set` hook gets a chance to
+                // transform the incoming value before storage.
+                let stored = self.apply_set_discipline(&target, value)?;
+                self.scope.assign(&target, Value::Scalar(stored))?;
             }
         }
         if cmd.words.is_empty() {
@@ -1547,6 +1641,9 @@ impl<B: MapBackend> Evaluator<B> {
             if self.scope.is_readonly(name) {
                 return Err(KashError::Readonly(name.clone()));
             }
+            // Discipline `.<name>.unset` hook gets notified before
+            // the binding actually disappears.
+            self.apply_unset_discipline(name);
             // A non-existent name returning 0 matches POSIX behaviour.
             let _ = self.scope.unset(name);
             // Allow unsetting a function as a convenience.
@@ -3900,6 +3997,7 @@ impl<B: MapBackend> Evaluator<B> {
                 }
                 Ok(Some(out))
             }
+            "value" => Ok(Some(self.discipline_value.clone())),
             other => Err(KashError::Parse(alloc::format!(
                 "unknown `.sh.{other}` introspection variable"
             ))),
@@ -4234,17 +4332,19 @@ impl<B: MapBackend> Evaluator<B> {
         // Follow `typeset -n` namerefs through to the bound name.
         let effective = self.follow_nameref_chain(name);
         // venv env overlay wins over the regular scope.
-        if let Some(v) = self.venv_env_value(&effective) {
-            return v;
-        }
-        match self.resolve_var_name(&effective) {
-            Some(resolved) => self
-                .scope
-                .get(&resolved)
-                .map(|v| v.to_scalar_string())
-                .unwrap_or_default(),
-            None => String::new(),
-        }
+        let raw = if let Some(v) = self.venv_env_value(&effective) {
+            v
+        } else {
+            match self.resolve_var_name(&effective) {
+                Some(resolved) => self
+                    .scope
+                    .get(&resolved)
+                    .map(|v| v.to_scalar_string())
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        };
+        self.apply_get_discipline(&effective, raw)
     }
 
     /// Look up `name` and return its scalar form, or empty for unset.
@@ -4278,19 +4378,27 @@ impl<B: MapBackend> Evaluator<B> {
         }
         let effective = self.follow_nameref_chain(name);
         if let Some(v) = self.venv_env_value(&effective) {
-            return Ok(v);
+            return Ok(self.apply_get_discipline(&effective, v));
         }
         let resolved = self.resolve_var_name(&effective);
-        let name = effective.as_str();
-        match resolved.as_ref().and_then(|n| self.scope.get(n)) {
-            Some(v) => Ok(v.to_scalar_string()),
+        let raw = match resolved.as_ref().and_then(|n| self.scope.get(n)) {
+            Some(v) => Some(v.to_scalar_string()),
+            None => None,
+        };
+        match raw {
+            Some(r) => Ok(self.apply_get_discipline(&effective, r)),
             None => {
                 if self.options.nounset {
                     Err(KashError::Runtime(alloc::format!(
-                        "{name}: parameter not set"
+                        "{name}: parameter not set",
+                        name = effective
                     )))
                 } else {
-                    Ok(String::new())
+                    // Even unset bindings get to run their get
+                    // hook — that's how a "computed" variable
+                    // (a hook that fabricates its own value) is
+                    // supposed to work in ksh93.
+                    Ok(self.apply_get_discipline(&effective, String::new()))
                 }
             }
         }
@@ -10270,6 +10378,52 @@ mod tests {
             msg.contains("here-doc") || msg.contains("here-string"),
             "got: {msg}",
         );
+    }
+
+    // ===== discipline functions =====
+
+    #[test]
+    fn discipline_set_transforms_stored_value() {
+        let (_, out, _) = run(
+            "function .x.set { .sh.value=\"set:${.sh.value}\"; }\nx=raw\necho $x\n",
+        );
+        assert_eq!(out, "set:raw\n");
+    }
+
+    #[test]
+    fn discipline_get_transforms_read_value() {
+        let (_, out, _) = run(
+            "y=base\nfunction .y.get { .sh.value=\"${.sh.value}-modified\"; }\necho $y\n",
+        );
+        assert_eq!(out, "base-modified\n");
+    }
+
+    #[test]
+    fn discipline_unset_hook_runs_before_removal() {
+        let (_, out, _) = run(
+            "function .z.unset { echo gone-z; }\nz=alive\nunset z\necho \"after=[$z]\"\n",
+        );
+        assert_eq!(out, "gone-z\nafter=[]\n");
+    }
+
+    #[test]
+    fn discipline_set_reentry_guarded() {
+        // The hook itself assigns *to the same variable* by going
+        // through `.sh.value` — the re-entry guard stops the hook
+        // from triggering itself.
+        let (_, out, _) = run(
+            "function .v.set { .sh.value=\"once:${.sh.value}\"; }\nv=in\necho $v\n",
+        );
+        assert_eq!(out, "once:in\n");
+    }
+
+    #[test]
+    fn discipline_get_on_unset_var_lets_hook_synthesise() {
+        // No prior `name=…`; the get hook fabricates the value.
+        let (_, out, _) = run(
+            "function .ghost.get { .sh.value=summoned; }\necho $ghost\n",
+        );
+        assert_eq!(out, "summoned\n");
     }
 
     // ===== `typedef` (user-defined type) =====
