@@ -4156,6 +4156,187 @@ ifstd!({
             Ok(Outcome::Status(status.code().unwrap_or(128)))
         }
 
+        /// Expand the *first* pipeline stage's argv only — used by
+        /// the pure-output-builtin bridge so we can peek the
+        /// command name without committing to the full
+        /// external-spawn validation pass.
+        fn expand_pipeline_first_stage_argv(
+            &mut self,
+            pipe: &Pipeline,
+        ) -> Result<alloc::vec::Vec<String>> {
+            let Some(crate::ast::Command::Simple(s)) = pipe.stages.first() else {
+                return Ok(alloc::vec::Vec::new());
+            };
+            let mut argv: alloc::vec::Vec<String> = alloc::vec::Vec::with_capacity(s.words.len());
+            for w in &s.words {
+                argv.extend(self.expand_word_to_fields(w)?);
+            }
+            Ok(argv)
+        }
+
+        /// Run a pipeline whose first stage is a pure-output
+        /// builtin. The builtin runs in-process; its output bytes
+        /// are written into the second stage's piped stdin; the
+        /// rest of the chain spawns externally as usual.
+        fn run_pipeline_with_inproc_first(
+            &mut self,
+            pipe: &Pipeline,
+            first_argv: alloc::vec::Vec<String>,
+        ) -> Result<Outcome> {
+            use std::io::{Read, Write};
+            use std::process::{Child, Command, Stdio};
+            // Step 1: run the leading builtin into a side buffer.
+            let old_len = self.output.len();
+            let leading = self.dispatch_known_builtin(&first_argv)?;
+            let initial_bytes = self.output[old_len..].as_bytes().to_vec();
+            self.output.truncate(old_len);
+            let leading_status = leading.status();
+            // Step 2: validate + spawn the remaining stages exactly
+            // the way the regular external path does.
+            struct StageSpec {
+                argv: alloc::vec::Vec<String>,
+                io: StageIo,
+            }
+            let mut specs: alloc::vec::Vec<StageSpec> =
+                alloc::vec::Vec::with_capacity(pipe.stages.len() - 1);
+            for stage in &pipe.stages[1..] {
+                let simple = match stage {
+                    crate::ast::Command::Simple(s) => s,
+                    crate::ast::Command::Compound(_) => {
+                        return Err(KashError::Runtime(
+                            "compound commands in pipeline stages are not yet supported".into(),
+                        ));
+                    }
+                };
+                if !simple.assignments.is_empty() {
+                    return Err(KashError::Runtime(
+                        "assignment prefixes in pipeline stages are not yet supported".into(),
+                    ));
+                }
+                let mut argv = alloc::vec::Vec::with_capacity(simple.words.len());
+                for w in &simple.words {
+                    argv.extend(self.expand_word_to_fields(w)?);
+                }
+                if argv.is_empty() {
+                    return Err(KashError::Runtime("pipeline stage expanded to nothing".into()));
+                }
+                let name = argv[0].as_str();
+                if self.resolve_function_name(name).is_some() || is_builtin_name(name) {
+                    return Err(KashError::Runtime(alloc::format!(
+                        "builtin or function `{name}` past the first pipeline stage is not yet supported"
+                    )));
+                }
+                let io = self.resolve_stage_io(&simple.redirects)?;
+                specs.push(StageSpec { argv, io });
+            }
+            let n = specs.len();
+            let mut children: alloc::vec::Vec<Child> = alloc::vec::Vec::with_capacity(n);
+            for (i, spec) in specs.iter_mut().enumerate() {
+                let StageSpec { argv, io } = spec;
+                self.check_external_spawn(&argv[0])?;
+                let resolved =
+                    resolve_in_path(self, &argv[0]).unwrap_or_else(|| argv[0].clone());
+                let mut cmd = Command::new(&resolved);
+                cmd.args(&argv[1..]);
+                self.apply_exported_env(&mut cmd);
+                // stdin: per-stage redirect wins; else previous-
+                // stage pipe (i > 0); else *the first stage's
+                // captured bytes* (i == 0) via piped stdin.
+                let inline_bytes = io.in_inline.take();
+                let need_inline_pipe = inline_bytes.is_some();
+                if let Some(f) = io.in_file.take() {
+                    cmd.stdin(Stdio::from(f));
+                } else if need_inline_pipe {
+                    cmd.stdin(Stdio::piped());
+                } else if i == 0 {
+                    cmd.stdin(Stdio::piped());
+                } else {
+                    let prev_stdout = children[i - 1]
+                        .stdout
+                        .take()
+                        .expect("previous stage was spawned with piped stdout");
+                    cmd.stdin(Stdio::from(prev_stdout));
+                }
+                if let Some(f) = io.stdout_file.take() {
+                    if io.stderr_follows_stdout {
+                        let f2 = f
+                            .try_clone()
+                            .map_err(|e| KashError::Runtime(alloc::format!("dup: {e}")))?;
+                        cmd.stdout(Stdio::from(f));
+                        cmd.stderr(Stdio::from(f2));
+                    } else {
+                        cmd.stdout(Stdio::from(f));
+                    }
+                } else {
+                    cmd.stdout(Stdio::piped());
+                }
+                if let Some(ef) = io.stderr_file.take() {
+                    cmd.stderr(Stdio::from(ef));
+                } else if !io.stderr_follows_stdout {
+                    cmd.stderr(Stdio::inherit());
+                }
+                let mut child = cmd.spawn().map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        KashError::ExternalNotFound(argv[0].clone())
+                    } else {
+                        KashError::Runtime(alloc::format!("spawn `{}`: {e}", argv[0]))
+                    }
+                })?;
+                // Feed the *first* external stage's stdin from the
+                // captured builtin output. Inline-stdin overrides
+                // this (it has its own bytes to write).
+                if i == 0
+                    && !need_inline_pipe
+                    && let Some(mut si) = child.stdin.take()
+                {
+                    si.write_all(&initial_bytes).map_err(|e| {
+                        KashError::Runtime(alloc::format!("write pipeline stdin: {e}"))
+                    })?;
+                }
+                if let Some(bytes) = inline_bytes
+                    && let Some(mut si) = child.stdin.take()
+                {
+                    si.write_all(&bytes).map_err(|e| {
+                        KashError::Runtime(alloc::format!("write stdin: {e}"))
+                    })?;
+                }
+                children.push(child);
+            }
+            // Drain last stdout into self.output.
+            let last = n - 1;
+            let mut buf = alloc::vec::Vec::<u8>::new();
+            if let Some(mut last_stdout) = children[last].stdout.take() {
+                last_stdout.read_to_end(&mut buf).map_err(|e| {
+                    KashError::Runtime(alloc::format!("read pipeline stdout: {e}"))
+                })?;
+                self.output.push_str(&String::from_utf8_lossy(&buf));
+            }
+            // Reap. Status policy matches the regular pipeline
+            // path: last stage's status by default; pipefail
+            // takes the right-most non-zero (including the
+            // in-process leading builtin's).
+            let mut last_status = 0;
+            let mut last_nonzero = if leading_status != 0 { leading_status } else { 0 };
+            for (i, child) in children.iter_mut().enumerate() {
+                let st = child
+                    .wait()
+                    .map_err(|e| KashError::Runtime(alloc::format!("wait: {e}")))?;
+                let code = st.code().unwrap_or(128);
+                if code != 0 {
+                    last_nonzero = code;
+                }
+                if i == last {
+                    last_status = code;
+                }
+            }
+            let final_status = if self.options.pipefail {
+                if last_nonzero != 0 { last_nonzero } else { 0 }
+            } else {
+                last_status
+            };
+            Ok(Outcome::Status(final_status))
+        }
+
         /// Spawn an N-stage pipeline of external commands. Stages
         /// that resolve to a builtin or function are rejected — the
         /// in-process / cross-process bridge for those lands later.
@@ -4167,13 +4348,22 @@ ifstd!({
             use std::io::{Read, Write};
             use std::process::{Child, Command, Stdio};
 
-            // Resolve every stage's argv + redirects up front. We
-            // can't lazy-resolve later because some redirect targets
-            // are `Word`s that need expansion against the current
-            // scope, and the borrow checker prefers we do all that
-            // before we start touching children. The pre-validation
-            // also lets us reject built-in / function stages before
-            // any process is spawned.
+            // First-stage in-process bridge: if the leading stage
+            // resolves to a *pure-output* builtin (`echo`, `printf`,
+            // `:`, `true`, `false`, `test`, `[`), run it in-process
+            // and route its captured output bytes as stdin into the
+            // second stage. Later stages keep going through the
+            // normal external-spawn path. Other in-process stages
+            // (function, side-effecting builtin like `read` or
+            // `set`) still bail with the original "not yet"
+            // diagnostic — handling them needs proper isolation.
+            let first_argv = self.expand_pipeline_first_stage_argv(pipe)?;
+            if let Some(name) = first_argv.first()
+                && is_pure_output_builtin(name)
+                && pipe.stages.len() >= 2
+            {
+                return self.run_pipeline_with_inproc_first(pipe, first_argv);
+            }
             struct StageSpec {
                 argv: alloc::vec::Vec<String>,
                 io: StageIo,
@@ -4347,6 +4537,19 @@ const fn default_fd_for(kind: crate::ast::RedirectKind) -> i32 {
         Output | Append | OutputBoth | AppendBoth => 1,
         DupOutput => 1,
     }
+}
+
+/// True iff `name` is one of the side-effect-free builtins whose
+/// output the pipeline driver can capture into a side buffer and
+/// feed into the next stage's stdin. These are the ones safe to
+/// run in-process *before* spawning the rest of a multi-stage
+/// pipeline. Side-effecting builtins (`read`, `set`, `unset`,
+/// `eval`, …) stay rejected because their effects belong to the
+/// caller's scope and can't be cleanly funnelled through a pipe.
+fn is_pure_output_builtin(name: &str) -> bool {
+    // `printf` would belong here once it lands as a builtin; for
+    // now `echo` is the practical case the bridge handles.
+    matches!(name, "echo" | ":" | "true" | "false" | "test" | "[")
 }
 
 fn is_builtin_name(name: &str) -> bool {
@@ -7998,6 +8201,42 @@ mod tests {
         }
 
         #[test]
+        fn pipeline_first_stage_echo_pipes_to_external() {
+            if !have("/usr/bin/tr") {
+                return;
+            }
+            let src = "echo \"abc XYZ\" | /usr/bin/tr a-z A-Z\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output(), "ABC XYZ\n");
+        }
+
+        #[test]
+        fn pipeline_first_stage_echo_three_stage() {
+            if !have("/usr/bin/tr") || !have("/usr/bin/wc") {
+                return;
+            }
+            let src = "echo \"a b c d\" | /usr/bin/tr ' ' '\\n' | /usr/bin/wc -l\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            ev.eval_program(&prog).unwrap();
+            assert_eq!(ev.take_output().trim(), "4");
+        }
+
+        #[test]
+        fn pipeline_first_stage_non_pure_builtin_still_rejected() {
+            // `read` is side-effecting (binds to caller scope), so
+            // the pipeline bridge intentionally doesn't handle it.
+            let src = "read X | /bin/cat\n";
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("not yet supported"), "got: {msg}");
+        }
+
+        #[test]
         fn here_doc_with_trailing_semicolon_separates_statements() {
             if !have("/bin/cat") {
                 return;
@@ -10502,12 +10741,20 @@ mod tests {
         }
 
         #[test]
-        fn pipeline_rejects_builtin_stage() {
-            // `echo` is an in-process builtin — using it as a pipeline
-            // stage isn't supported yet.
-            let prog = parse("echo a | /bin/cat").unwrap();
+        fn pipeline_rejects_non_first_builtin_stage() {
+            // A pure-output builtin as the *leading* stage runs
+            // in-process and bridges its captured output into the
+            // next stage's stdin — that case is now supported.
+            // A builtin past the first stage, however, still
+            // requires the cross-process bridge we haven't built.
+            if !have("/bin/echo") {
+                return;
+            }
+            let prog = parse("/bin/echo a | echo b").unwrap();
             let mut ev = Evaluator::new();
-            assert!(ev.eval_program(&prog).is_err());
+            let err = ev.eval_program(&prog).unwrap_err();
+            let msg = alloc::format!("{err}");
+            assert!(msg.contains("not yet supported"), "got: {msg}");
         }
     }
 }
