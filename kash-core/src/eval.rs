@@ -3187,6 +3187,22 @@ impl<B: MapBackend> Evaluator<B> {
         Ok(cleanup_bigfloat_str(&rendered))
     }
 
+    /// Format a `BigFloat` as its canonical `float128` decimal
+    /// string (used by the arithmetic engine's float128 tier).
+    fn format_bigfloat(
+        &mut self,
+        bf: &astro_float::BigFloat,
+    ) -> Result<String> {
+        use astro_float::{Radix, RoundingMode};
+        let cc = self.bf_consts()?;
+        let rendered = bf
+            .format(Radix::Dec, RoundingMode::ToEven, cc)
+            .map_err(|_| {
+                KashError::Runtime("float128 formatting failed".into())
+            })?;
+        Ok(cleanup_bigfloat_str(&rendered))
+    }
+
     fn coerce_for_attrs(
         &mut self,
         attrs: &AttrSet,
@@ -4233,8 +4249,7 @@ impl<B: MapBackend> Evaluator<B> {
                 if chars.peek() == Some(&'(') {
                     chars.next();
                     let body = read_arith_body(&mut chars)?;
-                    let v = self.eval_arith(&body)?;
-                    alloc::format!("{v}")
+                    self.eval_arith_render(&body)?
                 } else {
                     let body = read_paren_body(&mut chars)?;
                     self.run_command_substitution(&body)?
@@ -4396,7 +4411,11 @@ impl<B: MapBackend> Evaluator<B> {
     /// references inside the body are expanded *before* the parser
     /// runs (so e.g. `$((`X` + `$X`))` both work); bare names are
     /// looked up directly during parsing.
-    fn eval_arith(&mut self, src: &str) -> Result<i64> {
+    /// Evaluate an arithmetic expression to a [`Num`] (int / float
+    /// / float128). The full-fidelity entry point — used by
+    /// `$((…))` expansion and typed-numeric storage so a float
+    /// result keeps its float identity.
+    fn eval_arith_num(&mut self, src: &str) -> Result<Num> {
         let mut expanded = String::new();
         self.expand_dollar(src, &mut expanded)?;
         let mut parser = ArithParser {
@@ -4407,6 +4426,32 @@ impl<B: MapBackend> Evaluator<B> {
         let v = parser.parse_expr()?;
         parser.expect_end()?;
         Ok(v)
+    }
+
+    /// Evaluate an arithmetic expression to `i64`, truncating a
+    /// float result toward zero. Used by integer-only contexts:
+    /// array indices, exit status, `((…))` truthiness, integer
+    /// `typeset`.
+    fn eval_arith(&mut self, src: &str) -> Result<i64> {
+        match self.eval_arith_num(src)? {
+            Num::Int(n) => Ok(n),
+            Num::Float(f) => Ok(f as i64),
+            Num::Float128(bf) => {
+                let s = self.format_bigfloat(&bf)?;
+                Ok(s.parse::<f64>().unwrap_or(0.0) as i64)
+            }
+        }
+    }
+
+    /// Render the result of `$((…))` — a float keeps its decimal
+    /// form rather than being truncated to an integer.
+    fn eval_arith_render(&mut self, src: &str) -> Result<String> {
+        let n = self.eval_arith_num(src)?;
+        match &n {
+            Num::Int(v) => Ok(alloc::format!("{v}")),
+            Num::Float(f) => Ok(format_float_value(*f)),
+            Num::Float128(bf) => self.format_bigfloat(bf),
+        }
     }
 
     /// Parse `src` as kash source, run it in a fresh subshell-style
@@ -4460,8 +4505,8 @@ impl<B: MapBackend> Evaluator<B> {
                 if chars.peek() == Some(&'(') {
                     chars.next();
                     let body = read_arith_body(&mut chars)?;
-                    let v = self.eval_arith(&body)?;
-                    out.push_str(&alloc::format!("{v}"));
+                    let rendered = self.eval_arith_render(&body)?;
+                    out.push_str(&rendered);
                 } else {
                     let body = read_paren_body(&mut chars)?;
                     let value = self.run_command_substitution(&body)?;
@@ -8291,6 +8336,228 @@ struct ArithParser<'a, 'e, B: MapBackend> {
     ev: &'e mut Evaluator<B>,
 }
 
+/// A value flowing through the arithmetic engine. Three real
+/// tiers promote C-style by *widest operand*: `Int` (i64) <
+/// `Float` (f64) < `Float128` (113-bit, `astro-float`). Two
+/// `Int`s stay integer (`$((7/2))` is `3`); any `Float` operand
+/// promotes to f64; any `Float128` operand promotes the whole
+/// operation to 113-bit BigFloat. Bitwise / shift operators
+/// require integer operands. (The complex tiers land in 6.5b.)
+#[derive(Clone, Debug)]
+enum Num {
+    /// 64-bit signed integer — the shell arithmetic default.
+    Int(i64),
+    /// IEEE 754 binary64.
+    Float(f64),
+    /// IEEE 754 binary128 (113-bit), backed by `astro-float`.
+    Float128(astro_float::BigFloat),
+}
+
+impl Num {
+    /// Promotion rank: 0 `Int`, 1 `Float`, 2 `Float128`. The
+    /// result tier of a binary op is the max of its operands'.
+    fn rank(&self) -> u8 {
+        match self {
+            Num::Int(_) => 0,
+            Num::Float(_) => 1,
+            Num::Float128(_) => 2,
+        }
+    }
+
+    /// Promote to a 113-bit `BigFloat` (the float128 tier).
+    fn to_bigfloat(&self) -> astro_float::BigFloat {
+        match self {
+            Num::Int(n) => astro_float::BigFloat::from_i64(*n, FLOAT128_PREC),
+            Num::Float(f) => astro_float::BigFloat::from_f64(*f, FLOAT128_PREC),
+            Num::Float128(bf) => bf.clone(),
+        }
+    }
+
+    /// Value as `f64`, for the f64 tier. Only called when neither
+    /// operand is `Float128` (those promote to BigFloat instead),
+    /// so the `Float128` arm is defensive.
+    fn as_f64(&self) -> f64 {
+        match self {
+            Num::Int(n) => *n as f64,
+            Num::Float(f) => *f,
+            Num::Float128(_) => f64::NAN,
+        }
+    }
+
+    /// True iff the value is non-zero — arithmetic "true" for
+    /// `&&` / `||` / `!` / ternary / `((…))`.
+    fn is_truthy(&self) -> bool {
+        match self {
+            Num::Int(n) => *n != 0,
+            Num::Float(f) => *f != 0.0,
+            Num::Float128(bf) => !bf.is_zero(),
+        }
+    }
+
+    /// Require an integer operand for a bitwise / shift operator;
+    /// a float / float128 is an error.
+    fn require_int(&self, op: &str) -> Result<i64> {
+        match self {
+            Num::Int(n) => Ok(*n),
+            _ => Err(KashError::Runtime(alloc::format!(
+                "arithmetic: operator `{op}` requires integer operands"
+            ))),
+        }
+    }
+
+    /// Whether either operand sits in the float128 tier — the
+    /// trigger to compute the whole operation in `BigFloat`.
+    fn either_f128(a: &Num, b: &Num) -> bool {
+        a.rank() == 2 || b.rank() == 2
+    }
+
+    /// Whether either operand is a (non-integer) float tier.
+    fn either_float(a: &Num, b: &Num) -> bool {
+        a.rank() >= 1 || b.rank() >= 1
+    }
+}
+
+/// IEEE 754 round-to-nearest-even — the default for the
+/// float128 arithmetic path.
+const F128_RM: astro_float::RoundingMode = astro_float::RoundingMode::ToEven;
+
+/// `a + b` with C-style promotion across the three real tiers.
+fn arith_add(a: &Num, b: &Num) -> Result<Num> {
+    if let (Num::Int(x), Num::Int(y)) = (a, b) {
+        x.checked_add(*y)
+            .map(Num::Int)
+            .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))
+    } else if Num::either_f128(a, b) {
+        Ok(Num::Float128(a.to_bigfloat().add(
+            &b.to_bigfloat(),
+            FLOAT128_PREC,
+            F128_RM,
+        )))
+    } else {
+        Ok(Num::Float(a.as_f64() + b.as_f64()))
+    }
+}
+
+fn arith_sub(a: &Num, b: &Num) -> Result<Num> {
+    if let (Num::Int(x), Num::Int(y)) = (a, b) {
+        x.checked_sub(*y)
+            .map(Num::Int)
+            .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))
+    } else if Num::either_f128(a, b) {
+        Ok(Num::Float128(a.to_bigfloat().sub(
+            &b.to_bigfloat(),
+            FLOAT128_PREC,
+            F128_RM,
+        )))
+    } else {
+        Ok(Num::Float(a.as_f64() - b.as_f64()))
+    }
+}
+
+fn arith_mul(a: &Num, b: &Num) -> Result<Num> {
+    if let (Num::Int(x), Num::Int(y)) = (a, b) {
+        x.checked_mul(*y)
+            .map(Num::Int)
+            .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))
+    } else if Num::either_f128(a, b) {
+        Ok(Num::Float128(a.to_bigfloat().mul(
+            &b.to_bigfloat(),
+            FLOAT128_PREC,
+            F128_RM,
+        )))
+    } else {
+        Ok(Num::Float(a.as_f64() * b.as_f64()))
+    }
+}
+
+fn arith_div(a: &Num, b: &Num) -> Result<Num> {
+    if Num::either_f128(a, b) {
+        return Ok(Num::Float128(a.to_bigfloat().div(
+            &b.to_bigfloat(),
+            FLOAT128_PREC,
+            F128_RM,
+        )));
+    }
+    if Num::either_float(a, b) {
+        Ok(Num::Float(a.as_f64() / b.as_f64()))
+    } else {
+        let (Num::Int(x), Num::Int(y)) = (a, b) else {
+            unreachable!("non-float operands are both Int")
+        };
+        if *y == 0 {
+            return Err(KashError::Runtime("arithmetic: divide by zero".into()));
+        }
+        Ok(Num::Int(x / y))
+    }
+}
+
+fn arith_mod(a: &Num, b: &Num) -> Result<Num> {
+    if Num::either_f128(a, b) {
+        // `astro-float`'s `rem` is the truncated remainder.
+        return Ok(Num::Float128(a.to_bigfloat().rem(&b.to_bigfloat())));
+    }
+    if Num::either_float(a, b) {
+        Ok(Num::Float(a.as_f64() % b.as_f64()))
+    } else {
+        let (Num::Int(x), Num::Int(y)) = (a, b) else {
+            unreachable!("non-float operands are both Int")
+        };
+        if *y == 0 {
+            return Err(KashError::Runtime("arithmetic: modulo by zero".into()));
+        }
+        Ok(Num::Int(x % y))
+    }
+}
+
+/// Unary negation across the three real tiers.
+fn arith_negate(v: &Num) -> Result<Num> {
+    match v {
+        Num::Int(n) => n
+            .checked_neg()
+            .map(Num::Int)
+            .ok_or_else(|| KashError::Runtime("arithmetic overflow".into())),
+        Num::Float(f) => Ok(Num::Float(-f)),
+        Num::Float128(bf) => {
+            let mut neg = bf.clone();
+            neg.inv_sign();
+            Ok(Num::Float128(neg))
+        }
+    }
+}
+
+/// Boolean result as the arithmetic `1` / `0` integer.
+fn bool_num(b: bool) -> Num {
+    Num::Int(b as i64)
+}
+
+/// Equality of two numbers, promoting to the wider tier.
+fn arith_eq(a: &Num, b: &Num) -> bool {
+    arith_cmp(a, b) == core::cmp::Ordering::Equal
+}
+
+/// Compare two numbers for the relational / equality operators,
+/// promoting to the wider tier (BigFloat when either is float128,
+/// else f64, else i64).
+fn arith_cmp(a: &Num, b: &Num) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    if Num::either_f128(a, b) {
+        match a.to_bigfloat().cmp(&b.to_bigfloat()) {
+            Some(s) if s < 0 => Ordering::Less,
+            Some(s) if s > 0 => Ordering::Greater,
+            _ => Ordering::Equal,
+        }
+    } else if Num::either_float(a, b) {
+        a.as_f64()
+            .partial_cmp(&b.as_f64())
+            .unwrap_or(Ordering::Equal)
+    } else {
+        match (a, b) {
+            (Num::Int(x), Num::Int(y)) => x.cmp(y),
+            _ => unreachable!("non-float operands are both Int"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AssignOp {
     Plain,
@@ -8307,11 +8574,11 @@ enum AssignOp {
 }
 
 impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
-    fn parse_expr(&mut self) -> Result<i64> {
+    fn parse_expr(&mut self) -> Result<Num> {
         self.parse_assign()
     }
 
-    fn parse_assign(&mut self) -> Result<i64> {
+    fn parse_assign(&mut self) -> Result<Num> {
         self.skip_ws();
         let save = self.pos;
         if let Some(name) = self.try_read_identifier() {
@@ -8353,44 +8620,51 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         None
     }
 
-    fn apply_assign(&mut self, name: &str, op: AssignOp, rhs: i64) -> Result<i64> {
-        let current = self.read_named(name)?;
+    fn apply_assign(&mut self, name: &str, op: AssignOp, rhs: Num) -> Result<Num> {
         let new = match op {
             AssignOp::Plain => rhs,
-            AssignOp::Add => current
-                .checked_add(rhs)
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?,
-            AssignOp::Sub => current
-                .checked_sub(rhs)
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?,
-            AssignOp::Mul => current
-                .checked_mul(rhs)
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?,
-            AssignOp::Div => {
-                if rhs == 0 {
-                    return Err(KashError::Runtime("arithmetic: divide by zero".into()));
-                }
-                current / rhs
-            }
-            AssignOp::Mod => {
-                if rhs == 0 {
-                    return Err(KashError::Runtime("arithmetic: modulo by zero".into()));
-                }
-                current % rhs
-            }
-            AssignOp::BitAnd => current & rhs,
-            AssignOp::BitOr => current | rhs,
-            AssignOp::BitXor => current ^ rhs,
-            AssignOp::Shl => current.wrapping_shl(rhs as u32),
-            AssignOp::Shr => current.wrapping_shr(rhs as u32),
+            AssignOp::Add => arith_add(&self.read_named(name)?, &rhs)?,
+            AssignOp::Sub => arith_sub(&self.read_named(name)?, &rhs)?,
+            AssignOp::Mul => arith_mul(&self.read_named(name)?, &rhs)?,
+            AssignOp::Div => arith_div(&self.read_named(name)?, &rhs)?,
+            AssignOp::Mod => arith_mod(&self.read_named(name)?, &rhs)?,
+            AssignOp::BitAnd => Num::Int(
+                self.read_named(name)?.require_int("&=")? & rhs.require_int("&=")?,
+            ),
+            AssignOp::BitOr => Num::Int(
+                self.read_named(name)?.require_int("|=")? | rhs.require_int("|=")?,
+            ),
+            AssignOp::BitXor => Num::Int(
+                self.read_named(name)?.require_int("^=")? ^ rhs.require_int("^=")?,
+            ),
+            AssignOp::Shl => Num::Int(
+                self.read_named(name)?
+                    .require_int("<<=")?
+                    .wrapping_shl(rhs.require_int("<<=")? as u32),
+            ),
+            AssignOp::Shr => Num::Int(
+                self.read_named(name)?
+                    .require_int(">>=")?
+                    .wrapping_shr(rhs.require_int(">>=")? as u32),
+            ),
         };
-        self.ev
-            .scope
-            .assign(name, Value::Scalar(alloc::format!("{new}")))?;
+        let rendered = self.render_num(&new)?;
+        self.ev.scope.assign(name, Value::Scalar(rendered))?;
         Ok(new)
     }
 
-    fn parse_ternary(&mut self) -> Result<i64> {
+    /// Render a `Num` for storage / output. Float128 needs the
+    /// `Consts` cache to format, so this lives on the parser
+    /// (which holds the evaluator).
+    fn render_num(&mut self, n: &Num) -> Result<String> {
+        match n {
+            Num::Int(v) => Ok(alloc::format!("{v}")),
+            Num::Float(f) => Ok(format_float_value(*f)),
+            Num::Float128(bf) => self.ev.format_bigfloat(bf),
+        }
+    }
+
+    fn parse_ternary(&mut self) -> Result<Num> {
         let cond = self.parse_or()?;
         self.skip_ws();
         if self.try_consume_exact("?") {
@@ -8402,66 +8676,66 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 ));
             }
             let else_val = self.parse_assign()?;
-            Ok(if cond != 0 { then_val } else { else_val })
+            Ok(if cond.is_truthy() { then_val } else { else_val })
         } else {
             Ok(cond)
         }
     }
 
-    fn parse_or(&mut self) -> Result<i64> {
+    fn parse_or(&mut self) -> Result<Num> {
         let mut lhs = self.parse_and()?;
         while self.try_consume_exact("||") {
             let rhs = self.parse_and()?;
-            lhs = (lhs != 0 || rhs != 0) as i64;
+            lhs = bool_num(lhs.is_truthy() || rhs.is_truthy());
         }
         Ok(lhs)
     }
 
-    fn parse_and(&mut self) -> Result<i64> {
+    fn parse_and(&mut self) -> Result<Num> {
         let mut lhs = self.parse_bit_or()?;
         while self.try_consume_exact("&&") {
             let rhs = self.parse_bit_or()?;
-            lhs = (lhs != 0 && rhs != 0) as i64;
+            lhs = bool_num(lhs.is_truthy() && rhs.is_truthy());
         }
         Ok(lhs)
     }
 
-    fn parse_bit_or(&mut self) -> Result<i64> {
+    fn parse_bit_or(&mut self) -> Result<Num> {
         let mut lhs = self.parse_bit_xor()?;
         while self.try_consume_single('|') {
             let rhs = self.parse_bit_xor()?;
-            lhs |= rhs;
+            lhs = Num::Int(lhs.require_int("|")? | rhs.require_int("|")?);
         }
         Ok(lhs)
     }
 
-    fn parse_bit_xor(&mut self) -> Result<i64> {
+    fn parse_bit_xor(&mut self) -> Result<Num> {
         let mut lhs = self.parse_bit_and()?;
         while self.try_consume_single('^') {
             let rhs = self.parse_bit_and()?;
-            lhs ^= rhs;
+            lhs = Num::Int(lhs.require_int("^")? ^ rhs.require_int("^")?);
         }
         Ok(lhs)
     }
 
-    fn parse_bit_and(&mut self) -> Result<i64> {
+    fn parse_bit_and(&mut self) -> Result<Num> {
         let mut lhs = self.parse_eq()?;
         while self.try_consume_single('&') {
             let rhs = self.parse_eq()?;
-            lhs &= rhs;
+            lhs = Num::Int(lhs.require_int("&")? & rhs.require_int("&")?);
         }
         Ok(lhs)
     }
 
-    fn parse_eq(&mut self) -> Result<i64> {
+    fn parse_eq(&mut self) -> Result<Num> {
         let mut lhs = self.parse_rel()?;
         loop {
             if self.try_consume_exact("==") {
                 let rhs = self.parse_rel()?;
-                lhs = (lhs == rhs) as i64;
+                lhs = bool_num(arith_eq(&lhs, &rhs));
             } else if self.try_consume_exact("!=") {
                 let rhs = self.parse_rel()?;
-                lhs = (lhs != rhs) as i64;
+                lhs = bool_num(!arith_eq(&lhs, &rhs));
             } else {
                 break;
             }
@@ -8469,21 +8743,22 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(lhs)
     }
 
-    fn parse_rel(&mut self) -> Result<i64> {
+    fn parse_rel(&mut self) -> Result<Num> {
+        use core::cmp::Ordering;
         let mut lhs = self.parse_shift()?;
         loop {
             if self.try_consume_exact("<=") {
                 let rhs = self.parse_shift()?;
-                lhs = (lhs <= rhs) as i64;
+                lhs = bool_num(arith_cmp(&lhs, &rhs) != Ordering::Greater);
             } else if self.try_consume_exact(">=") {
                 let rhs = self.parse_shift()?;
-                lhs = (lhs >= rhs) as i64;
+                lhs = bool_num(arith_cmp(&lhs, &rhs) != Ordering::Less);
             } else if self.try_consume_single('<') {
                 let rhs = self.parse_shift()?;
-                lhs = (lhs < rhs) as i64;
+                lhs = bool_num(arith_cmp(&lhs, &rhs) == Ordering::Less);
             } else if self.try_consume_single('>') {
                 let rhs = self.parse_shift()?;
-                lhs = (lhs > rhs) as i64;
+                lhs = bool_num(arith_cmp(&lhs, &rhs) == Ordering::Greater);
             } else {
                 break;
             }
@@ -8491,15 +8766,19 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(lhs)
     }
 
-    fn parse_shift(&mut self) -> Result<i64> {
+    fn parse_shift(&mut self) -> Result<Num> {
         let mut lhs = self.parse_add()?;
         loop {
             if self.try_consume_exact("<<") {
                 let rhs = self.parse_add()?;
-                lhs = lhs.wrapping_shl(rhs as u32);
+                lhs = Num::Int(
+                    lhs.require_int("<<")?.wrapping_shl(rhs.require_int("<<")? as u32),
+                );
             } else if self.try_consume_exact(">>") {
                 let rhs = self.parse_add()?;
-                lhs = lhs.wrapping_shr(rhs as u32);
+                lhs = Num::Int(
+                    lhs.require_int(">>")?.wrapping_shr(rhs.require_int(">>")? as u32),
+                );
             } else {
                 break;
             }
@@ -8507,19 +8786,15 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(lhs)
     }
 
-    fn parse_add(&mut self) -> Result<i64> {
+    fn parse_add(&mut self) -> Result<Num> {
         let mut lhs = self.parse_mul()?;
         loop {
             if self.try_consume_single('+') {
                 let rhs = self.parse_mul()?;
-                lhs = lhs
-                    .checked_add(rhs)
-                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+                lhs = arith_add(&lhs, &rhs)?;
             } else if self.try_consume_single('-') {
                 let rhs = self.parse_mul()?;
-                lhs = lhs
-                    .checked_sub(rhs)
-                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+                lhs = arith_sub(&lhs, &rhs)?;
             } else {
                 break;
             }
@@ -8527,26 +8802,18 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(lhs)
     }
 
-    fn parse_mul(&mut self) -> Result<i64> {
+    fn parse_mul(&mut self) -> Result<Num> {
         let mut lhs = self.parse_unary()?;
         loop {
             if self.try_consume_single('*') {
                 let rhs = self.parse_unary()?;
-                lhs = lhs
-                    .checked_mul(rhs)
-                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
+                lhs = arith_mul(&lhs, &rhs)?;
             } else if self.try_consume_single('/') {
                 let rhs = self.parse_unary()?;
-                if rhs == 0 {
-                    return Err(KashError::Runtime("arithmetic: divide by zero".into()));
-                }
-                lhs /= rhs;
+                lhs = arith_div(&lhs, &rhs)?;
             } else if self.try_consume_single('%') {
                 let rhs = self.parse_unary()?;
-                if rhs == 0 {
-                    return Err(KashError::Runtime("arithmetic: modulo by zero".into()));
-                }
-                lhs %= rhs;
+                lhs = arith_mod(&lhs, &rhs)?;
             } else {
                 break;
             }
@@ -8554,32 +8821,24 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(lhs)
     }
 
-    fn parse_unary(&mut self) -> Result<i64> {
+    fn parse_unary(&mut self) -> Result<Num> {
         self.skip_ws();
         if self.try_consume_exact("++") {
             let name = self.try_read_identifier().ok_or_else(|| {
                 KashError::Parse("arithmetic: `++` requires an lvalue".into())
             })?;
-            let new = self
-                .read_named(&name)?
-                .checked_add(1)
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
-            self.ev
-                .scope
-                .assign(&name, Value::Scalar(alloc::format!("{new}")))?;
+            let new = arith_add(&self.read_named(&name)?, &Num::Int(1))?;
+            let rendered = self.render_num(&new)?;
+            self.ev.scope.assign(&name, Value::Scalar(rendered))?;
             return Ok(new);
         }
         if self.try_consume_exact("--") {
             let name = self.try_read_identifier().ok_or_else(|| {
                 KashError::Parse("arithmetic: `--` requires an lvalue".into())
             })?;
-            let new = self
-                .read_named(&name)?
-                .checked_sub(1)
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
-            self.ev
-                .scope
-                .assign(&name, Value::Scalar(alloc::format!("{new}")))?;
+            let new = arith_sub(&self.read_named(&name)?, &Num::Int(1))?;
+            let rendered = self.render_num(&new)?;
+            self.ev.scope.assign(&name, Value::Scalar(rendered))?;
             return Ok(new);
         }
         if self.try_consume_single('+') {
@@ -8587,22 +8846,20 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         }
         if self.try_consume_single('-') {
             let v = self.parse_unary()?;
-            return v
-                .checked_neg()
-                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()));
+            return arith_negate(&v);
         }
         if self.try_consume_single('!') {
             let v = self.parse_unary()?;
-            return Ok((v == 0) as i64);
+            return Ok(bool_num(!v.is_truthy()));
         }
         if self.try_consume_single('~') {
             let v = self.parse_unary()?;
-            return Ok(!v);
+            return Ok(Num::Int(!v.require_int("~")?));
         }
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<i64> {
+    fn parse_primary(&mut self) -> Result<Num> {
         self.skip_ws();
         if self.try_consume_exact("(") {
             let v = self.parse_expr()?;
@@ -8615,7 +8872,7 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
             return Ok(v);
         }
         if let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
+            if c.is_ascii_digit() || c == '.' {
                 return self.parse_number();
             }
             if c == '_' || c.is_ascii_alphabetic() {
@@ -8624,23 +8881,18 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                     .expect("just peeked an identifier start");
                 self.skip_ws();
                 if self.try_consume_exact("++") {
+                    // Post-increment: yield the old value, store the new.
                     let current = self.read_named(&name)?;
-                    let new = current
-                        .checked_add(1)
-                        .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
-                    self.ev
-                        .scope
-                        .assign(&name, Value::Scalar(alloc::format!("{new}")))?;
+                    let new = arith_add(&current, &Num::Int(1))?;
+                    let rendered = self.render_num(&new)?;
+                    self.ev.scope.assign(&name, Value::Scalar(rendered))?;
                     return Ok(current);
                 }
                 if self.try_consume_exact("--") {
                     let current = self.read_named(&name)?;
-                    let new = current
-                        .checked_sub(1)
-                        .ok_or_else(|| KashError::Runtime("arithmetic overflow".into()))?;
-                    self.ev
-                        .scope
-                        .assign(&name, Value::Scalar(alloc::format!("{new}")))?;
+                    let new = arith_sub(&current, &Num::Int(1))?;
+                    let rendered = self.render_num(&new)?;
+                    self.ev.scope.assign(&name, Value::Scalar(rendered))?;
                     return Ok(current);
                 }
                 return self.read_named(&name);
@@ -8652,8 +8904,9 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         )))
     }
 
-    fn parse_number(&mut self) -> Result<i64> {
+    fn parse_number(&mut self) -> Result<Num> {
         let start = self.pos;
+        // Hex / octal are integer-only (no `0x1.5`).
         if self.peek() == Some('0') && matches!(self.peek_at(1), Some('x' | 'X')) {
             self.advance();
             self.advance();
@@ -8671,12 +8924,16 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                     "arithmetic: empty hex literal".into(),
                 ));
             }
-            return i64::from_str_radix(lit, 16).map_err(|_| {
+            return i64::from_str_radix(lit, 16).map(Num::Int).map_err(|_| {
                 KashError::Parse(alloc::format!("arithmetic: invalid hex literal `0x{lit}`"))
             });
         }
+        // A leading `0` before more octal digits is octal — but
+        // only when no `.` / `e` follows (otherwise it's a float
+        // like `0.5`).
         if self.peek() == Some('0')
             && matches!(self.peek_at(1), Some('0'..='7'))
+            && !self.scan_has_float_marker()
         {
             self.advance();
             let digits_start = self.pos;
@@ -8688,10 +8945,11 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 }
             }
             let lit = &self.src[digits_start..self.pos];
-            return i64::from_str_radix(lit, 8).map_err(|_| {
+            return i64::from_str_radix(lit, 8).map(Num::Int).map_err(|_| {
                 KashError::Parse(alloc::format!("arithmetic: invalid octal literal `0{lit}`"))
             });
         }
+        // Decimal integer or float. Consume the integer part…
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 self.advance();
@@ -8699,10 +8957,59 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 break;
             }
         }
+        let mut is_float = false;
+        // …a fractional part…
+        if self.peek() == Some('.') {
+            is_float = true;
+            self.advance();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        // …and an exponent.
+        if matches!(self.peek(), Some('e' | 'E')) {
+            is_float = true;
+            self.advance();
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.advance();
+            }
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
         let lit = &self.src[start..self.pos];
-        lit.parse::<i64>().map_err(|_| {
-            KashError::Parse(alloc::format!("arithmetic: invalid integer `{lit}`"))
-        })
+        if is_float {
+            lit.parse::<f64>().map(Num::Float).map_err(|_| {
+                KashError::Parse(alloc::format!("arithmetic: invalid float `{lit}`"))
+            })
+        } else {
+            lit.parse::<i64>().map(Num::Int).map_err(|_| {
+                KashError::Parse(alloc::format!("arithmetic: invalid integer `{lit}`"))
+            })
+        }
+    }
+
+    /// Peek whether the number starting here carries a float
+    /// marker (`.` or `e`/`E`) before the next non-numeric byte —
+    /// used to keep `0.5` out of the octal path.
+    fn scan_has_float_marker(&self) -> bool {
+        let rest = &self.src[self.pos..];
+        for c in rest.chars() {
+            match c {
+                '0'..='9' => continue,
+                '.' | 'e' | 'E' => return true,
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn try_read_identifier(&mut self) -> Option<String> {
@@ -8729,21 +9036,63 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         }
     }
 
-    fn read_named(&self, name: &str) -> Result<i64> {
-        let value = self
-            .ev
-            .scope
-            .get(name)
-            .map(|v| v.to_scalar_string())
-            .unwrap_or_default();
-        if value.is_empty() {
-            return Ok(0);
+    fn read_named(&mut self, name: &str) -> Result<Num> {
+        // Snapshot the value and the declared numeric tier, then
+        // drop the binding borrow before touching the (mutable)
+        // BigFloat constant cache.
+        let (value, nt) = match self.ev.scope.get_binding(name) {
+            Some(b) => (b.value.to_scalar_string(), b.attrs.numeric_type),
+            None => (String::new(), None),
+        };
+        if value.trim().is_empty() {
+            return Ok(Num::Int(0));
         }
-        value.trim().parse::<i64>().map_err(|_| {
+        let trimmed = value.trim();
+        let not_a_number = || {
             KashError::Runtime(alloc::format!(
                 "arithmetic: `{name}`'s value `{value}` is not a number"
             ))
-        })
+        };
+        match nt {
+            // float128 — parse at 113-bit precision.
+            Some(t) if t.is_extended_precision() && t.is_float() => {
+                use astro_float::{BigFloat, Radix, RoundingMode};
+                let cc = self.ev.bf_consts()?;
+                let bf = BigFloat::parse(
+                    trimmed,
+                    Radix::Dec,
+                    FLOAT128_PREC,
+                    RoundingMode::ToEven,
+                    cc,
+                );
+                if bf.is_nan() {
+                    return Err(not_a_number());
+                }
+                Ok(Num::Float128(bf))
+            }
+            // Complex operands in `$((…))` arrive with 6.5b.
+            Some(t) if t.is_complex() => Err(KashError::Runtime(
+                alloc::format!(
+                    "arithmetic: complex operand `{name}` is not yet supported"
+                ),
+            )),
+            Some(t) if t.is_float() => {
+                trimmed.parse::<f64>().map(Num::Float).map_err(|_| not_a_number())
+            }
+            Some(_) => {
+                trimmed.parse::<i64>().map(Num::Int).map_err(|_| not_a_number())
+            }
+            // Untyped: prefer integer, fall back to float.
+            None => {
+                if let Ok(n) = trimmed.parse::<i64>() {
+                    Ok(Num::Int(n))
+                } else if let Ok(f) = trimmed.parse::<f64>() {
+                    Ok(Num::Float(f))
+                } else {
+                    Err(not_a_number())
+                }
+            }
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -15924,6 +16273,85 @@ mod tests {
         ev.eval_program(&prog).unwrap();
         let out = ev.take_output();
         assert!(out.contains("KASH_BENCH_X=alpha"), "got: {out:?}");
+    }
+
+    // ===== arithmetic: float + float128 tiers =====
+
+    #[test]
+    fn arith_integer_division_stays_integer() {
+        let (_, out, _) = run("echo $((7/2))");
+        assert_eq!(out, "3\n");
+    }
+
+    #[test]
+    fn arith_float_literal_addition() {
+        let (_, out, _) = run("echo $((1.5 + 2.5))");
+        assert_eq!(out, "4.0\n");
+    }
+
+    #[test]
+    fn arith_int_float_promotion() {
+        let (_, out, _) = run("echo $((3 + 0.5))");
+        assert_eq!(out, "3.5\n");
+    }
+
+    #[test]
+    fn arith_float_division() {
+        let (_, out, _) = run("echo $((3.0 / 2))");
+        assert_eq!(out, "1.5\n");
+    }
+
+    #[test]
+    fn arith_float_comparison_yields_int() {
+        let (_, out, _) = run("echo $((1.5 < 2)) $((2.5 > 3)) $((1.0 == 1))");
+        assert_eq!(out, "1 0 1\n");
+    }
+
+    #[test]
+    fn arith_float_stored_to_typed_float() {
+        let (_, out, _) = run("float64 x=$((1.0 / 4)); echo $x");
+        assert_eq!(out, "0.25\n");
+    }
+
+    #[test]
+    fn arith_bitwise_on_float_errors() {
+        let prog = parse("echo $((1.5 & 2))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("integer operands"));
+    }
+
+    #[test]
+    fn arith_float128_operand_promotes_to_113_bit() {
+        // A `float128` operand promotes the whole operation to
+        // 113-bit BigFloat — precision survives far past f64.
+        let (_, out, _) = run(
+            "float128 x=1.123456789012345678901234567890\necho $((x + x))\n",
+        );
+        assert_eq!(out, "2.24691357802469135780246913578e+0\n");
+    }
+
+    #[test]
+    fn arith_float128_mixed_with_int() {
+        let (_, out, _) = run("float128 x=1.5\necho $((x * 4 + 1))\n");
+        assert_eq!(out, "7e+0\n");
+    }
+
+    #[test]
+    fn arith_float128_stored_back() {
+        let (_, out, _) = run(
+            "float128 x=2\nfloat128 y=$((x * x))\necho $y\n",
+        );
+        assert_eq!(out, "4e+0\n");
+    }
+
+    #[test]
+    fn arith_complex_operand_not_yet_supported() {
+        let prog =
+            parse("complex128 z=1+2i\necho $((z + 1))\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("complex"));
     }
 
     // ===== arithmetic extensions =====
