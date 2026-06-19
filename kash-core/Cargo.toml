@@ -30,6 +30,7 @@ toml = { version = "0.8", optional = true, default-features = false, features = 
 # (Google Brain bfloat16). no_std-compatible, used by the typed
 # float primitives (float16 / bfloat16).
 half = { version = "2", default-features = false }
+astro-float = { version = "0.9.5", default-features = false }
 
 [dev-dependencies]
 # Used by the backend-comparison integration test in `tests/`. The

@@ -278,6 +278,11 @@ pub struct Evaluator<B: MapBackend = BTreeBackend> {
     /// against this name so the body's `_` prefix points at the
     /// active instance. `None` outside a typedef body.
     self_instance_var: Option<String>,
+    /// Lazily-initialised `astro-float` constant cache, used by
+    /// the extended-precision (`float128` / `complex256`)
+    /// parse / format path. `Consts::new()` is comparatively
+    /// expensive, so it's built once on first use.
+    bf_consts: Option<astro_float::Consts>,
     /// Effective stdin for *external* commands inside the active
     /// compound body. Set by `{ … } < file` (and similar) on
     /// enter; restored on exit. The spawn paths consult this
@@ -403,6 +408,7 @@ impl<B: MapBackend> Evaluator<B> {
             type_instances: alloc::collections::BTreeMap::new(),
             in_type_method: None,
             self_instance_var: None,
+            bf_consts: None,
             #[cfg(feature = "std")]
             compound_input: None,
             #[cfg(feature = "std")]
@@ -1610,6 +1616,10 @@ impl<B: MapBackend> Evaluator<B> {
                         ));
                     }
                     alloc::format!("{wrapped}")
+                } else if nt.is_extended_precision() {
+                    // `float128` — 113-bit BigFloat path. (A
+                    // `complex256` was already peeled off above.)
+                    self.coerce_float128(&value)?
                 } else if nt.is_float() {
                     let raw = match value.trim().parse::<f64>() {
                         Ok(f) => f,
@@ -3092,16 +3102,33 @@ impl<B: MapBackend> Evaluator<B> {
         raw: &str,
         in_func: bool,
     ) -> Result<()> {
-        let (re_raw, im_raw) = parse_complex_literal(raw).ok_or_else(|| {
-            KashError::Runtime(alloc::format!(
-                "invalid complex literal `{raw}` for type `{}`",
-                nt.name(),
-            ))
-        })?;
-        let (re, im) = nt.project_complex(re_raw, im_raw);
-        let scalar = format_complex_value(re, im);
-        let re_str = format_float_value(re);
-        let im_str = format_float_value(im);
+        let (re_str, im_str, scalar) = if nt.is_extended_precision() {
+            // `complex256` — each component is a 113-bit BigFloat.
+            let (re_raw, im_raw) =
+                split_complex_literal(raw).ok_or_else(|| {
+                    KashError::Runtime(alloc::format!(
+                        "invalid complex literal `{raw}` for type `{}`",
+                        nt.name(),
+                    ))
+                })?;
+            let re = self.coerce_float128(&re_raw)?;
+            let im = self.coerce_float128(&im_raw)?;
+            let scalar = format_complex_strings(&re, &im);
+            (re, im, scalar)
+        } else {
+            let (re_raw, im_raw) = parse_complex_literal(raw).ok_or_else(|| {
+                KashError::Runtime(alloc::format!(
+                    "invalid complex literal `{raw}` for type `{}`",
+                    nt.name(),
+                ))
+            })?;
+            let (re, im) = nt.project_complex(re_raw, im_raw);
+            (
+                format_float_value(re),
+                format_float_value(im),
+                format_complex_value(re, im),
+            )
+        };
         // Per-component bindings — `name.re` / `name.im` — let
         // user code read or update one half without re-parsing
         // the string form.
@@ -3117,6 +3144,47 @@ impl<B: MapBackend> Evaluator<B> {
             self.scope.assign(name, Value::Scalar(scalar))?;
         }
         Ok(())
+    }
+
+    /// Lazily build (and return) the `astro-float` constant cache
+    /// used for extended-precision parsing / formatting.
+    fn bf_consts(&mut self) -> Result<&mut astro_float::Consts> {
+        if self.bf_consts.is_none() {
+            let c = astro_float::Consts::new().map_err(|_| {
+                KashError::Runtime(
+                    "failed to initialise extended-precision constants".into(),
+                )
+            })?;
+            self.bf_consts = Some(c);
+        }
+        Ok(self.bf_consts.as_mut().expect("just initialised"))
+    }
+
+    /// Parse a decimal string as a `float128` (113-bit binary128)
+    /// and return its canonical decimal string form. Used for
+    /// `float128` storage and `complex256` components.
+    fn coerce_float128(&mut self, raw: &str) -> Result<String> {
+        use astro_float::{BigFloat, Radix, RoundingMode};
+        let trimmed = raw.trim();
+        let cc = self.bf_consts()?;
+        let bf = BigFloat::parse(
+            trimmed,
+            Radix::Dec,
+            FLOAT128_PREC,
+            RoundingMode::ToEven,
+            cc,
+        );
+        if bf.is_nan() {
+            return Err(KashError::Runtime(alloc::format!(
+                "invalid float128 literal `{raw}`"
+            )));
+        }
+        let rendered = bf
+            .format(Radix::Dec, RoundingMode::ToEven, cc)
+            .map_err(|_| {
+                KashError::Runtime("float128 formatting failed".into())
+            })?;
+        Ok(cleanup_bigfloat_str(&rendered))
     }
 
     fn coerce_for_attrs(
@@ -3140,6 +3208,10 @@ impl<B: MapBackend> Evaluator<B> {
                     ));
                 }
                 alloc::format!("{wrapped}")
+            } else if nt.is_extended_precision() {
+                // `float128` — parse / store through the 113-bit
+                // BigFloat path so precision beyond `f64` survives.
+                self.coerce_float128(&value)?
             } else if nt.is_float() {
                 // Typed float: parse the RHS as `f64`, falling
                 // back to the arithmetic engine for integer-only
@@ -7454,19 +7526,31 @@ fn ansi_c_decode(inner: &str) -> String {
 /// caller is responsible for projecting components through the
 /// destination type's component precision.
 pub fn parse_complex_literal(input: &str) -> Option<(f64, f64)> {
+    let (re, im) = split_complex_literal(input)?;
+    Some((re.parse().ok()?, im.parse().ok()?))
+}
+
+/// Split a complex literal into its `(real, imaginary)` component
+/// decimal *strings*, normalising the unit forms (`+` → `1`, `-`
+/// → `-1`, omitted → `0`). Recognises the same forms as
+/// [`parse_complex_literal`] — `(re=R im=I)`, `R+Ii`, `R-Ii`,
+/// `Ii`, `i`, `-i`, `R`. Keeping the strings lets `complex256`
+/// re-parse each component at full `BigFloat` precision rather
+/// than losing it through an `f64`.
+pub fn split_complex_literal(input: &str) -> Option<(String, String)> {
     let s = input.trim();
     // Compound form `(re=R im=I)` — order-free, components
-    // optional. Whitespace-separated key=value pairs.
+    // optional.
     if let Some(rest) = s.strip_prefix('(')
         && let Some(inner) = rest.strip_suffix(')')
     {
-        let mut re = 0.0_f64;
-        let mut im = 0.0_f64;
+        let mut re = String::from("0");
+        let mut im = String::from("0");
         for kv in inner.split_whitespace() {
             if let Some(v) = kv.strip_prefix("re=") {
-                re = v.parse().ok()?;
+                re = v.to_string();
             } else if let Some(v) = kv.strip_prefix("im=") {
-                im = v.parse().ok()?;
+                im = v.to_string();
             } else {
                 return None;
             }
@@ -7476,10 +7560,7 @@ pub fn parse_complex_literal(input: &str) -> Option<(f64, f64)> {
     // Forms with a trailing `i`.
     if let Some(body) = s.strip_suffix('i') {
         let bytes = body.as_bytes();
-        // Locate the split between real and imaginary parts —
-        // the rightmost `+` / `-` that isn't part of an
-        // exponent (`e+` / `E-`). Skipping index 0 lets a
-        // leading sign on the real part pass through.
+        // Rightmost `+` / `-` that isn't part of an exponent.
         let mut split: Option<usize> = None;
         if !bytes.is_empty() {
             for i in (1..bytes.len()).rev() {
@@ -7493,26 +7574,23 @@ pub fn parse_complex_literal(input: &str) -> Option<(f64, f64)> {
         }
         if let Some(idx) = split {
             let (re_part, im_part) = body.split_at(idx);
-            let re: f64 = re_part.parse().ok()?;
-            let im: f64 = match im_part {
-                "+" => 1.0,
-                "-" => -1.0,
-                other => other.parse().ok()?,
+            let im = match im_part {
+                "+" => "1".to_string(),
+                "-" => "-1".to_string(),
+                other => other.to_string(),
             };
-            return Some((re, im));
+            return Some((re_part.to_string(), im));
         }
-        // No real part — body is the imaginary coefficient
-        // (possibly empty, `+`, or `-`).
+        // No real part — body is the imaginary coefficient.
         let im = match body {
-            "" | "+" => 1.0,
-            "-" => -1.0,
-            other => other.parse().ok()?,
+            "" | "+" => "1".to_string(),
+            "-" => "-1".to_string(),
+            other => other.to_string(),
         };
-        return Some((0.0, im));
+        return Some(("0".to_string(), im));
     }
     // Real-only fallback.
-    let re: f64 = s.parse().ok()?;
-    Some((re, 0.0))
+    Some((s.to_string(), "0".to_string()))
 }
 
 /// Render a `(real, imaginary)` complex value in canonical
@@ -7540,6 +7618,44 @@ pub fn format_complex_value(re: f64, im: f64) -> String {
         alloc::format!("{re_str}+{im_str}i")
     } else {
         alloc::format!("{re_str}{im_str}i")
+    }
+}
+
+/// Significand width of IEEE 754 binary128 — the `astro-float`
+/// precision used for `float128` / `complex256`.
+const FLOAT128_PREC: usize = 113;
+
+/// Tidy an `astro-float` decimal rendering: it emits scientific
+/// notation with a bare `.` before the exponent for short
+/// mantissas (`5.e-1`, `0.e+0`); drop that dangling dot so the
+/// result is `5e-1` / `0e+0`.
+fn cleanup_bigfloat_str(s: &str) -> String {
+    s.replace(".e", "e")
+}
+
+/// Whether a `BigFloat` decimal rendering represents zero — its
+/// mantissa (the part before the exponent) is all `0` (with an
+/// optional sign / dot). Used to collapse a `complex256` whose
+/// imaginary part is zero down to its real component.
+fn bigfloat_str_is_zero(s: &str) -> bool {
+    let mantissa = s.split(['e', 'E']).next().unwrap_or(s);
+    mantissa
+        .chars()
+        .all(|c| matches!(c, '0' | '.' | '-' | '+'))
+}
+
+/// Render a `complex256` from its two already-formatted component
+/// strings. Collapses a zero imaginary part to the bare real
+/// component; otherwise emits `R±Ii`, letting a negative `im`
+/// carry its own sign.
+fn format_complex_strings(re: &str, im: &str) -> String {
+    if bigfloat_str_is_zero(im) {
+        return re.to_string();
+    }
+    if im.starts_with('-') {
+        alloc::format!("{re}{im}i")
+    } else {
+        alloc::format!("{re}+{im}i")
     }
 }
 
@@ -14099,6 +14215,70 @@ mod tests {
         let err = ev.eval_program(&prog).unwrap_err();
         let msg = alloc::format!("{err}");
         assert!(msg.contains("complex"), "got: {msg}");
+    }
+
+    // ===== extended precision (float128 / complex256) =====
+
+    #[test]
+    fn typed_float128_preserves_precision_beyond_f64() {
+        // ~36 significant digits — far past f64's ~17. The value
+        // round-trips through the 113-bit BigFloat store.
+        let (_, out, _) = run(
+            "float128 x=3.14159265358979323846264338327950288\necho $x\n",
+        );
+        assert_eq!(out, "3.14159265358979323846264338327950288e+0\n");
+    }
+
+    #[test]
+    fn typed_float128_simple_value() {
+        let (_, out, _) = run("float128 x=1.5\necho $x\n");
+        assert_eq!(out, "1.5e+0\n");
+    }
+
+    #[test]
+    fn typed_float128_integer_value() {
+        let (_, out, _) = run("float128 x=42\necho $x\n");
+        assert_eq!(out, "4.2e+1\n");
+    }
+
+    #[test]
+    fn typed_float128_negative() {
+        let (_, out, _) = run("float128 x=-2.5\necho $x\n");
+        assert_eq!(out, "-2.5e+0\n");
+    }
+
+    #[test]
+    fn typed_float128_invalid_errors() {
+        let prog = parse("float128 x=notanum\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("float128"));
+    }
+
+    #[test]
+    fn typed_complex256_components_full_precision() {
+        let (_, out, _) = run(
+            "complex256 z=1.123456789012345678901234567890+2i\n\
+             echo \"${z.re} ${z.im}\"\n",
+        );
+        assert_eq!(
+            out,
+            "1.12345678901234567890123456789e+0 2e+0\n",
+        );
+    }
+
+    #[test]
+    fn typed_complex256_real_only_collapses() {
+        let (_, out, _) = run("complex256 z=5\necho $z\n");
+        assert_eq!(out, "5e+0\n");
+    }
+
+    #[test]
+    fn typed_complex256_sticky_reassignment() {
+        // The type attribute persists across a plain reassignment.
+        let (_, out, _) =
+            run("complex256 z=1+1i\nz=2.5-3.5i\necho \"${z.re} ${z.im}\"\n");
+        assert_eq!(out, "2.5e+0 -3.5e+0\n");
     }
 
     // ===== zsh-style expansion flags (case + quote subset) =====

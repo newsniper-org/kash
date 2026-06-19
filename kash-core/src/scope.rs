@@ -100,6 +100,13 @@ pub enum NumericType {
     Complex128,
     /// `bcomplex32` — pair of `bfloat16`s, ML-friendly.
     BComplex32,
+    /// `float128` — IEEE 754 binary128 (113-bit significand),
+    /// backed by `astro-float` at that precision. Values are
+    /// stored as their full-precision decimal string rather than
+    /// an `f64`.
+    Float128,
+    /// `complex256` — pair of `float128`s.
+    Complex256,
 }
 
 impl NumericType {
@@ -126,6 +133,8 @@ impl NumericType {
             "complex64" => Self::Complex64,
             "complex128" => Self::Complex128,
             "bcomplex32" => Self::BComplex32,
+            "float128" => Self::Float128,
+            "complex256" => Self::Complex256,
             _ => return None,
         })
     }
@@ -149,12 +158,17 @@ impl NumericType {
         )
     }
 
-    /// True iff this type is a float (not integer, not complex).
+    /// True iff this type is a float (not integer, not complex),
+    /// including the extended-precision `float128`.
     #[must_use]
     pub fn is_float(self) -> bool {
         matches!(
             self,
-            Self::Float16 | Self::Float32 | Self::Float64 | Self::BFloat16,
+            Self::Float16
+                | Self::Float32
+                | Self::Float64
+                | Self::BFloat16
+                | Self::Float128,
         )
     }
 
@@ -165,8 +179,21 @@ impl NumericType {
     pub fn is_complex(self) -> bool {
         matches!(
             self,
-            Self::Complex32 | Self::Complex64 | Self::Complex128 | Self::BComplex32,
+            Self::Complex32
+                | Self::Complex64
+                | Self::Complex128
+                | Self::BComplex32
+                | Self::Complex256,
         )
+    }
+
+    /// True iff this type needs `astro-float` extended-precision
+    /// backing (`float128` / `complex256`) rather than an `f64`.
+    /// The storage path routes these through the `BigFloat`
+    /// helpers instead of [`Self::project_float`].
+    #[must_use]
+    pub fn is_extended_precision(self) -> bool {
+        matches!(self, Self::Float128 | Self::Complex256)
     }
 
     /// For a complex type, the float type that backs each
@@ -179,6 +206,7 @@ impl NumericType {
             Self::Complex64 => Self::Float32,
             Self::Complex128 => Self::Float64,
             Self::BComplex32 => Self::BFloat16,
+            Self::Complex256 => Self::Float128,
             _ => panic!("NumericType::component_type called on a non-complex type"),
         }
     }
@@ -213,10 +241,12 @@ impl NumericType {
             | Self::Float32
             | Self::Float64
             | Self::BFloat16
+            | Self::Float128
             | Self::Complex32
             | Self::Complex64
             | Self::Complex128
-            | Self::BComplex32 => {
+            | Self::BComplex32
+            | Self::Complex256 => {
                 panic!("NumericType::wrap called on a float/complex type — use project_float/complex")
             }
         }
@@ -226,7 +256,9 @@ impl NumericType {
     /// and return the round-trip. For `float64` this is a no-op;
     /// `float32` round-trips through `f32`; `float16` and
     /// `bfloat16` round-trip through `half::f16` and `half::bf16`
-    /// respectively. Integer variants panic.
+    /// respectively. Integer and extended-precision (`float128`)
+    /// variants panic — the latter is stored through the
+    /// `BigFloat` path, not as an `f64`.
     #[must_use]
     pub fn project_float(self, v: f64) -> f64 {
         match self {
@@ -234,7 +266,7 @@ impl NumericType {
             Self::Float32 => v as f32 as f64,
             Self::Float16 => f64::from(half::f16::from_f64(v)),
             Self::BFloat16 => f64::from(half::bf16::from_f64(v)),
-            _ => panic!("NumericType::project_float called on a non-float type"),
+            _ => panic!("NumericType::project_float called on a non-f64-float type"),
         }
     }
 
@@ -261,6 +293,8 @@ impl NumericType {
             Self::Complex64 => "complex64",
             Self::Complex128 => "complex128",
             Self::BComplex32 => "bcomplex32",
+            Self::Float128 => "float128",
+            Self::Complex256 => "complex256",
         }
     }
 }
