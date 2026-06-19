@@ -4431,27 +4431,41 @@ impl<B: MapBackend> Evaluator<B> {
     /// Evaluate an arithmetic expression to `i64`, truncating a
     /// float result toward zero. Used by integer-only contexts:
     /// array indices, exit status, `((…))` truthiness, integer
-    /// `typeset`.
+    /// `typeset`. A complex result is an error.
     fn eval_arith(&mut self, src: &str) -> Result<i64> {
-        match self.eval_arith_num(src)? {
-            Num::Int(n) => Ok(n),
-            Num::Float(f) => Ok(f as i64),
-            Num::Float128(bf) => {
-                let s = self.format_bigfloat(&bf)?;
-                Ok(s.parse::<f64>().unwrap_or(0.0) as i64)
+        let n = self.eval_arith_num(src)?;
+        // A complex value with a zero imaginary part is really a
+        // real number and converts; a genuinely complex one has
+        // no integer form.
+        n.as_real_f64().map(|f| f as i64).ok_or_else(|| {
+            KashError::Runtime(
+                "arithmetic: a complex value has no integer form".into(),
+            )
+        })
+    }
+
+    /// Render any `Num` to its canonical string form — used for
+    /// storage and `$((…))` output. The float128 / complex256
+    /// tiers format through the `Consts` cache.
+    fn render_num(&mut self, n: &Num) -> Result<String> {
+        match n {
+            Num::Int(v) => Ok(alloc::format!("{v}")),
+            Num::Float(f) => Ok(format_float_value(*f)),
+            Num::Float128(bf) => self.format_bigfloat(bf),
+            Num::Complex(r, i) => Ok(format_complex_value(*r, *i)),
+            Num::Complex256(r, i) => {
+                let rs = self.format_bigfloat(r)?;
+                let is = self.format_bigfloat(i)?;
+                Ok(format_complex_strings(&rs, &is))
             }
         }
     }
 
-    /// Render the result of `$((…))` — a float keeps its decimal
-    /// form rather than being truncated to an integer.
+    /// Render the result of `$((…))` — a float / complex keeps its
+    /// decimal form rather than being truncated to an integer.
     fn eval_arith_render(&mut self, src: &str) -> Result<String> {
         let n = self.eval_arith_num(src)?;
-        match &n {
-            Num::Int(v) => Ok(alloc::format!("{v}")),
-            Num::Float(f) => Ok(format_float_value(*f)),
-            Num::Float128(bf) => self.format_bigfloat(bf),
-        }
+        self.render_num(&n)
     }
 
     /// Parse `src` as kash source, run it in a fresh subshell-style
@@ -7678,6 +7692,84 @@ fn cleanup_bigfloat_str(s: &str) -> String {
     s.replace(".e", "e")
 }
 
+/// Convert a `float128` `BigFloat` to the nearest `f64`, rounding
+/// toward zero. Reconstructs the IEEE 754 bit pattern directly
+/// from the raw mantissa / exponent via `as_raw_parts` — no
+/// decimal round-trip and no `Consts` — mirroring astro-float's
+/// own (non-public) `to_f64`.
+///
+/// Every reachable consumer (the integer-context `eval_arith`
+/// wrapper, `as_real_f64`) immediately truncates the result to
+/// `i64`, so only the integer part needs to be exact. Normal-
+/// magnitude values (`|v| ≥ ~1`) take the normal path and are
+/// exact to ≤1 ulp; everything in the f64-subnormal range
+/// (`|v| < 2^-1022`) truncates to integer `0` regardless of the
+/// subnormal branch's precision.
+fn bigfloat_to_f64(bf: &astro_float::BigFloat) -> f64 {
+    use astro_float::Sign;
+    if bf.is_zero() {
+        return 0.0;
+    }
+    if bf.is_inf() {
+        return if bf.is_inf_neg() {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    let Some((m, _n, sign, e, _inexact)) = bf.as_raw_parts() else {
+        return f64::NAN;
+    };
+    if m.is_empty() {
+        return 0.0;
+    }
+    // Mantissa words are little-endian, normalized so the most
+    // significant word's top bit is set. Reconstruct the top 64
+    // bits: the top word is one u64 (64-bit targets) or the top
+    // two u32 words combined (32-bit x86). Building this without a
+    // `<< 64` shift, which would be a shift-by-width overflow.
+    let word_bits = core::mem::size_of::<astro_float::Word>() * 8;
+    let last = m.len() - 1; // `m` is non-empty (guarded above).
+    // `u64::from` is a no-op when `Word` is u64 (64-bit targets)
+    // but the widening conversion needed when it is u32 (32-bit
+    // x86), where the top 64 bits span the two highest words.
+    #[allow(clippy::useless_conversion)]
+    let mut mantissa = u64::from(m[last]);
+    #[allow(clippy::useless_conversion)]
+    if word_bits < 64
+        && let Some(below) = last.checked_sub(1)
+    {
+        mantissa = (mantissa << word_bits) | u64::from(m[below]);
+    }
+    let neg = matches!(sign, Sign::Neg);
+    // astro-float's exponent is the binary exponent of a
+    // mantissa in [0.5, 1); the IEEE bias is 1023.
+    let mut eb: i64 = e as i64 + 1023;
+    if eb >= 0x7ff {
+        return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    if eb <= 0 {
+        // Subnormal, or underflow to zero.
+        let shift = (-eb) as u64;
+        if shift < 52 {
+            let mut bits = mantissa >> (shift + 12);
+            if neg {
+                bits |= 0x8000_0000_0000_0000;
+            }
+            return f64::from_bits(bits);
+        }
+        return 0.0;
+    }
+    // Normal: assemble [sign:1][exp:11][fraction:52]. The leading
+    // `<< 1` drops the implicit leading 1.
+    let frac = (mantissa << 1) >> 12;
+    eb -= 1;
+    let mut bits: u64 = neg as u64;
+    bits = (bits << 11) | eb as u64;
+    bits = (bits << 52) | frac;
+    f64::from_bits(bits)
+}
+
 /// Whether a `BigFloat` decimal rendering represents zero — its
 /// mantissa (the part before the exponent) is all `0` (with an
 /// optional sign / dot). Used to collapse a `complex256` whose
@@ -8336,13 +8428,15 @@ struct ArithParser<'a, 'e, B: MapBackend> {
     ev: &'e mut Evaluator<B>,
 }
 
-/// A value flowing through the arithmetic engine. Three real
-/// tiers promote C-style by *widest operand*: `Int` (i64) <
-/// `Float` (f64) < `Float128` (113-bit, `astro-float`). Two
-/// `Int`s stay integer (`$((7/2))` is `3`); any `Float` operand
-/// promotes to f64; any `Float128` operand promotes the whole
-/// operation to 113-bit BigFloat. Bitwise / shift operators
-/// require integer operands. (The complex tiers land in 6.5b.)
+/// A value flowing through the arithmetic engine. The tiers form
+/// a 2-D lattice — *precision* (Int 0 < f64 1 < f128 2) × *domain*
+/// (real / complex) — and a binary op promotes to the widest of
+/// both axes by operand. Two `Int`s stay integer (`$((7/2))` is
+/// `3`); any `Float`/`Float128` promotes the real precision; any
+/// complex operand makes the result complex (`$((1 + 2i))`); a
+/// `Float128` mixed with a `Complex` widens to `Complex256` so no
+/// precision is silently dropped. Bitwise / shift require integer
+/// operands; ordering comparisons are rejected on complex values.
 #[derive(Clone, Debug)]
 enum Num {
     /// 64-bit signed integer — the shell arithmetic default.
@@ -8351,37 +8445,91 @@ enum Num {
     Float(f64),
     /// IEEE 754 binary128 (113-bit), backed by `astro-float`.
     Float128(astro_float::BigFloat),
+    /// `complex128` — an `f64` real / imaginary pair.
+    Complex(f64, f64),
+    /// `complex256` — a 113-bit `BigFloat` real / imaginary pair.
+    Complex256(astro_float::BigFloat, astro_float::BigFloat),
 }
 
 impl Num {
-    /// Promotion rank: 0 `Int`, 1 `Float`, 2 `Float128`. The
-    /// result tier of a binary op is the max of its operands'.
+    /// Precision rank: 0 `Int`, 1 `Float` / `Complex`, 2
+    /// `Float128` / `Complex256`. A binary op computes at the max
+    /// of the two operands' ranks.
     fn rank(&self) -> u8 {
         match self {
             Num::Int(_) => 0,
-            Num::Float(_) => 1,
-            Num::Float128(_) => 2,
+            Num::Float(_) | Num::Complex(..) => 1,
+            Num::Float128(_) | Num::Complex256(..) => 2,
         }
     }
 
-    /// Promote to a 113-bit `BigFloat` (the float128 tier).
+    /// Whether the value lives in the complex domain.
+    fn is_complex(&self) -> bool {
+        matches!(self, Num::Complex(..) | Num::Complex256(..))
+    }
+
+    /// Promote to a 113-bit `BigFloat` (real float128 tier). Only
+    /// valid on a real value.
     fn to_bigfloat(&self) -> astro_float::BigFloat {
         match self {
             Num::Int(n) => astro_float::BigFloat::from_i64(*n, FLOAT128_PREC),
             Num::Float(f) => astro_float::BigFloat::from_f64(*f, FLOAT128_PREC),
             Num::Float128(bf) => bf.clone(),
+            Num::Complex(..) | Num::Complex256(..) => {
+                unreachable!("to_bigfloat on a complex value")
+            }
         }
     }
 
-    /// Value as `f64`, for the f64 tier. Only called when neither
-    /// operand is `Float128` (those promote to BigFloat instead),
-    /// so the `Float128` arm is defensive.
-    fn as_f64(&self) -> f64 {
+    /// Promote to an `f64` `(re, im)` pair (the complex128 tier).
+    fn to_complex_f64(&self) -> (f64, f64) {
         match self {
-            Num::Int(n) => *n as f64,
-            Num::Float(f) => *f,
-            Num::Float128(_) => f64::NAN,
+            Num::Int(n) => (*n as f64, 0.0),
+            Num::Float(f) => (*f, 0.0),
+            Num::Complex(r, i) => (*r, *i),
+            // The rank-2 tiers normally take the BigFloat complex
+            // path; convert defensively in case they reach here.
+            Num::Float128(bf) => (bigfloat_to_f64(bf), 0.0),
+            Num::Complex256(r, i) => (bigfloat_to_f64(r), bigfloat_to_f64(i)),
         }
+    }
+
+    /// Promote to a 113-bit `BigFloat` `(re, im)` pair (the
+    /// complex256 tier).
+    fn to_complex_bf(&self) -> (astro_float::BigFloat, astro_float::BigFloat) {
+        use astro_float::BigFloat;
+        let zero = BigFloat::from_i64(0, FLOAT128_PREC);
+        match self {
+            Num::Int(n) => (BigFloat::from_i64(*n, FLOAT128_PREC), zero),
+            Num::Float(f) => (BigFloat::from_f64(*f, FLOAT128_PREC), zero),
+            Num::Float128(bf) => (bf.clone(), zero),
+            Num::Complex(r, i) => (
+                BigFloat::from_f64(*r, FLOAT128_PREC),
+                BigFloat::from_f64(*i, FLOAT128_PREC),
+            ),
+            Num::Complex256(r, i) => (r.clone(), i.clone()),
+        }
+    }
+
+    /// Value as `f64` when it is genuinely real — every real tier,
+    /// and a complex value *only if its imaginary part is zero*
+    /// (e.g. the `1+0i` left by `(1+2i) - 2i`). Otherwise `None`.
+    fn as_real_f64(&self) -> Option<f64> {
+        match self {
+            Num::Int(n) => Some(*n as f64),
+            Num::Float(f) => Some(*f),
+            Num::Float128(bf) => Some(bigfloat_to_f64(bf)),
+            Num::Complex(r, i) => (*i == 0.0).then_some(*r),
+            Num::Complex256(r, i) => i.is_zero().then(|| bigfloat_to_f64(r)),
+        }
+    }
+
+    /// Value as `f64`. The f128 tier converts directly from its
+    /// raw bits; a complex value yields its real part when the
+    /// imaginary part is zero, else `NaN` (the real arith path
+    /// checks domain first, so a true complex never reaches here).
+    fn as_f64(&self) -> f64 {
+        self.as_real_f64().unwrap_or(f64::NAN)
     }
 
     /// True iff the value is non-zero — arithmetic "true" for
@@ -8391,11 +8539,12 @@ impl Num {
             Num::Int(n) => *n != 0,
             Num::Float(f) => *f != 0.0,
             Num::Float128(bf) => !bf.is_zero(),
+            Num::Complex(r, i) => *r != 0.0 || *i != 0.0,
+            Num::Complex256(r, i) => !r.is_zero() || !i.is_zero(),
         }
     }
 
-    /// Require an integer operand for a bitwise / shift operator;
-    /// a float / float128 is an error.
+    /// Require an integer operand for a bitwise / shift operator.
     fn require_int(&self, op: &str) -> Result<i64> {
         match self {
             Num::Int(n) => Ok(*n),
@@ -8405,13 +8554,13 @@ impl Num {
         }
     }
 
-    /// Whether either operand sits in the float128 tier — the
-    /// trigger to compute the whole operation in `BigFloat`.
+    /// Whether either operand sits in the float128 / complex256
+    /// precision tier (rank 2).
     fn either_f128(a: &Num, b: &Num) -> bool {
         a.rank() == 2 || b.rank() == 2
     }
 
-    /// Whether either operand is a (non-integer) float tier.
+    /// Whether either operand is a (non-integer) real float.
     fn either_float(a: &Num, b: &Num) -> bool {
         a.rank() >= 1 || b.rank() >= 1
     }
@@ -8421,8 +8570,93 @@ impl Num {
 /// float128 arithmetic path.
 const F128_RM: astro_float::RoundingMode = astro_float::RoundingMode::ToEven;
 
-/// `a + b` with C-style promotion across the three real tiers.
+/// Order two `BigFloat`s by the sign of their difference rather
+/// than `BigFloat::cmp`. astro-float 0.9.5's `cmp` returns the
+/// wrong sign comparing a small-magnitude value (whose 113-bit
+/// mantissa has a leading zero word) against zero — e.g.
+/// `1e-40.cmp(0)` yields `Less`. Subtraction is correct for these
+/// values, and the sign of `a − b` is exact for the ordering.
+fn bigfloat_cmp(a: &astro_float::BigFloat, b: &astro_float::BigFloat) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let d = a.sub(b, FLOAT128_PREC, F128_RM);
+    if d.is_zero() {
+        Ordering::Equal
+    } else if d.is_negative() {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
+}
+
+/// Which complex binary op `arith_complex` should perform.
+#[derive(Clone, Copy)]
+enum COp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// Complex `a ⊕ b` at the appropriate precision: `complex256`
+/// (BigFloat pair) when either operand is a rank-2 tier, else
+/// `complex128` (f64 pair). Division by a zero complex yields
+/// NaN/Inf components (IEEE), not an error.
+fn arith_complex(a: &Num, b: &Num, op: COp) -> Num {
+    if Num::either_f128(a, b) {
+        let (ar, ai) = a.to_complex_bf();
+        let (br, bi) = b.to_complex_bf();
+        let p = FLOAT128_PREC;
+        let (rr, ri) = match op {
+            COp::Add => (ar.add(&br, p, F128_RM), ai.add(&bi, p, F128_RM)),
+            COp::Sub => (ar.sub(&br, p, F128_RM), ai.sub(&bi, p, F128_RM)),
+            COp::Mul => {
+                // (ar·br − ai·bi) + (ar·bi + ai·br)i
+                let rr = ar
+                    .mul(&br, p, F128_RM)
+                    .sub(&ai.mul(&bi, p, F128_RM), p, F128_RM);
+                let ri = ar
+                    .mul(&bi, p, F128_RM)
+                    .add(&ai.mul(&br, p, F128_RM), p, F128_RM);
+                (rr, ri)
+            }
+            COp::Div => {
+                // numerator · conj(denom) / |denom|²
+                let denom = br
+                    .mul(&br, p, F128_RM)
+                    .add(&bi.mul(&bi, p, F128_RM), p, F128_RM);
+                let rr = ar
+                    .mul(&br, p, F128_RM)
+                    .add(&ai.mul(&bi, p, F128_RM), p, F128_RM)
+                    .div(&denom, p, F128_RM);
+                let ri = ai
+                    .mul(&br, p, F128_RM)
+                    .sub(&ar.mul(&bi, p, F128_RM), p, F128_RM)
+                    .div(&denom, p, F128_RM);
+                (rr, ri)
+            }
+        };
+        Num::Complex256(rr, ri)
+    } else {
+        let (ar, ai) = a.to_complex_f64();
+        let (br, bi) = b.to_complex_f64();
+        let (rr, ri) = match op {
+            COp::Add => (ar + br, ai + bi),
+            COp::Sub => (ar - br, ai - bi),
+            COp::Mul => (ar * br - ai * bi, ar * bi + ai * br),
+            COp::Div => {
+                let denom = br * br + bi * bi;
+                ((ar * br + ai * bi) / denom, (ai * br - ar * bi) / denom)
+            }
+        };
+        Num::Complex(rr, ri)
+    }
+}
+
+/// `a + b` — promotes across the precision *and* domain axes.
 fn arith_add(a: &Num, b: &Num) -> Result<Num> {
+    if a.is_complex() || b.is_complex() {
+        return Ok(arith_complex(a, b, COp::Add));
+    }
     if let (Num::Int(x), Num::Int(y)) = (a, b) {
         x.checked_add(*y)
             .map(Num::Int)
@@ -8439,6 +8673,9 @@ fn arith_add(a: &Num, b: &Num) -> Result<Num> {
 }
 
 fn arith_sub(a: &Num, b: &Num) -> Result<Num> {
+    if a.is_complex() || b.is_complex() {
+        return Ok(arith_complex(a, b, COp::Sub));
+    }
     if let (Num::Int(x), Num::Int(y)) = (a, b) {
         x.checked_sub(*y)
             .map(Num::Int)
@@ -8455,6 +8692,9 @@ fn arith_sub(a: &Num, b: &Num) -> Result<Num> {
 }
 
 fn arith_mul(a: &Num, b: &Num) -> Result<Num> {
+    if a.is_complex() || b.is_complex() {
+        return Ok(arith_complex(a, b, COp::Mul));
+    }
     if let (Num::Int(x), Num::Int(y)) = (a, b) {
         x.checked_mul(*y)
             .map(Num::Int)
@@ -8471,6 +8711,9 @@ fn arith_mul(a: &Num, b: &Num) -> Result<Num> {
 }
 
 fn arith_div(a: &Num, b: &Num) -> Result<Num> {
+    if a.is_complex() || b.is_complex() {
+        return Ok(arith_complex(a, b, COp::Div));
+    }
     if Num::either_f128(a, b) {
         return Ok(Num::Float128(a.to_bigfloat().div(
             &b.to_bigfloat(),
@@ -8492,6 +8735,11 @@ fn arith_div(a: &Num, b: &Num) -> Result<Num> {
 }
 
 fn arith_mod(a: &Num, b: &Num) -> Result<Num> {
+    if a.is_complex() || b.is_complex() {
+        return Err(KashError::Runtime(
+            "arithmetic: `%` is undefined for complex operands".into(),
+        ));
+    }
     if Num::either_f128(a, b) {
         // `astro-float`'s `rem` is the truncated remainder.
         return Ok(Num::Float128(a.to_bigfloat().rem(&b.to_bigfloat())));
@@ -8509,7 +8757,7 @@ fn arith_mod(a: &Num, b: &Num) -> Result<Num> {
     }
 }
 
-/// Unary negation across the three real tiers.
+/// Unary negation across all tiers.
 fn arith_negate(v: &Num) -> Result<Num> {
     match v {
         Num::Int(n) => n
@@ -8517,11 +8765,9 @@ fn arith_negate(v: &Num) -> Result<Num> {
             .map(Num::Int)
             .ok_or_else(|| KashError::Runtime("arithmetic overflow".into())),
         Num::Float(f) => Ok(Num::Float(-f)),
-        Num::Float128(bf) => {
-            let mut neg = bf.clone();
-            neg.inv_sign();
-            Ok(Num::Float128(neg))
-        }
+        Num::Float128(bf) => Ok(Num::Float128(bf.neg())),
+        Num::Complex(r, i) => Ok(Num::Complex(-r, -i)),
+        Num::Complex256(r, i) => Ok(Num::Complex256(r.neg(), i.neg())),
     }
 }
 
@@ -8530,29 +8776,42 @@ fn bool_num(b: bool) -> Num {
     Num::Int(b as i64)
 }
 
-/// Equality of two numbers, promoting to the wider tier.
+/// Equality of two numbers, promoting across both axes. Complex
+/// values compare component-wise.
 fn arith_eq(a: &Num, b: &Num) -> bool {
-    arith_cmp(a, b) == core::cmp::Ordering::Equal
+    if a.is_complex() || b.is_complex() {
+        return if Num::either_f128(a, b) {
+            use core::cmp::Ordering::Equal;
+            let (ar, ai) = a.to_complex_bf();
+            let (br, bi) = b.to_complex_bf();
+            bigfloat_cmp(&ar, &br) == Equal && bigfloat_cmp(&ai, &bi) == Equal
+        } else {
+            let (ar, ai) = a.to_complex_f64();
+            let (br, bi) = b.to_complex_f64();
+            ar == br && ai == bi
+        };
+    }
+    matches!(arith_cmp(a, b), Ok(core::cmp::Ordering::Equal))
 }
 
-/// Compare two numbers for the relational / equality operators,
-/// promoting to the wider tier (BigFloat when either is float128,
-/// else f64, else i64).
-fn arith_cmp(a: &Num, b: &Num) -> core::cmp::Ordering {
+/// Order two *real* numbers, promoting to the wider tier. Complex
+/// operands have no ordering and are an error.
+fn arith_cmp(a: &Num, b: &Num) -> Result<core::cmp::Ordering> {
     use core::cmp::Ordering;
+    if a.is_complex() || b.is_complex() {
+        return Err(KashError::Runtime(
+            "arithmetic: complex values are not ordered".into(),
+        ));
+    }
     if Num::either_f128(a, b) {
-        match a.to_bigfloat().cmp(&b.to_bigfloat()) {
-            Some(s) if s < 0 => Ordering::Less,
-            Some(s) if s > 0 => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
+        Ok(bigfloat_cmp(&a.to_bigfloat(), &b.to_bigfloat()))
     } else if Num::either_float(a, b) {
-        a.as_f64()
+        Ok(a.as_f64()
             .partial_cmp(&b.as_f64())
-            .unwrap_or(Ordering::Equal)
+            .unwrap_or(Ordering::Equal))
     } else {
         match (a, b) {
-            (Num::Int(x), Num::Int(y)) => x.cmp(y),
+            (Num::Int(x), Num::Int(y)) => Ok(x.cmp(y)),
             _ => unreachable!("non-float operands are both Int"),
         }
     }
@@ -8653,15 +8912,11 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(new)
     }
 
-    /// Render a `Num` for storage / output. Float128 needs the
-    /// `Consts` cache to format, so this lives on the parser
-    /// (which holds the evaluator).
+    /// Render a `Num` for storage / output, delegating to the
+    /// evaluator (the float128 / complex256 tiers need its
+    /// `Consts` cache to format).
     fn render_num(&mut self, n: &Num) -> Result<String> {
-        match n {
-            Num::Int(v) => Ok(alloc::format!("{v}")),
-            Num::Float(f) => Ok(format_float_value(*f)),
-            Num::Float128(bf) => self.ev.format_bigfloat(bf),
-        }
+        self.ev.render_num(n)
     }
 
     fn parse_ternary(&mut self) -> Result<Num> {
@@ -8749,16 +9004,16 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         loop {
             if self.try_consume_exact("<=") {
                 let rhs = self.parse_shift()?;
-                lhs = bool_num(arith_cmp(&lhs, &rhs) != Ordering::Greater);
+                lhs = bool_num(arith_cmp(&lhs, &rhs)? != Ordering::Greater);
             } else if self.try_consume_exact(">=") {
                 let rhs = self.parse_shift()?;
-                lhs = bool_num(arith_cmp(&lhs, &rhs) != Ordering::Less);
+                lhs = bool_num(arith_cmp(&lhs, &rhs)? != Ordering::Less);
             } else if self.try_consume_single('<') {
                 let rhs = self.parse_shift()?;
-                lhs = bool_num(arith_cmp(&lhs, &rhs) == Ordering::Less);
+                lhs = bool_num(arith_cmp(&lhs, &rhs)? == Ordering::Less);
             } else if self.try_consume_single('>') {
                 let rhs = self.parse_shift()?;
-                lhs = bool_num(arith_cmp(&lhs, &rhs) == Ordering::Greater);
+                lhs = bool_num(arith_cmp(&lhs, &rhs)? == Ordering::Greater);
             } else {
                 break;
             }
@@ -8986,15 +9241,28 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
             }
         }
         let lit = &self.src[start..self.pos];
-        if is_float {
-            lit.parse::<f64>().map(Num::Float).map_err(|_| {
+        let base = if is_float {
+            Num::Float(lit.parse::<f64>().map_err(|_| {
                 KashError::Parse(alloc::format!("arithmetic: invalid float `{lit}`"))
-            })
+            })?)
         } else {
-            lit.parse::<i64>().map(Num::Int).map_err(|_| {
+            Num::Int(lit.parse::<i64>().map_err(|_| {
                 KashError::Parse(alloc::format!("arithmetic: invalid integer `{lit}`"))
-            })
+            })?)
+        };
+        // Imaginary suffix: a numeric literal immediately followed
+        // by `i` (not part of a longer identifier) is a pure
+        // imaginary value — `2i`, `1.5i`, `3e2i`.
+        if self.peek() == Some('i')
+            && !matches!(
+                self.peek_at(1),
+                Some(c) if c == '_' || c.is_ascii_alphanumeric()
+            )
+        {
+            self.advance();
+            return Ok(Num::Complex(0.0, base.as_f64()));
         }
+        Ok(base)
     }
 
     /// Peek whether the number starting here carries a float
@@ -9070,12 +9338,37 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 }
                 Ok(Num::Float128(bf))
             }
-            // Complex operands in `$((…))` arrive with 6.5b.
-            Some(t) if t.is_complex() => Err(KashError::Runtime(
-                alloc::format!(
-                    "arithmetic: complex operand `{name}` is not yet supported"
-                ),
-            )),
+            // complex256 — components at 113-bit precision.
+            Some(t) if t.is_complex() && t.is_extended_precision() => {
+                use astro_float::{BigFloat, Radix, RoundingMode};
+                let (re_s, im_s) =
+                    split_complex_literal(trimmed).ok_or_else(not_a_number)?;
+                let cc = self.ev.bf_consts()?;
+                let re = BigFloat::parse(
+                    re_s.trim(),
+                    Radix::Dec,
+                    FLOAT128_PREC,
+                    RoundingMode::ToEven,
+                    cc,
+                );
+                let im = BigFloat::parse(
+                    im_s.trim(),
+                    Radix::Dec,
+                    FLOAT128_PREC,
+                    RoundingMode::ToEven,
+                    cc,
+                );
+                if re.is_nan() || im.is_nan() {
+                    return Err(not_a_number());
+                }
+                Ok(Num::Complex256(re, im))
+            }
+            // complex128 — f64 component pair.
+            Some(t) if t.is_complex() => {
+                let (re, im) =
+                    parse_complex_literal(trimmed).ok_or_else(not_a_number)?;
+                Ok(Num::Complex(re, im))
+            }
             Some(t) if t.is_float() => {
                 trimmed.parse::<f64>().map(Num::Float).map_err(|_| not_a_number())
             }
@@ -16345,13 +16638,129 @@ mod tests {
         assert_eq!(out, "4e+0\n");
     }
 
+    // ===== arithmetic: complex tier =====
+
     #[test]
-    fn arith_complex_operand_not_yet_supported() {
-        let prog =
-            parse("complex128 z=1+2i\necho $((z + 1))\n").unwrap();
+    fn arith_complex_literal_and_add() {
+        let (_, out, _) = run("echo $((1 + 2i))");
+        assert_eq!(out, "1.0+2.0i\n");
+    }
+
+    #[test]
+    fn arith_complex_multiplication() {
+        // (1+2i)(3+4i) = -5+10i — the memory's worked example.
+        let (_, out, _) = run(
+            "complex128 a=1+2i\ncomplex128 b=3+4i\necho $((a * b))\n",
+        );
+        assert_eq!(out, "-5.0+10.0i\n");
+    }
+
+    #[test]
+    fn arith_complex_division() {
+        // (1+2i)/(1+2i) = 1.
+        let (_, out, _) = run(
+            "complex128 a=1+2i\necho $((a / a))\n",
+        );
+        assert_eq!(out, "1.0\n");
+    }
+
+    #[test]
+    fn arith_real_times_imaginary() {
+        let (_, out, _) = run("echo $((3 * 2i))");
+        assert_eq!(out, "6.0i\n");
+    }
+
+    #[test]
+    fn arith_complex_stored_back() {
+        let (_, out, _) = run(
+            "complex128 a=1+2i\ncomplex128 b=3+4i\ncomplex128 r=$((a * b))\necho $r\n",
+        );
+        assert_eq!(out, "-5.0+10.0i\n");
+    }
+
+    #[test]
+    fn arith_complex256_at_113_bit() {
+        // (1+i)² = 2i, computed in the complex256 tier.
+        let (_, out, _) = run(
+            "complex256 z=1+1i\necho $((z * z))\n",
+        );
+        assert_eq!(out, "0.0+2e+0i\n");
+    }
+
+    #[test]
+    fn arith_complex_ordering_is_an_error() {
+        let prog = parse("echo $(( (1+2i) < 3 ))").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
-        assert!(alloc::format!("{err}").contains("complex"));
+        assert!(alloc::format!("{err}").contains("not ordered"));
+    }
+
+    #[test]
+    fn arith_complex_modulo_is_an_error() {
+        let prog = parse("echo $(( (1+2i) % 2 ))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("undefined for complex"));
+    }
+
+    #[test]
+    fn arith_complex_equality() {
+        let (_, out, _) =
+            run("echo $(( (1+2i) == (1+2i) )) $(( (1+2i) == (1+3i) ))");
+        assert_eq!(out, "1 0\n");
+    }
+
+    #[test]
+    fn arith_complex_zero_imaginary_is_real() {
+        // `(1+2i) - 2i` is `1+0i` — really real, so usable as an
+        // integer index and rendered as a plain real.
+        let (_, out, _) = run("echo $(( (4 + 0i) + 1 ))");
+        assert_eq!(out, "5.0\n");
+        let (_, out, _) =
+            run("s=XYZ\necho ${s:$(( (1+2i) - 2i )):1}\n");
+        assert_eq!(out, "Y\n");
+    }
+
+    #[test]
+    fn arith_genuinely_complex_has_no_integer_form() {
+        let prog = parse("s=XYZ\necho ${s:$(( 1+2i )):1}\n").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("no integer form"));
+    }
+
+    #[test]
+    fn arith_float128_truncates_to_int_via_raw_parts() {
+        // A float128 variable used *directly* as an integer-context
+        // operand routes through `eval_arith` → `bigfloat_to_f64`
+        // (the `as_raw_parts` reconstruction). `2.9` truncates to
+        // 2. Regression guard: this path shift-overflow-panicked
+        // in debug builds before the loop was de-looped. (Note
+        // `${s:o:2}`, not `${s:$((o)):2}` — the latter renders `o`
+        // to a string first and never reaches the converter.)
+        let (_, out, _) = run("s=ABCDEF\nfloat128 o=2.9\necho ${s:o:2}\n");
+        assert_eq!(out, "CD\n");
+    }
+
+    #[test]
+    fn arith_float128_codepoint_via_raw_parts() {
+        // `(#)` flag → `eval_arith` → `bigfloat_to_f64`; 65 → 'A'.
+        let (_, out, _) =
+            run("float128 x=65\nn=x\nprintf '%s\\n' ${(#)n}\n");
+        assert_eq!(out, "A\n");
+    }
+
+    #[test]
+    fn arith_float128_small_value_comparison() {
+        // astro-float 0.9.5's `BigFloat::cmp` mis-orders a tiny
+        // value against zero; the subtraction-based `bigfloat_cmp`
+        // workaround gives the right answer regardless of operand
+        // order.
+        let (_, out, _) = run("float128 x=1e-40\necho $(( x > 0 )) $(( 0 < x )) $(( x < 0 ))\n");
+        assert_eq!(out, "1 1 0\n");
+        let (_, out, _) =
+            run("float128 x=-1e-300\necho $(( x < 0 )) $(( x > 0 ))\n");
+        assert_eq!(out, "1 0\n");
     }
 
     // ===== arithmetic extensions =====
