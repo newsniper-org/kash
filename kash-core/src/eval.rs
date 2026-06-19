@@ -8570,6 +8570,128 @@ impl Num {
 /// float128 arithmetic path.
 const F128_RM: astro_float::RoundingMode = astro_float::RoundingMode::ToEven;
 
+/// One-argument math-library functions, dispatched per numeric
+/// tier by the arithmetic engine.
+#[derive(Clone, Copy)]
+enum Fn1 {
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Exp,
+    Exp2,
+    Ln,
+    Log2,
+    Log10,
+    Sqrt,
+    Cbrt,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Fabs,
+}
+
+impl Fn1 {
+    fn from_name(n: &str) -> Option<Fn1> {
+        Some(match n {
+            "sin" => Fn1::Sin,
+            "cos" => Fn1::Cos,
+            "tan" => Fn1::Tan,
+            "asin" => Fn1::Asin,
+            "acos" => Fn1::Acos,
+            "atan" => Fn1::Atan,
+            "sinh" => Fn1::Sinh,
+            "cosh" => Fn1::Cosh,
+            "tanh" => Fn1::Tanh,
+            "asinh" => Fn1::Asinh,
+            "acosh" => Fn1::Acosh,
+            "atanh" => Fn1::Atanh,
+            "exp" => Fn1::Exp,
+            "exp2" => Fn1::Exp2,
+            // C / ksh93 `log` is natural log; `ln` is the alias.
+            "log" | "ln" => Fn1::Ln,
+            "log2" => Fn1::Log2,
+            "log10" => Fn1::Log10,
+            "sqrt" => Fn1::Sqrt,
+            "cbrt" => Fn1::Cbrt,
+            "floor" => Fn1::Floor,
+            "ceil" => Fn1::Ceil,
+            "round" => Fn1::Round,
+            "trunc" => Fn1::Trunc,
+            "fabs" => Fn1::Fabs,
+            _ => return None,
+        })
+    }
+
+    fn eval_f64(self, x: f64) -> f64 {
+        match self {
+            Fn1::Sin => libm::sin(x),
+            Fn1::Cos => libm::cos(x),
+            Fn1::Tan => libm::tan(x),
+            Fn1::Asin => libm::asin(x),
+            Fn1::Acos => libm::acos(x),
+            Fn1::Atan => libm::atan(x),
+            Fn1::Sinh => libm::sinh(x),
+            Fn1::Cosh => libm::cosh(x),
+            Fn1::Tanh => libm::tanh(x),
+            Fn1::Asinh => libm::asinh(x),
+            Fn1::Acosh => libm::acosh(x),
+            Fn1::Atanh => libm::atanh(x),
+            Fn1::Exp => libm::exp(x),
+            Fn1::Exp2 => libm::exp2(x),
+            Fn1::Ln => libm::log(x),
+            Fn1::Log2 => libm::log2(x),
+            Fn1::Log10 => libm::log10(x),
+            Fn1::Sqrt => libm::sqrt(x),
+            Fn1::Cbrt => libm::cbrt(x),
+            Fn1::Floor => libm::floor(x),
+            Fn1::Ceil => libm::ceil(x),
+            Fn1::Round => libm::round(x),
+            Fn1::Trunc => libm::trunc(x),
+            Fn1::Fabs => libm::fabs(x),
+        }
+    }
+}
+
+/// Two-argument math-library functions.
+#[derive(Clone, Copy)]
+enum Fn2 {
+    Atan2,
+    Hypot,
+    Pow,
+    Fmod,
+}
+
+impl Fn2 {
+    fn from_name(n: &str) -> Option<Fn2> {
+        Some(match n {
+            "atan2" => Fn2::Atan2,
+            "hypot" => Fn2::Hypot,
+            "pow" => Fn2::Pow,
+            "fmod" => Fn2::Fmod,
+            _ => return None,
+        })
+    }
+
+    fn eval_f64(self, a: f64, b: f64) -> f64 {
+        match self {
+            Fn2::Atan2 => libm::atan2(a, b),
+            Fn2::Hypot => libm::hypot(a, b),
+            Fn2::Pow => libm::pow(a, b),
+            Fn2::Fmod => libm::fmod(a, b),
+        }
+    }
+}
+
 /// Order two `BigFloat`s by the sign of their difference rather
 /// than `BigFloat::cmp`. astro-float 0.9.5's `cmp` returns the
 /// wrong sign comparing a small-magnitude value (whose 113-bit
@@ -8585,6 +8707,86 @@ fn bigfloat_cmp(a: &astro_float::BigFloat, b: &astro_float::BigFloat) -> core::c
         Ordering::Less
     } else {
         Ordering::Greater
+    }
+}
+
+/// Truncate a `BigFloat` toward zero at full 113-bit precision —
+/// astro-float has no `trunc`, so use `x − (x rem 1)` (its `rem`
+/// is the truncated remainder, so the fractional part carries
+/// `x`'s sign and subtracting it lands on the integer toward
+/// zero).
+fn bigfloat_trunc(x: &astro_float::BigFloat) -> astro_float::BigFloat {
+    let one = astro_float::BigFloat::from_i64(1, FLOAT128_PREC);
+    let frac = x.rem(&one);
+    x.sub(&frac, FLOAT128_PREC, F128_RM)
+}
+
+/// `floor` at 113-bit: trunc, then step down by one for a
+/// negative value with a non-zero fractional part.
+fn bigfloat_floor(x: &astro_float::BigFloat) -> astro_float::BigFloat {
+    let t = bigfloat_trunc(x);
+    if x.is_negative() && bigfloat_cmp(x, &t) != core::cmp::Ordering::Equal {
+        let one = astro_float::BigFloat::from_i64(1, FLOAT128_PREC);
+        t.sub(&one, FLOAT128_PREC, F128_RM)
+    } else {
+        t
+    }
+}
+
+/// `ceil` at 113-bit: trunc, then step up for a positive value
+/// with a non-zero fractional part.
+fn bigfloat_ceil(x: &astro_float::BigFloat) -> astro_float::BigFloat {
+    let t = bigfloat_trunc(x);
+    if x.is_positive() && bigfloat_cmp(x, &t) != core::cmp::Ordering::Equal {
+        let one = astro_float::BigFloat::from_i64(1, FLOAT128_PREC);
+        t.add(&one, FLOAT128_PREC, F128_RM)
+    } else {
+        t
+    }
+}
+
+/// `round` at 113-bit, half away from zero (matching `libm`):
+/// truncate `x ± 0.5`.
+fn bigfloat_round(x: &astro_float::BigFloat) -> astro_float::BigFloat {
+    let half = astro_float::BigFloat::from_f64(0.5, FLOAT128_PREC);
+    let adj = if x.is_negative() {
+        x.sub(&half, FLOAT128_PREC, F128_RM)
+    } else {
+        x.add(&half, FLOAT128_PREC, F128_RM)
+    };
+    bigfloat_trunc(&adj)
+}
+
+/// `atan2(y, x)` at 113-bit, composed from `atan` (astro-float
+/// has no `atan2`) with the standard quadrant adjustments.
+fn bigfloat_atan2(
+    y: &astro_float::BigFloat,
+    x: &astro_float::BigFloat,
+    cc: &mut astro_float::Consts,
+) -> astro_float::BigFloat {
+    let p = FLOAT128_PREC;
+    let rm = F128_RM;
+    let pi = cc.pi(p, rm);
+    if !x.is_zero() {
+        let base = y.div(x, p, rm).atan(p, rm, cc);
+        if x.is_negative() {
+            if y.is_negative() {
+                base.sub(&pi, p, rm)
+            } else {
+                base.add(&pi, p, rm)
+            }
+        } else {
+            base
+        }
+    } else if y.is_zero() {
+        astro_float::BigFloat::from_i64(0, p)
+    } else {
+        let half_pi = pi.div(&astro_float::BigFloat::from_i64(2, p), p, rm);
+        if y.is_negative() {
+            half_pi.neg()
+        } else {
+            half_pi
+        }
     }
 }
 
@@ -9231,86 +9433,219 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
         Ok(args)
     }
 
-    /// Dispatch a math-library function call. The f64 (real)
-    /// surface lands here; `float128` / complex arguments are
-    /// rejected with a clear message until the extended-tier
-    /// math commit wires them in.
+    /// Dispatch a math-library function call across the numeric
+    /// tiers: real f64 (`libm`), real float128 (`astro-float`),
+    /// and complex. Complex-specific functions (`creal`, `cabs`,
+    /// …) and `abs` have dedicated handling.
     fn call_math_func(&mut self, name: &str, args: &[Num]) -> Result<Num> {
+        if let Some(f) = Fn1::from_name(name) {
+            let [a] = args else {
+                return Err(math_arity_err(name, 1, args.len()));
+            };
+            return self.eval_fn1(f, name, a);
+        }
+        if let Some(f) = Fn2::from_name(name) {
+            let [a, b] = args else {
+                return Err(math_arity_err(name, 2, args.len()));
+            };
+            return self.eval_fn2(f, name, a, b);
+        }
         match name {
-            "sin" => self.math_unary(name, args, libm::sin),
-            "cos" => self.math_unary(name, args, libm::cos),
-            "tan" => self.math_unary(name, args, libm::tan),
-            "asin" => self.math_unary(name, args, libm::asin),
-            "acos" => self.math_unary(name, args, libm::acos),
-            "atan" => self.math_unary(name, args, libm::atan),
-            "sinh" => self.math_unary(name, args, libm::sinh),
-            "cosh" => self.math_unary(name, args, libm::cosh),
-            "tanh" => self.math_unary(name, args, libm::tanh),
-            "asinh" => self.math_unary(name, args, libm::asinh),
-            "acosh" => self.math_unary(name, args, libm::acosh),
-            "atanh" => self.math_unary(name, args, libm::atanh),
-            "exp" => self.math_unary(name, args, libm::exp),
-            "exp2" => self.math_unary(name, args, libm::exp2),
-            // C / ksh93 `log` is the natural logarithm; `ln` is a
-            // kash-friendly alias.
-            "log" | "ln" => self.math_unary(name, args, libm::log),
-            "log2" => self.math_unary(name, args, libm::log2),
-            "log10" => self.math_unary(name, args, libm::log10),
-            "sqrt" => self.math_unary(name, args, libm::sqrt),
-            "cbrt" => self.math_unary(name, args, libm::cbrt),
-            "floor" => self.math_unary(name, args, libm::floor),
-            "ceil" => self.math_unary(name, args, libm::ceil),
-            "round" => self.math_unary(name, args, libm::round),
-            "trunc" => self.math_unary(name, args, libm::trunc),
-            "fabs" => self.math_unary(name, args, libm::fabs),
             "abs" => self.math_abs(args),
-            "atan2" => self.math_binary(name, args, libm::atan2),
-            "hypot" => self.math_binary(name, args, libm::hypot),
-            "pow" => self.math_binary(name, args, libm::pow),
-            "fmod" => self.math_binary(name, args, libm::fmod),
+            "creal" | "cimag" | "cconj" | "cabs" | "carg" | "cphase" => {
+                let [a] = args else {
+                    return Err(math_arity_err(name, 1, args.len()));
+                };
+                self.eval_complex_part(name, a)
+            }
             _ => Err(KashError::Runtime(alloc::format!(
                 "arithmetic: unknown function `{name}`"
             ))),
         }
     }
 
-    /// One-argument real (`f64`) math function. A `float128` /
-    /// complex argument errors (extended-tier math is a follow-up).
-    fn math_unary(
-        &self,
-        name: &str,
-        args: &[Num],
-        f: fn(f64) -> f64,
-    ) -> Result<Num> {
-        let [a] = args else {
-            return Err(math_arity_err(name, 1, args.len()));
-        };
+    /// One-argument math function, dispatched by the argument's
+    /// tier. f64 → `libm`; float128 → `astro-float` (custom
+    /// rounding family); complex → complex-generalized formulas
+    /// (`eval_fn1_complex`).
+    fn eval_fn1(&mut self, f: Fn1, name: &str, a: &Num) -> Result<Num> {
         match a {
-            Num::Int(_) | Num::Float(_) => Ok(Num::Float(f(a.as_f64()))),
-            _ => Err(math_tier_err(name)),
+            Num::Int(_) | Num::Float(_) => Ok(Num::Float(f.eval_f64(a.as_f64()))),
+            Num::Float128(bf) => {
+                let r = self.eval_fn1_f128(f, &bf.clone())?;
+                Ok(Num::Float128(r))
+            }
+            Num::Complex(re, im) => self.eval_fn1_complex(f, name, *re, *im),
+            Num::Complex256(..) => Err(KashError::Runtime(alloc::format!(
+                "arithmetic: `{name}()` on complex256 is not yet supported"
+            ))),
         }
     }
 
-    /// Two-argument real (`f64`) math function.
-    fn math_binary(
-        &self,
-        name: &str,
-        args: &[Num],
-        f: fn(f64, f64) -> f64,
-    ) -> Result<Num> {
-        let [a, b] = args else {
-            return Err(math_arity_err(name, 2, args.len()));
-        };
-        if a.rank() == 2 || b.rank() == 2 || a.is_complex() || b.is_complex() {
+    /// float128 unary math. Transcendentals go through
+    /// `astro-float` (some need the `Consts` cache); the rounding
+    /// family is computed at full 113-bit precision via the
+    /// `bigfloat_*` helpers.
+    fn eval_fn1_f128(
+        &mut self,
+        f: Fn1,
+        x: &astro_float::BigFloat,
+    ) -> Result<astro_float::BigFloat> {
+        use astro_float::BigFloat;
+        let p = FLOAT128_PREC;
+        let rm = F128_RM;
+        Ok(match f {
+            Fn1::Sqrt => x.sqrt(p, rm),
+            Fn1::Cbrt => x.cbrt(p, rm),
+            Fn1::Fabs => x.abs(),
+            Fn1::Floor => bigfloat_floor(x),
+            Fn1::Ceil => bigfloat_ceil(x),
+            Fn1::Round => bigfloat_round(x),
+            Fn1::Trunc => bigfloat_trunc(x),
+            Fn1::Exp2 => {
+                let two = BigFloat::from_i64(2, p);
+                let cc = self.ev.bf_consts()?;
+                two.pow(x, p, rm, cc)
+            }
+            _ => {
+                let cc = self.ev.bf_consts()?;
+                match f {
+                    Fn1::Sin => x.sin(p, rm, cc),
+                    Fn1::Cos => x.cos(p, rm, cc),
+                    Fn1::Tan => x.tan(p, rm, cc),
+                    Fn1::Asin => x.asin(p, rm, cc),
+                    Fn1::Acos => x.acos(p, rm, cc),
+                    Fn1::Atan => x.atan(p, rm, cc),
+                    Fn1::Sinh => x.sinh(p, rm, cc),
+                    Fn1::Cosh => x.cosh(p, rm, cc),
+                    Fn1::Tanh => x.tanh(p, rm, cc),
+                    Fn1::Asinh => x.asinh(p, rm, cc),
+                    Fn1::Acosh => x.acosh(p, rm, cc),
+                    Fn1::Atanh => x.atanh(p, rm, cc),
+                    Fn1::Exp => x.exp(p, rm, cc),
+                    Fn1::Ln => x.ln(p, rm, cc),
+                    Fn1::Log2 => x.log2(p, rm, cc),
+                    Fn1::Log10 => x.log10(p, rm, cc),
+                    // Algebraic / rounding cases handled above.
+                    Fn1::Sqrt
+                    | Fn1::Cbrt
+                    | Fn1::Fabs
+                    | Fn1::Floor
+                    | Fn1::Ceil
+                    | Fn1::Round
+                    | Fn1::Trunc
+                    | Fn1::Exp2 => unreachable!("handled above"),
+                }
+            }
+        })
+    }
+
+    /// Two-argument math function across tiers. f64 → `libm`;
+    /// float128 → `astro-float` (`atan2` / `hypot` composed from
+    /// primitives astro-float lacks). Complex operands are an
+    /// error for these (they are real-valued binary ops; complex
+    /// `pow` is a follow-up).
+    fn eval_fn2(&mut self, f: Fn2, name: &str, a: &Num, b: &Num) -> Result<Num> {
+        if a.is_complex() || b.is_complex() {
             return Err(math_tier_err(name));
         }
-        Ok(Num::Float(f(a.as_f64(), b.as_f64())))
+        if a.rank() == 2 || b.rank() == 2 {
+            let x = a.to_bigfloat();
+            let y = b.to_bigfloat();
+            return Ok(Num::Float128(self.eval_fn2_f128(f, &x, &y)?));
+        }
+        Ok(Num::Float(f.eval_f64(a.as_f64(), b.as_f64())))
+    }
+
+    fn eval_fn2_f128(
+        &mut self,
+        f: Fn2,
+        x: &astro_float::BigFloat,
+        y: &astro_float::BigFloat,
+    ) -> Result<astro_float::BigFloat> {
+        let p = FLOAT128_PREC;
+        let rm = F128_RM;
+        Ok(match f {
+            Fn2::Pow => {
+                let cc = self.ev.bf_consts()?;
+                x.pow(y, p, rm, cc)
+            }
+            Fn2::Fmod => x.rem(y),
+            Fn2::Hypot => {
+                // √(x² + y²).
+                x.mul(x, p, rm).add(&y.mul(y, p, rm), p, rm).sqrt(p, rm)
+            }
+            Fn2::Atan2 => {
+                let cc = self.ev.bf_consts()?;
+                bigfloat_atan2(x, y, cc)
+            }
+        })
+    }
+
+    /// `creal` / `cimag` / `cconj` / `cabs` / `carg` (`cphase`) —
+    /// the complex-specific functions, defined for real arguments
+    /// too (a real is `r + 0i`).
+    fn eval_complex_part(&mut self, name: &str, a: &Num) -> Result<Num> {
+        match name {
+            "creal" => Ok(match a {
+                Num::Complex(r, _) => Num::Float(*r),
+                Num::Complex256(r, _) => Num::Float128(r.clone()),
+                other => other.clone(),
+            }),
+            "cimag" => Ok(match a {
+                Num::Complex(_, i) => Num::Float(*i),
+                Num::Complex256(_, i) => Num::Float128(i.clone()),
+                _ => Num::Int(0),
+            }),
+            "cconj" => Ok(match a {
+                Num::Complex(r, i) => Num::Complex(*r, -i),
+                Num::Complex256(r, i) => Num::Complex256(r.clone(), i.neg()),
+                other => other.clone(),
+            }),
+            "cabs" => match a {
+                Num::Complex(r, i) => Ok(Num::Float(libm::hypot(*r, *i))),
+                Num::Complex256(r, i) => {
+                    let p = FLOAT128_PREC;
+                    let rm = F128_RM;
+                    Ok(Num::Float128(
+                        r.mul(r, p, rm).add(&i.mul(i, p, rm), p, rm).sqrt(p, rm),
+                    ))
+                }
+                Num::Float128(bf) => Ok(Num::Float128(bf.abs())),
+                Num::Int(n) => n
+                    .checked_abs()
+                    .map(Num::Int)
+                    .ok_or_else(|| KashError::Runtime("arithmetic overflow".into())),
+                Num::Float(x) => Ok(Num::Float(libm::fabs(*x))),
+            },
+            "carg" | "cphase" => match a {
+                Num::Complex(r, i) => Ok(Num::Float(libm::atan2(*i, *r))),
+                Num::Complex256(r, i) => {
+                    let cc = self.ev.bf_consts()?;
+                    Ok(Num::Float128(bigfloat_atan2(i, r, cc)))
+                }
+                // arg of a real: 0 if ≥ 0, π if < 0.
+                Num::Float128(bf) => {
+                    if bf.is_negative() {
+                        let cc = self.ev.bf_consts()?;
+                        Ok(Num::Float128(cc.pi(FLOAT128_PREC, F128_RM)))
+                    } else {
+                        Ok(Num::Float(0.0))
+                    }
+                }
+                _ => {
+                    let v = a.as_f64();
+                    Ok(Num::Float(if v < 0.0 { core::f64::consts::PI } else { 0.0 }))
+                }
+            },
+            _ => unreachable!("eval_complex_part called for {name}"),
+        }
     }
 
     /// `abs(x)` — magnitude, preserving the integer tier (so
-    /// `abs(-3)` is `3`, not `3.0`). Complex magnitude (`cabs`)
-    /// and float128 land with the extended-tier math.
-    fn math_abs(&self, args: &[Num]) -> Result<Num> {
+    /// `abs(-3)` is `3`, not `3.0`). Float128 → BigFloat abs;
+    /// complex → magnitude (like `cabs`).
+    fn math_abs(&mut self, args: &[Num]) -> Result<Num> {
         let [a] = args else {
             return Err(math_arity_err("abs", 1, args.len()));
         };
@@ -9320,8 +9655,27 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 .map(Num::Int)
                 .ok_or_else(|| KashError::Runtime("arithmetic overflow".into())),
             Num::Float(f) => Ok(Num::Float(libm::fabs(*f))),
-            _ => Err(math_tier_err("abs")),
+            Num::Float128(bf) => Ok(Num::Float128(bf.abs())),
+            Num::Complex(..) | Num::Complex256(..) => {
+                self.eval_complex_part("cabs", a)
+            }
         }
+    }
+
+    /// Complex-generalized transcendentals — `sqrt`/`exp`/`log`/
+    /// `sin`/`cos`/… of a complex argument. Wired in 7.3; for now
+    /// a clear "not yet supported" rather than a precision-losing
+    /// fallback.
+    fn eval_fn1_complex(
+        &mut self,
+        _f: Fn1,
+        name: &str,
+        _re: f64,
+        _im: f64,
+    ) -> Result<Num> {
+        Err(KashError::Runtime(alloc::format!(
+            "arithmetic: `{name}()` on a complex argument is not yet supported"
+        )))
     }
 
     fn parse_number(&mut self) -> Result<Num> {
@@ -17010,9 +17364,80 @@ mod tests {
         assert!(alloc::format!("{err}").contains("argument"));
     }
 
+    // ===== arithmetic: math library (float128 + complex tiers) =====
+
     #[test]
-    fn math_float128_arg_not_yet_supported() {
-        let prog = parse("float128 x=2\necho $(( sqrt(x) ))").unwrap();
+    fn math_float128_sqrt_at_113_bit() {
+        // 113-bit √2 — far more digits than f64's ~17.
+        let (_, out, _) = run("float128 x=2\necho $(( sqrt(x) ))");
+        assert_eq!(
+            out,
+            "1.41421356237309504880168872420969807857e+0\n",
+        );
+    }
+
+    #[test]
+    fn math_float128_transcendentals() {
+        // f64-prefix agreement with Python is enough to confirm
+        // the right function is dispatched in the f128 tier.
+        let (_, out, _) = run("float128 x=2\necho $(( sin(x) ))");
+        assert!(out.starts_with("9.09297426825681695"), "got: {out}");
+        let (_, out, _) = run("float128 x=2\necho $(( exp(x) ))");
+        assert!(out.starts_with("7.38905609893065022"), "got: {out}");
+        let (_, out, _) = run("float128 x=2\necho $(( log(x) ))");
+        assert!(out.starts_with("6.93147180559945309"), "got: {out}");
+    }
+
+    #[test]
+    fn math_float128_rounding_family() {
+        let (_, out, _) = run(
+            "float128 y=3.7\necho $(( floor(y) )) $(( ceil(y) )) $(( round(y) )) $(( trunc(y) ))",
+        );
+        assert_eq!(out, "3e+0 4e+0 4e+0 3e+0\n");
+        let (_, out, _) = run(
+            "float128 y=-3.7\necho $(( floor(y) )) $(( ceil(y) )) $(( round(y) )) $(( trunc(y) ))",
+        );
+        assert_eq!(out, "-4e+0 -3e+0 -4e+0 -3e+0\n");
+    }
+
+    #[test]
+    fn math_float128_atan2_and_hypot() {
+        // atan2(2, 2) = π/4.
+        let (_, out, _) = run("float128 x=2\necho $(( atan2(x, x) ))");
+        assert!(out.starts_with("7.85398163397448309"), "got: {out}");
+        let (_, out, _) = run("float128 a=3\nfloat128 b=4\necho $(( hypot(a, b) ))");
+        assert_eq!(out, "5e+0\n");
+    }
+
+    #[test]
+    fn math_complex_specific_functions() {
+        let (_, out, _) = run(
+            "complex128 z=3+4i\necho $(( cabs(z) )) $(( creal(z) )) $(( cimag(z) ))",
+        );
+        assert_eq!(out, "5.0 3.0 4.0\n");
+        let (_, out, _) = run("complex128 z=3+4i\necho $(( carg(z) ))");
+        assert_eq!(out, "0.9272952180016122\n");
+        let (_, out, _) = run("complex128 z=3+4i\necho $(( cconj(z) ))");
+        assert_eq!(out, "3.0-4.0i\n");
+    }
+
+    #[test]
+    fn math_complex256_specific_functions() {
+        let (_, out, _) = run(
+            "complex256 w=3+4i\necho $(( cabs(w) )) $(( creal(w) )) $(( cimag(w) ))",
+        );
+        assert_eq!(out, "5e+0 3e+0 4e+0\n");
+    }
+
+    #[test]
+    fn math_abs_of_complex_is_magnitude() {
+        let (_, out, _) = run("complex128 z=3+4i\necho $(( abs(z) ))");
+        assert_eq!(out, "5.0\n");
+    }
+
+    #[test]
+    fn math_complex_transcendental_not_yet_supported() {
+        let prog = parse("complex128 z=1+2i\necho $(( sqrt(z) ))").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
         assert!(alloc::format!("{err}").contains("not yet supported"));
