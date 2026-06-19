@@ -351,6 +351,24 @@ impl<'src> Lexer<'src> {
             return self.read_ansi_c(start);
         }
 
+        // A `{` glued to non-blank content opens a brace-expansion
+        // word (`{a,b}`, `{1..9}`, `pre{x,y}`) rather than the
+        // reserved-word brace group. A brace group's `{` is always
+        // a standalone token — followed by blank, newline, or end
+        // of input — and the empty block `{}` (used by kash's
+        // declarative `body {}` sections) keeps the `{` as an
+        // `Op::Lbrace` too. This check runs before `read_operator`
+        // so the glued brace-expansion form never becomes an
+        // `Op::Lbrace`.
+        if b == b'{'
+            && !matches!(
+                self.peek_at(1),
+                None | Some(b' ' | b'\t' | b'\n' | b'}')
+            )
+        {
+            return self.read_word(start);
+        }
+
         // Operators.
         if let Some(op) = self.read_operator() {
             return Ok(Token {
@@ -662,30 +680,18 @@ impl<'src> Lexer<'src> {
                 if self.peek().is_some() {
                     self.pos += 1;
                 }
-            } else if b == b'{' && self.pos > start {
-                // Brace group *inside* a running word — e.g. the
-                // `{a,b}` half of `.utils.{a,b}` for `use`. Absorb
-                // up to the matching `}` (balanced, with nesting)
-                // so the whole construct lands in a single Word
-                // token. A `{` at word *start* is still a brace-
-                // group opener and breaks out of word-reading.
-                self.pos += 1;
-                let mut depth = 1usize;
-                while let Some(c) = self.peek() {
-                    self.pos += 1;
-                    if c == b'{' {
-                        depth += 1;
-                    } else if c == b'}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                if depth != 0 {
-                    return Err(KashError::Parse(alloc::format!(
-                        "unterminated `{{…}}` group inside word at offset {start}"
-                    )));
+            } else if b == b'{' {
+                // Brace construct inside or starting a word — the
+                // `{a,b}` of `.utils.{a,b}`, a leading `{1..9}`,
+                // `pre{x,y}post`. Absorb a balanced `{…}` (with
+                // nesting) so the whole construct lands in a single
+                // Word token for brace expansion to chew on later.
+                // With no matching `}`, the `{` is a literal word
+                // byte (bash leaves `echo {` / `echo {x` verbatim),
+                // so consume just the brace and keep reading.
+                match self.scan_matching_brace(self.pos) {
+                    Some(close) => self.pos = close + 1,
+                    None => self.pos += 1,
                 }
             } else {
                 break;
@@ -702,6 +708,30 @@ impl<'src> Lexer<'src> {
             kind: TokenKind::Word(self.src[start..self.pos].into()),
             span: Span::new(start, self.pos),
         })
+    }
+
+    /// Scan from the `{` at byte index `open` for its matching `}`,
+    /// counting nested `{`/`}`. Returns the index of the matching
+    /// `}`, or `None` when the input ends first (unbalanced — the
+    /// caller treats the `{` as a literal word byte). Byte-level,
+    /// matching the pre-quote nature of brace expansion.
+    fn scan_matching_brace(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
     }
 }
 

@@ -3051,6 +3051,19 @@ impl<B: MapBackend> Evaluator<B> {
         value
     }
 
+    /// Whether an unmatched filesystem glob should *fail* rather
+    /// than survive as its literal pattern. Per
+    /// `project_shell_glob_pattern.md`: fail in `default` mode and
+    /// under any `-secure` modifier; otherwise (POSIX-aware,
+    /// ksh93u-*) the literal pattern is left in place (POSIX
+    /// behaviour). The `(#qN)` qualifier opts back into the
+    /// literal-survives form. Wired in this commit; the filesystem
+    /// glob step that consults it lands in the next sub-commit.
+    fn null_glob_should_fail(&self) -> bool {
+        self.mode.modifiers.contains(&crate::mode::Modifier::Secure)
+            || self.mode.base == crate::mode::BaseMode::Default
+    }
+
     /// Refuse zsh `${(…)body}` flag-block expansions inside
     /// the strict modes that disable zsh extensions. POSIX-
     /// strict and `ksh93u-strict` are both no-extensions modes
@@ -3942,6 +3955,30 @@ impl<B: MapBackend> Evaluator<B> {
     /// at least one quoted segment always produces at least one
     /// field, even if everything inside expanded to empty.
     fn expand_word_to_fields(&mut self, w: &Word) -> Result<Vec<String>> {
+        // Brace expansion runs first — before `$`-expansion and
+        // field splitting — fanning the word into one or more
+        // words (`{a,b}` → `a`, `b`). Each resulting word then goes
+        // through the normal per-word expansion, *including* POSIX
+        // empty-word suppression: a brace alternative that ends up
+        // a wholly-empty *unquoted* word produces no field (`echo
+        // {a,}` → `a`, matching bash), while a quoted-empty
+        // alternative (`{a,""}`) keeps its empty field.
+        let words = brace_expand_word(w);
+        let mut out: Vec<String> = Vec::new();
+        for bw in &words {
+            out.extend(self.expand_word_to_fields_one(bw)?);
+        }
+        Ok(out)
+    }
+
+    /// Expand a single (already brace-expanded) word into fields.
+    /// See [`Self::expand_word_to_fields`] for the brace wrapper. A
+    /// wholly-empty unquoted word produces no field (POSIX); a word
+    /// with any quoted segment always yields at least one field.
+    fn expand_word_to_fields_one(
+        &mut self,
+        w: &Word,
+    ) -> Result<Vec<String>> {
         let ifs = self.lookup_ifs();
         let mut fields: Vec<String> = alloc::vec![String::new()];
         for seg in &w.segments {
@@ -9152,23 +9189,33 @@ fn parse_use_args(args: &[String]) -> Result<Vec<ImportEntry>> {
                 alias: alloc::string::String::from(*alias),
             }])
         }
-        [absolute] if absolute.starts_with('.') => {
-            let expanded = expand_brace_in_path(absolute)?;
-            let mut out = Vec::with_capacity(expanded.len());
-            for path in &expanded {
-                let segs = split_path(path)?;
-                if segs.len() < 2 {
-                    return Err(KashError::Runtime(alloc::format!(
-                        "use: `{path}` needs at least one path segment before the symbol name"
-                    )));
+        symbols
+            if !symbols.is_empty()
+                && symbols.iter().all(|s| s.starts_with('.')) =>
+        {
+            // One or more single-symbol imports. The brace form
+            // `use .ns.{a,b}` arrives here already fanned out into
+            // `.ns.a .ns.b` by word-level brace expansion; a lone
+            // arg that still carries a brace (e.g. a quoted one)
+            // goes through `expand_brace_in_path` as a fallback.
+            let mut out = Vec::new();
+            for sym in symbols {
+                let expanded = expand_brace_in_path(sym)?;
+                for path in &expanded {
+                    let segs = split_path(path)?;
+                    if segs.len() < 2 {
+                        return Err(KashError::Runtime(alloc::format!(
+                            "use: `{path}` needs at least one path segment before the symbol name"
+                        )));
+                    }
+                    let source_name = segs.last().unwrap().clone();
+                    let source_path = segs[..segs.len() - 1].to_vec();
+                    out.push(ImportEntry::Symbol {
+                        source_path,
+                        source_name,
+                        alias: None,
+                    });
                 }
-                let source_name = segs.last().unwrap().clone();
-                let source_path = segs[..segs.len() - 1].to_vec();
-                out.push(ImportEntry::Symbol {
-                    source_path,
-                    source_name,
-                    alias: None,
-                });
             }
             Ok(out)
         }
@@ -9203,6 +9250,441 @@ fn parse_use_args(args: &[String]) -> Result<Vec<ImportEntry>> {
             "use: expected one of `use namespace PATH [as ALIAS]`, `use .PATH.NAME [as ALIAS]`, or `use .PATH.{N1,N2,…}`".into(),
         )),
     }
+}
+
+/// Provenance tag for one character during brace expansion: which
+/// kind of word segment it came from. Only `Bare` characters are
+/// brace-active — a `{` / `}` / `,` / `.` inside a quoted segment
+/// is inert and never drives expansion. Carried so reconstruction
+/// restores the original quoting per resulting word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegKind {
+    /// Unquoted bare text — brace-active.
+    Bare,
+    /// `'…'` — inert.
+    Single,
+    /// `"…"` — inert (for brace purposes; `$` still expands later).
+    Double,
+    /// `$'…'` — inert.
+    AnsiC,
+}
+
+/// Brace-expand a [`Word`] into one or more words. A word with no
+/// active brace construct returns a single clone of `w`; `{a,b}`,
+/// `{1..9}`, `{1..9..2}`, `{a..z}`, and cross-products fan out into
+/// multiple words. Quoting is preserved: a `{` inside a quoted
+/// *segment* stays literal. Runs *before* `$`-expansion and
+/// globbing, matching the POSIX/bash word-expansion order.
+///
+/// Known limitation: a quote that appears *inside* an otherwise
+/// unquoted brace body — `a{b,"c"}d`, `{a,""}`, `{a,'b'}` — is not
+/// recognised as a quoted segment. The lexer absorbs a `{…}` group
+/// byte-for-byte into one bare token (see `Lexer::scan_matching_
+/// brace`), so the quote characters arrive as literal bytes rather
+/// than a distinct [`WordSegment`]. Quote-aware tokenisation inside
+/// brace groups is a follow-up; the common forms (unquoted
+/// alternatives, ranges, cross-products, and a quoted segment
+/// *adjacent* to the brace like `{a,b}'{1,2}'`) all behave
+/// correctly.
+fn brace_expand_word(w: &Word) -> Vec<Word> {
+    // Fast path: a word with no `{` in any bare segment can't
+    // brace-expand. The overwhelmingly common case — skip the
+    // atom machinery entirely.
+    let has_brace = w.segments.iter().any(|seg| {
+        matches!(seg, WordSegment::Bare(s) if s.contains('{'))
+    });
+    if !has_brace {
+        return alloc::vec![w.clone()];
+    }
+    let mut atoms: Vec<(char, SegKind)> = Vec::new();
+    for seg in &w.segments {
+        let (s, kind) = match seg {
+            WordSegment::Bare(s) => (s, SegKind::Bare),
+            WordSegment::SingleQuoted(s) => (s, SegKind::Single),
+            WordSegment::DoubleQuoted(s) => (s, SegKind::Double),
+            WordSegment::AnsiC(s) => (s, SegKind::AnsiC),
+        };
+        for c in s.chars() {
+            atoms.push((c, kind));
+        }
+    }
+    let mut out: Vec<Vec<(char, SegKind)>> = Vec::new();
+    brace_expand_atoms(&atoms, &mut out);
+    out.into_iter()
+        .map(|seq| atoms_to_word(&seq, w.span))
+        .collect()
+}
+
+/// Recursively expand the leftmost expandable brace group in
+/// `atoms`, pushing each resulting atom sequence into `out`. With
+/// no expandable group the sequence passes through unchanged.
+fn brace_expand_atoms(
+    atoms: &[(char, SegKind)],
+    out: &mut Vec<Vec<(char, SegKind)>>,
+) {
+    let Some((open, close)) = find_brace_group(atoms) else {
+        out.push(atoms.to_vec());
+        return;
+    };
+    let pre = &atoms[..open];
+    let body = &atoms[open + 1..close];
+    let post = &atoms[close + 1..];
+    let alts =
+        parse_brace_body(body).expect("find_brace_group validated the body");
+    // The tail is shared across every alternative — expand once.
+    let mut post_expansions: Vec<Vec<(char, SegKind)>> = Vec::new();
+    brace_expand_atoms(post, &mut post_expansions);
+    for alt in &alts {
+        // An alternative may itself contain nested braces.
+        let mut alt_expansions: Vec<Vec<(char, SegKind)>> = Vec::new();
+        brace_expand_atoms(alt, &mut alt_expansions);
+        for ae in &alt_expansions {
+            for pe in &post_expansions {
+                let mut combined: Vec<(char, SegKind)> =
+                    Vec::with_capacity(pre.len() + ae.len() + pe.len());
+                combined.extend_from_slice(pre);
+                combined.extend_from_slice(ae);
+                combined.extend_from_slice(pe);
+                out.push(combined);
+            }
+        }
+    }
+}
+
+/// If an opaque (non-brace-expandable) construct starts at atom
+/// `i` — `${…}`, `$(…)`, `$((…))`, or a backtick command
+/// substitution — return the index just past it so brace scanning
+/// skips its interior. A `{` inside `${v,,}` or a `,` inside
+/// `$(a,b)` must never be read as brace syntax. Only active (Bare)
+/// `$` / backtick start these. Returns `None` for a normal atom.
+fn skip_opaque_construct(atoms: &[(char, SegKind)], i: usize) -> Option<usize> {
+    let (c, k) = atoms[i];
+    if k != SegKind::Bare {
+        return None;
+    }
+    // Backtick command substitution: to the next active backtick.
+    if c == '`' {
+        let mut j = i + 1;
+        while j < atoms.len() {
+            if atoms[j] == ('`', SegKind::Bare) {
+                return Some(j + 1);
+            }
+            j += 1;
+        }
+        return Some(atoms.len());
+    }
+    // `${…}` / `$(…)` / `$((…))` — balanced over the opener byte.
+    if c == '$'
+        && i + 1 < atoms.len()
+        && atoms[i + 1].1 == SegKind::Bare
+        && let open @ ('{' | '(') = atoms[i + 1].0
+    {
+        let close = if open == '{' { '}' } else { ')' };
+        let mut depth = 0usize;
+        let mut j = i + 1;
+        while j < atoms.len() {
+            if atoms[j].1 == SegKind::Bare {
+                if atoms[j].0 == open {
+                    depth += 1;
+                } else if atoms[j].0 == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+            }
+            j += 1;
+        }
+        return Some(atoms.len());
+    }
+    None
+}
+
+/// Find the leftmost active `{` whose matching `}` encloses an
+/// expandable body (a top-level comma list or a numeric / char
+/// range). Returns the `(open, close)` atom indices, or `None`
+/// when the word has no expandable brace group. `${…}` / `$(…)` /
+/// backtick regions are skipped wholesale.
+fn find_brace_group(atoms: &[(char, SegKind)]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < atoms.len() {
+        let (c, k) = atoms[i];
+        if k == SegKind::Bare && c == '\\' {
+            // Escaped char: skip the backslash and the next atom.
+            i += 2;
+            continue;
+        }
+        if let Some(next) = skip_opaque_construct(atoms, i) {
+            i = next;
+            continue;
+        }
+        if k == SegKind::Bare
+            && c == '{'
+            && let Some(close) = matching_active_brace(atoms, i)
+            && parse_brace_body(&atoms[i + 1..close]).is_some()
+        {
+            return Some((i, close));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the matching `}` for the active `{` at `open`, counting
+/// only active (Bare) braces and skipping backslash-escaped atoms.
+fn matching_active_brace(
+    atoms: &[(char, SegKind)],
+    open: usize,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < atoms.len() {
+        let (c, k) = atoms[i];
+        if k == SegKind::Bare && c == '\\' {
+            i += 2;
+            continue;
+        }
+        // Don't count a `}` that belongs to an inner `${…}` /
+        // `$(…)` — but only once past the opener itself.
+        if i > open
+            && let Some(next) = skip_opaque_construct(atoms, i)
+        {
+            i = next;
+            continue;
+        }
+        if k == SegKind::Bare && c == '{' {
+            depth += 1;
+        } else if k == SegKind::Bare && c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a brace body into its alternatives. Comma form needs at
+/// least one top-level active comma (so `{a,b}` and `{a,}` qualify
+/// but `{a}` doesn't). Range form (`{1..9}`, `{a..z}`, optional
+/// `..STEP`) needs all-active content. Returns `None` for a
+/// non-expandable body, which is then left literal.
+fn parse_brace_body(
+    body: &[(char, SegKind)],
+) -> Option<Vec<Vec<(char, SegKind)>>> {
+    let comma_alts = split_top_level_commas(body);
+    if comma_alts.len() >= 2 {
+        return Some(comma_alts);
+    }
+    parse_brace_range(body)
+}
+
+/// Split `body` on active commas at brace-depth zero, skipping
+/// escaped atoms and nested active braces.
+fn split_top_level_commas(
+    body: &[(char, SegKind)],
+) -> Vec<Vec<(char, SegKind)>> {
+    let mut parts: Vec<Vec<(char, SegKind)>> = alloc::vec![Vec::new()];
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let (c, k) = body[i];
+        if k == SegKind::Bare && c == '\\' {
+            // Keep both the backslash and the escaped atom verbatim.
+            parts.last_mut().unwrap().push(body[i]);
+            if i + 1 < body.len() {
+                parts.last_mut().unwrap().push(body[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        // A `,` inside `${…}` / `$(…)` is not a brace separator —
+        // copy the whole opaque construct into the current part.
+        if let Some(next) = skip_opaque_construct(body, i) {
+            for atom in &body[i..next] {
+                parts.last_mut().unwrap().push(*atom);
+            }
+            i = next;
+            continue;
+        }
+        if k == SegKind::Bare && c == '{' {
+            depth += 1;
+        } else if k == SegKind::Bare && c == '}' {
+            depth = depth.saturating_sub(1);
+        } else if k == SegKind::Bare && c == ',' && depth == 0 {
+            parts.push(Vec::new());
+            i += 1;
+            continue;
+        }
+        parts.last_mut().unwrap().push(body[i]);
+        i += 1;
+    }
+    parts
+}
+
+/// Parse a numeric (`{1..9}`, `{1..9..2}`, `{9..1}`) or single-
+/// character (`{a..z}`, `{a..z..2}`) range. All body atoms must be
+/// active (Bare). Returns the generated alternatives, or `None`
+/// when the body isn't a valid range (left literal). Step `0` and
+/// malformed steps disable expansion (bash semantics).
+fn parse_brace_range(
+    body: &[(char, SegKind)],
+) -> Option<Vec<Vec<(char, SegKind)>>> {
+    if body.is_empty() || !body.iter().all(|(_, k)| *k == SegKind::Bare) {
+        return None;
+    }
+    let text: String = body.iter().map(|(c, _)| *c).collect();
+    let parts: Vec<&str> = text.split("..").collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    let step_str = parts.get(2).copied();
+
+    // Numeric range.
+    if let (Ok(lo), Ok(hi)) =
+        (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+    {
+        // A zero (or unparseable) step is treated as 1 — matching
+        // bash, which expands `{1..5..0}` as `1 2 3 4 5`.
+        let mag = match step_str {
+            None => 1i64,
+            Some(s) => {
+                let n = s.parse::<i64>().ok()?;
+                if n == 0 { 1 } else { n.unsigned_abs() as i64 }
+            }
+        };
+        let width = numeric_pad_width(parts[0], parts[1]);
+        let mut vals: Vec<i64> = Vec::new();
+        if lo <= hi {
+            let mut v = lo;
+            while v <= hi {
+                vals.push(v);
+                v += mag;
+            }
+        } else {
+            let mut v = lo;
+            while v >= hi {
+                vals.push(v);
+                v -= mag;
+            }
+        }
+        return Some(
+            vals.into_iter()
+                .map(|n| str_to_literal_atoms(&format_padded(n, width)))
+                .collect(),
+        );
+    }
+
+    // Single-character range.
+    let lo: Vec<char> = parts[0].chars().collect();
+    let hi: Vec<char> = parts[1].chars().collect();
+    if lo.len() == 1 && hi.len() == 1 {
+        let step = match step_str {
+            None => 1i64,
+            Some(s) => {
+                let n = s.parse::<i64>().ok()?;
+                if n == 0 { 1 } else { n.unsigned_abs() as i64 }
+            }
+        };
+        let lo = lo[0] as i64;
+        let hi = hi[0] as i64;
+        let mut chars: Vec<char> = Vec::new();
+        if lo <= hi {
+            let mut v = lo;
+            while v <= hi {
+                if let Some(c) = char::from_u32(v as u32) {
+                    chars.push(c);
+                }
+                v += step;
+            }
+        } else {
+            let mut v = lo;
+            while v >= hi {
+                if let Some(c) = char::from_u32(v as u32) {
+                    chars.push(c);
+                }
+                v -= step;
+            }
+        }
+        // Generated characters are *literal data* — tag them inert
+        // so a produced backtick / `$` / glob metachar isn't
+        // re-interpreted as syntax downstream (`{Z..a}` spans the
+        // backtick at ASCII 96).
+        return Some(
+            chars
+                .into_iter()
+                .map(|c| alloc::vec![(c, SegKind::Single)])
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Decide the zero-pad width for a numeric brace range. bash pads
+/// to a uniform *total field width* (sign included) when either
+/// endpoint is written with a leading zero: `{01..3}` → `01 02 03`,
+/// `{01..100}` → `001 … 100`, `{-02..2}` → `-02 -01 000 001 002`
+/// (width 3 counting the sign on the negative side). Returns `0`
+/// for "no padding".
+fn numeric_pad_width(lo: &str, hi: &str) -> usize {
+    let padded = |s: &str| {
+        let d = s.strip_prefix('-').unwrap_or(s);
+        d.len() > 1 && d.starts_with('0')
+    };
+    if !padded(lo) && !padded(hi) {
+        return 0;
+    }
+    // Total width including any sign character — the column bash
+    // aligns to.
+    lo.chars().count().max(hi.chars().count())
+}
+
+/// Format `n` to a uniform `width`-character field (0 = no
+/// padding). For a negative value the `-` counts toward the width,
+/// so the magnitude is zero-padded to `width - 1` digits.
+fn format_padded(n: i64, width: usize) -> String {
+    if width == 0 {
+        alloc::format!("{n}")
+    } else if n < 0 {
+        let digits = width.saturating_sub(1);
+        alloc::format!("-{:0>digits$}", n.unsigned_abs(), digits = digits)
+    } else {
+        alloc::format!("{:0>width$}", n, width = width)
+    }
+}
+
+/// Turn a plain string into a run of inert (single-quoted-tagged)
+/// atoms — used for range output, which is literal data and must
+/// not be re-scanned for `$` / backtick / glob metacharacters.
+fn str_to_literal_atoms(s: &str) -> Vec<(char, SegKind)> {
+    s.chars().map(|c| (c, SegKind::Single)).collect()
+}
+
+/// Coalesce a tagged atom sequence back into a [`Word`], merging
+/// runs of the same segment kind into one segment so quoting is
+/// restored on each expanded word.
+fn atoms_to_word(atoms: &[(char, SegKind)], span: crate::lexer::Span) -> Word {
+    let mut segments: Vec<WordSegment> = Vec::new();
+    let mut i = 0;
+    while i < atoms.len() {
+        let kind = atoms[i].1;
+        let mut s = String::new();
+        while i < atoms.len() && atoms[i].1 == kind {
+            s.push(atoms[i].0);
+            i += 1;
+        }
+        segments.push(match kind {
+            SegKind::Bare => WordSegment::Bare(s),
+            SegKind::Single => WordSegment::SingleQuoted(s),
+            SegKind::Double => WordSegment::DoubleQuoted(s),
+            SegKind::AnsiC => WordSegment::AnsiC(s),
+        });
+    }
+    if segments.is_empty() {
+        segments.push(WordSegment::Bare(String::new()));
+    }
+    Word { segments, span }
 }
 
 /// Expand brace groups in a `use` path. Supports the comma form
@@ -10643,6 +11125,236 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), "previous\nerr\n");
             let _ = fs::remove_file(&path);
         }
+    }
+
+    // ===== brace expansion =====
+
+    #[test]
+    fn brace_comma_basic() {
+        let (_, out, _) = run("echo a{b,c}d\n");
+        assert_eq!(out, "abd acd\n");
+    }
+
+    #[test]
+    fn brace_comma_three_alternatives() {
+        let (_, out, _) = run("echo {x,y,z}\n");
+        assert_eq!(out, "x y z\n");
+    }
+
+    #[test]
+    fn brace_range_numeric_ascending() {
+        let (_, out, _) = run("echo {1..5}\n");
+        assert_eq!(out, "1 2 3 4 5\n");
+    }
+
+    #[test]
+    fn brace_range_numeric_descending() {
+        let (_, out, _) = run("echo {5..1}\n");
+        assert_eq!(out, "5 4 3 2 1\n");
+    }
+
+    #[test]
+    fn brace_range_char() {
+        let (_, out, _) = run("echo {a..e}\n");
+        assert_eq!(out, "a b c d e\n");
+    }
+
+    #[test]
+    fn brace_step_numeric() {
+        let (_, out, _) = run("echo {1..10..2}\n");
+        assert_eq!(out, "1 3 5 7 9\n");
+    }
+
+    #[test]
+    fn brace_step_char() {
+        let (_, out, _) = run("echo {a..z..5}\n");
+        assert_eq!(out, "a f k p u z\n");
+    }
+
+    #[test]
+    fn brace_step_descending() {
+        let (_, out, _) = run("echo {10..1..3}\n");
+        assert_eq!(out, "10 7 4 1\n");
+    }
+
+    #[test]
+    fn brace_range_negative() {
+        let (_, out, _) = run("echo {-2..2}\n");
+        assert_eq!(out, "-2 -1 0 1 2\n");
+    }
+
+    #[test]
+    fn brace_zero_padded_width() {
+        let (_, out, _) = run("echo {01..03}\n");
+        assert_eq!(out, "01 02 03\n");
+    }
+
+    #[test]
+    fn brace_zero_padded_widest_endpoint() {
+        // bash pads to the widest endpoint when either has a
+        // leading zero: `{01..100..25}` → 001 026 051 076.
+        let (_, out, _) = run("echo {01..100..25}\n");
+        assert_eq!(out, "001 026 051 076\n");
+    }
+
+    #[test]
+    fn brace_cross_product() {
+        let (_, out, _) = run("echo {a,b}{1,2}\n");
+        assert_eq!(out, "a1 a2 b1 b2\n");
+    }
+
+    #[test]
+    fn brace_nested() {
+        let (_, out, _) = run("echo {a,b{c,d}}\n");
+        assert_eq!(out, "a bc bd\n");
+    }
+
+    #[test]
+    fn brace_literal_no_comma_or_range() {
+        // `{a}` has no comma and isn't a range → stays literal.
+        let (_, out, _) = run("echo {a}\n");
+        assert_eq!(out, "{a}\n");
+    }
+
+    #[test]
+    fn brace_literal_malformed_range() {
+        let (_, out, _) = run("echo {1..}\n");
+        assert_eq!(out, "{1..}\n");
+    }
+
+    #[test]
+    fn brace_step_zero_defaults_to_one() {
+        // bash expands `{1..5..0}` as if the step were 1.
+        let (_, out, _) = run("echo {1..5..0}\n");
+        assert_eq!(out, "1 2 3 4 5\n");
+        let (_, out, _) = run("echo {a..e..0}\n");
+        assert_eq!(out, "a b c d e\n");
+    }
+
+    #[test]
+    fn brace_negative_zero_padded_includes_sign_in_width() {
+        // bash aligns to a uniform field width that counts the
+        // sign: `{-01..01}` → `-01 000 001`.
+        let (_, out, _) = run("echo {-01..01}\n");
+        assert_eq!(out, "-01 000 001\n");
+    }
+
+    #[test]
+    fn brace_negative_mixed_pad_width() {
+        let (_, out, _) = run("echo {-02..2}\n");
+        assert_eq!(out, "-02 -01 000 001 002\n");
+        // Asymmetric endpoint widths align to the longer lexeme.
+        let (_, out, _) = run("echo {-1..001}\n");
+        assert_eq!(out, "-01 000 001\n");
+    }
+
+    #[test]
+    fn brace_char_range_crossing_backtick_is_literal() {
+        // ASCII 90..97 spans the backtick (96). The generated
+        // characters are literal data — a produced backtick must
+        // not be re-scanned as command substitution.
+        let (_, out, _) = run("echo {Z..a}\n");
+        assert_eq!(out, "Z [ \\ ] ^ _ ` a\n");
+    }
+
+    #[test]
+    fn brace_empty_alternative_with_suffix() {
+        // `{a,}b` → `ab` and `b` (the empty alternative gains the
+        // `b` suffix, so neither word is empty).
+        let (_, out, _) = run("echo {a,}b\n");
+        assert_eq!(out, "ab b\n");
+    }
+
+    #[test]
+    fn brace_unquoted_empty_alternative_is_dropped() {
+        // A wholly-empty *unquoted* brace word produces no field,
+        // matching bash: `echo {a,}` → `a`, `set -- {a,}` → 1 arg.
+        let (_, out, _) = run("echo {a,}\n");
+        assert_eq!(out, "a\n");
+        let (_, out, _) = run("set -- {a,}; echo $#\n");
+        assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn brace_alternative_emptied_by_expansion_is_dropped() {
+        // The first word `$xb` expands to empty (x unset) → no
+        // field; only `ab` survives. Matches bash.
+        let (_, out, _) = run("x=\"\"; echo {$x,a}b\n");
+        assert_eq!(out, "ab\n");
+    }
+
+    #[test]
+    fn brace_single_quoted_is_literal() {
+        let (_, out, _) = run("echo '{1..3}'\n");
+        assert_eq!(out, "{1..3}\n");
+    }
+
+    #[test]
+    fn brace_double_quoted_is_literal() {
+        let (_, out, _) = run("echo \"{a,b}\"\n");
+        assert_eq!(out, "{a,b}\n");
+    }
+
+    #[test]
+    fn brace_partly_quoted_alternative_stays_literal() {
+        // The unquoted `{a,b}` expands; the quoted `'{1,2}'`
+        // rides along verbatim on each expansion.
+        let (_, out, _) = run("echo {a,b}'{1,2}'\n");
+        assert_eq!(out, "a{1,2} b{1,2}\n");
+    }
+
+    #[test]
+    fn brace_does_not_touch_parameter_expansion() {
+        // `${v,,}` is parameter case-folding, not brace syntax.
+        let (_, out, _) = run("v=HELLO; echo ${v,,}\n");
+        assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn brace_alternatives_expand_dollar_after() {
+        // Brace runs before `$`; the chosen alternative's `$x`
+        // still expands afterward.
+        let (_, out, _) = run("x=1; y=2; echo {$x,$y}\n");
+        assert_eq!(out, "1 2\n");
+    }
+
+    #[test]
+    fn brace_in_for_loop_iteration() {
+        let (_, out, _) = run("for i in {1..3}; do echo n$i; done\n");
+        assert_eq!(out, "n1\nn2\nn3\n");
+    }
+
+    #[test]
+    fn brace_word_start_is_not_a_group() {
+        // `{1..3}` at command-argument start must lex as a word,
+        // not the reserved-word brace group.
+        let (_, out, _) = run("echo pre {1..3} post\n");
+        assert_eq!(out, "pre 1 2 3 post\n");
+    }
+
+    // ===== null-glob policy predicate =====
+
+    #[test]
+    fn null_glob_fails_in_default_mode() {
+        let ev =
+            Evaluator::with_mode(crate::mode::Mode::parse("default").unwrap());
+        assert!(ev.null_glob_should_fail());
+    }
+
+    #[test]
+    fn null_glob_survives_in_posix_aware_mode() {
+        let ev = Evaluator::with_mode(
+            crate::mode::Mode::parse("posix-aware").unwrap(),
+        );
+        assert!(!ev.null_glob_should_fail());
+    }
+
+    #[test]
+    fn null_glob_fails_under_secure_modifier() {
+        let ev = Evaluator::with_mode(
+            crate::mode::Mode::parse("posix-aware-secure").unwrap(),
+        );
+        assert!(ev.null_glob_should_fail());
     }
 
     // ===== glob enhancements =====
