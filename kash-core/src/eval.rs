@@ -8757,6 +8757,99 @@ fn bigfloat_round(x: &astro_float::BigFloat) -> astro_float::BigFloat {
     bigfloat_trunc(&adj)
 }
 
+// ---- f64 complex helpers (for complex128 transcendentals) ----
+// Each operates on a `(re, im)` pair via `libm` so the engine
+// stays no_std. Principal-branch formulas, verified against
+// Python `cmath`.
+
+fn c_add(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 + b.0, a.1 + b.1)
+}
+fn c_sub(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 - b.0, a.1 - b.1)
+}
+fn c_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+fn c_div(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    let d = b.0 * b.0 + b.1 * b.1;
+    ((a.0 * b.0 + a.1 * b.1) / d, (a.1 * b.0 - a.0 * b.1) / d)
+}
+fn c_scale(a: (f64, f64), s: f64) -> (f64, f64) {
+    (a.0 * s, a.1 * s)
+}
+/// e^z = e^a (cos b + i sin b).
+fn c_exp(z: (f64, f64)) -> (f64, f64) {
+    let e = libm::exp(z.0);
+    (e * libm::cos(z.1), e * libm::sin(z.1))
+}
+/// Principal natural log: ln|z| + i·arg(z).
+fn c_ln(z: (f64, f64)) -> (f64, f64) {
+    (0.5 * libm::log(z.0 * z.0 + z.1 * z.1), libm::atan2(z.1, z.0))
+}
+/// Principal square root.
+fn c_sqrt(z: (f64, f64)) -> (f64, f64) {
+    if z.0 == 0.0 && z.1 == 0.0 {
+        return (0.0, 0.0);
+    }
+    let m = libm::hypot(z.0, z.1);
+    let re = libm::sqrt((m + z.0) * 0.5);
+    let im = libm::sqrt((m - z.0) * 0.5);
+    (re, if z.1 < 0.0 { -im } else { im })
+}
+fn c_sin(z: (f64, f64)) -> (f64, f64) {
+    (libm::sin(z.0) * libm::cosh(z.1), libm::cos(z.0) * libm::sinh(z.1))
+}
+fn c_cos(z: (f64, f64)) -> (f64, f64) {
+    (libm::cos(z.0) * libm::cosh(z.1), -libm::sin(z.0) * libm::sinh(z.1))
+}
+fn c_sinh(z: (f64, f64)) -> (f64, f64) {
+    (libm::sinh(z.0) * libm::cos(z.1), libm::cosh(z.0) * libm::sin(z.1))
+}
+fn c_cosh(z: (f64, f64)) -> (f64, f64) {
+    (libm::cosh(z.0) * libm::cos(z.1), libm::sinh(z.0) * libm::sin(z.1))
+}
+const C_I: (f64, f64) = (0.0, 1.0);
+const C_NEG_I: (f64, f64) = (0.0, -1.0);
+const C_ONE: (f64, f64) = (1.0, 0.0);
+/// asin(z) = −i·ln(iz + √(1 − z²)).
+fn c_asin(z: (f64, f64)) -> (f64, f64) {
+    let root = c_sqrt(c_sub(C_ONE, c_mul(z, z)));
+    c_mul(C_NEG_I, c_ln(c_add(c_mul(C_I, z), root)))
+}
+/// acos(z) = π/2 − asin(z).
+fn c_acos(z: (f64, f64)) -> (f64, f64) {
+    let a = c_asin(z);
+    (core::f64::consts::FRAC_PI_2 - a.0, -a.1)
+}
+/// atan(z) = (i/2)·(ln(1 − iz) − ln(1 + iz)).
+fn c_atan(z: (f64, f64)) -> (f64, f64) {
+    let iz = c_mul(C_I, z);
+    let l = c_sub(c_ln(c_sub(C_ONE, iz)), c_ln(c_add(C_ONE, iz)));
+    c_mul((0.0, 0.5), l)
+}
+/// asinh(z) = ln(z + √(z² + 1)).
+fn c_asinh(z: (f64, f64)) -> (f64, f64) {
+    c_ln(c_add(z, c_sqrt(c_add(c_mul(z, z), C_ONE))))
+}
+/// acosh(z) = ln(z + √(z² − 1)). The naive principal-sqrt form
+/// picks the reciprocal root in the left half-plane (`Re(z) < 0`),
+/// which is exactly `−acosh(z)`; since principal `acosh` always
+/// has `Re ≥ 0`, recover the right branch by negating when the
+/// real part comes out negative.
+fn c_acosh(z: (f64, f64)) -> (f64, f64) {
+    let r = c_ln(c_add(z, c_sqrt(c_sub(c_mul(z, z), C_ONE))));
+    if r.0 < 0.0 {
+        (-r.0, -r.1)
+    } else {
+        r
+    }
+}
+/// atanh(z) = ½·(ln(1 + z) − ln(1 − z)).
+fn c_atanh(z: (f64, f64)) -> (f64, f64) {
+    c_scale(c_sub(c_ln(c_add(C_ONE, z)), c_ln(c_sub(C_ONE, z))), 0.5)
+}
+
 /// `atan2(y, x)` at 113-bit, composed from `atan` (astro-float
 /// has no `atan2`) with the standard quadrant adjustments.
 fn bigfloat_atan2(
@@ -9663,19 +9756,54 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
     }
 
     /// Complex-generalized transcendentals — `sqrt`/`exp`/`log`/
-    /// `sin`/`cos`/… of a complex argument. Wired in 7.3; for now
-    /// a clear "not yet supported" rather than a precision-losing
-    /// fallback.
+    /// `sin`/`cos`/… of a `complex128` argument, principal branch.
+    /// The rounding family (`floor`/…/`fabs`) has no complex
+    /// meaning and errors. (`complex256` transcendentals are
+    /// rejected one tier up, rather than demoted to f64.)
+    ///
+    /// Forward functions match Python `cmath` exactly; the inverse
+    /// functions (`asin`/`acos`/`atan`/`asinh`/`acosh`/`atanh`)
+    /// match for every off-cut argument but may pick the
+    /// conjugate branch for a *real* argument lying on the branch
+    /// cut (e.g. `acos(2)`), where C99's signed-zero convention
+    /// would choose the other sign — a documented edge, not a
+    /// wrong value.
     fn eval_fn1_complex(
         &mut self,
-        _f: Fn1,
+        f: Fn1,
         name: &str,
-        _re: f64,
-        _im: f64,
+        re: f64,
+        im: f64,
     ) -> Result<Num> {
-        Err(KashError::Runtime(alloc::format!(
-            "arithmetic: `{name}()` on a complex argument is not yet supported"
-        )))
+        use core::f64::consts::{LN_10, LN_2};
+        let z = (re, im);
+        let r = match f {
+            Fn1::Exp => c_exp(z),
+            Fn1::Exp2 => c_exp(c_scale(z, LN_2)), // 2^z = e^(z·ln2)
+            Fn1::Ln => c_ln(z),
+            Fn1::Log2 => c_scale(c_ln(z), 1.0 / LN_2),
+            Fn1::Log10 => c_scale(c_ln(z), 1.0 / LN_10),
+            Fn1::Sqrt => c_sqrt(z),
+            Fn1::Cbrt => c_exp(c_scale(c_ln(z), 1.0 / 3.0)), // principal
+            Fn1::Sin => c_sin(z),
+            Fn1::Cos => c_cos(z),
+            Fn1::Tan => c_div(c_sin(z), c_cos(z)),
+            Fn1::Sinh => c_sinh(z),
+            Fn1::Cosh => c_cosh(z),
+            Fn1::Tanh => c_div(c_sinh(z), c_cosh(z)),
+            Fn1::Asin => c_asin(z),
+            Fn1::Acos => c_acos(z),
+            Fn1::Atan => c_atan(z),
+            Fn1::Asinh => c_asinh(z),
+            Fn1::Acosh => c_acosh(z),
+            Fn1::Atanh => c_atanh(z),
+            Fn1::Floor | Fn1::Ceil | Fn1::Round | Fn1::Trunc | Fn1::Fabs => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "arithmetic: `{name}()` is not defined for complex values"
+                )));
+            }
+        };
+        Ok(Num::Complex(r.0, r.1))
     }
 
     fn parse_number(&mut self) -> Result<Num> {
@@ -17435,12 +17563,79 @@ mod tests {
         assert_eq!(out, "5.0\n");
     }
 
+    // ===== arithmetic: complex-generalized transcendentals =====
+
     #[test]
-    fn math_complex_transcendental_not_yet_supported() {
-        let prog = parse("complex128 z=1+2i\necho $(( sqrt(z) ))").unwrap();
+    fn math_complex_sqrt() {
+        let (_, out, _) = run("echo $(( sqrt(3+4i) ))");
+        assert_eq!(out, "2.0+1.0i\n");
+        // A complex arg is required to enter the complex domain —
+        // `sqrt(-1+0i)` is `i`, while real `sqrt(-1)` is `nan`.
+        let (_, out, _) = run("echo $(( sqrt(-1+0i) ))");
+        assert_eq!(out, "i\n");
+    }
+
+    #[test]
+    fn math_complex_exp_log() {
+        let (_, out, _) = run("echo $(( exp(1+2i) ))");
+        assert!(out.starts_with("-1.13120438375681"), "got: {out}");
+        // ln(-1+0i) = πi.
+        let (_, out, _) = run("echo $(( log(-1+0i) ))");
+        assert_eq!(out, "3.141592653589793i\n");
+    }
+
+    #[test]
+    fn math_complex_sin_cos_match_cmath() {
+        let (_, out, _) = run("echo $(( sin(1+1i) ))");
+        assert_eq!(out, "1.2984575814159773+0.6349639147847361i\n");
+        let (_, out, _) = run("echo $(( cos(1+1i) ))");
+        assert_eq!(out, "0.8337300251311492-0.9888977057628651i\n");
+    }
+
+    #[test]
+    fn math_complex_inverse_off_cut_matches_cmath() {
+        // Generic (off-branch-cut) arguments match Python cmath.
+        let (_, out, _) = run("echo $(( atan(1+1i) ))");
+        assert_eq!(out, "1.0172219678978514+0.40235947810852507i\n");
+        let (_, out, _) = run("echo $(( asin(1+1i) ))");
+        assert_eq!(out, "0.6662394324925153+1.0612750619050355i\n");
+    }
+
+    #[test]
+    fn math_complex_acosh_left_half_plane() {
+        // `acosh` in the left half-plane (Re(z) < 0, off the
+        // branch cut) must keep Re ≥ 0 — the naive principal-sqrt
+        // formula would return the negation.
+        let (_, out, _) = run("echo $(( acosh(-2+1i) ))");
+        assert_eq!(out, "1.4693517443681854+2.6342363503726487i\n");
+        // Re(z) > 0 is unaffected.
+        let (_, out, _) = run("echo $(( acosh(2+1i) ))");
+        assert_eq!(out, "1.4693517443681852+0.5073563032171445i\n");
+    }
+
+    #[test]
+    fn math_complex_real_sqrt_negative_is_nan() {
+        // Real (non-complex) sqrt of a negative stays in the real
+        // domain → NaN, matching C / ksh93.
+        let (_, out, _) = run("echo $(( sqrt(-1) ))");
+        assert_eq!(out, "nan\n");
+    }
+
+    #[test]
+    fn math_rounding_undefined_for_complex() {
+        let prog = parse("echo $(( floor(1+2i) ))").unwrap();
         let mut ev = Evaluator::new();
         let err = ev.eval_program(&prog).unwrap_err();
-        assert!(alloc::format!("{err}").contains("not yet supported"));
+        assert!(alloc::format!("{err}").contains("not defined for complex"));
+    }
+
+    #[test]
+    fn math_complex256_transcendental_not_yet_supported() {
+        let prog =
+            parse("complex256 z=1+2i\necho $(( sin(z) ))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("complex256"));
     }
 
     // ===== arithmetic extensions =====
