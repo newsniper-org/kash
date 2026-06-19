@@ -4000,7 +4000,51 @@ impl<B: MapBackend> Evaluator<B> {
         {
             return Ok(Vec::new());
         }
-        Ok(fields)
+        // Pathname expansion (globbing) applies only to a fully
+        // unquoted word — a quoted `*` / `?` / `[…]` stays
+        // literal. The check is at word granularity: a word with
+        // any quoted segment opts out wholesale (the rare mixed
+        // form `pre"x"*` is a documented limitation).
+        if word_has_quoted_segment(w) {
+            return Ok(fields);
+        }
+        self.glob_fields(fields)
+    }
+
+    /// Apply pathname expansion to `fields`. A field with no glob
+    /// metacharacter passes through unchanged. On a pattern that
+    /// matches nothing the null-glob policy decides — fail in
+    /// `default` / `-secure`, or leave the literal pattern
+    /// otherwise (see [`Self::null_glob_should_fail`]). Without the
+    /// `std` feature there is no filesystem, so globbing is a
+    /// no-op and patterns survive verbatim.
+    fn glob_fields(&self, fields: Vec<String>) -> Result<Vec<String>> {
+        #[cfg(not(feature = "std"))]
+        {
+            Ok(fields)
+        }
+        #[cfg(feature = "std")]
+        {
+            let mut out: Vec<String> = Vec::new();
+            for f in fields {
+                if !field_has_glob_meta(&f) {
+                    out.push(f);
+                    continue;
+                }
+                let matches = glob_expand_field(&f);
+                if matches.is_empty() {
+                    if self.null_glob_should_fail() {
+                        return Err(KashError::Runtime(alloc::format!(
+                            "no matches for glob pattern `{f}`"
+                        )));
+                    }
+                    out.push(f);
+                } else {
+                    out.extend(matches);
+                }
+            }
+            Ok(out)
+        }
     }
 
     /// Walk `text` (a single segment's payload) and append it to
@@ -9687,6 +9731,188 @@ fn atoms_to_word(atoms: &[(char, SegKind)], span: crate::lexer::Span) -> Word {
     Word { segments, span }
 }
 
+/// True if `field` carries an *unescaped* glob metacharacter that
+/// pathname expansion should act on: `*`, `?`, or a `[…]`
+/// character class (a lone `[` with no closing `]` is literal). A
+/// backslash-escaped metacharacter (`\*`, `\?`, `\[`) is literal
+/// and does not count. Alloc-safe — the filesystem walk is
+/// std-only.
+///
+/// (The surviving backslash itself is not yet stripped from the
+/// literal field — bare-word backslash quote removal is a separate
+/// pre-existing gap, deferred to the runtime-refinement pass.)
+fn field_has_glob_meta(field: &str) -> bool {
+    let bytes = field.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Escaped: this backslash plus the next byte are
+                // literal — skip both.
+                i += 2;
+                continue;
+            }
+            b'*' | b'?' => return true,
+            b'[' if bytes[i + 1..].contains(&b']') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Match a single path component `name` against the glob pattern
+/// `pat`, applying the POSIX hidden-file rule: a leading `.` in
+/// `name` only matches when `pat` also starts with a literal `.`.
+fn glob_component_matches(pat: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pat.starts_with('.') {
+        return false;
+    }
+    glob_match(pat, name)
+}
+
+/// Join a directory prefix and an entry name for the glob walker.
+/// An empty `dir` is the relative current directory, so the result
+/// is just `name`; otherwise the two are `/`-joined (the absolute
+/// root `/` joins without doubling the slash).
+#[cfg(feature = "std")]
+fn glob_join(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else if dir == "/" {
+        alloc::format!("/{name}")
+    } else {
+        alloc::format!("{dir}/{name}")
+    }
+}
+
+/// List the entry names of `dir` (an empty string means the
+/// relative current directory). Returns an empty list when the
+/// path isn't a readable directory — a non-match, never an error.
+#[cfg(feature = "std")]
+fn glob_read_dir(dir: &str) -> Vec<String> {
+    let path = if dir.is_empty() { "." } else { dir };
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Whether `path` is a directory, following symlinks (used for
+/// descending an explicit pattern component).
+#[cfg(feature = "std")]
+fn glob_is_dir(path: &str) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Whether `path` is a *real* directory — not a symlink. Used to
+/// gate `**` recursion so symlink cycles can't loop forever.
+#[cfg(feature = "std")]
+fn glob_is_real_dir(path: &str) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
+/// Collect every non-hidden descendant of `dir` (files, symlinks,
+/// and directories) recursively, pushing each path to `out`. Used
+/// by a trailing `**`. Recursion descends only into *real*
+/// directories (never symlinks), so symlink cycles can't loop.
+#[cfg(feature = "std")]
+fn glob_collect_descendants(dir: &str, out: &mut Vec<String>) {
+    for name in glob_read_dir(dir) {
+        if name.starts_with('.') {
+            continue;
+        }
+        let full = glob_join(dir, &name);
+        out.push(full.clone());
+        if glob_is_real_dir(&full) {
+            glob_collect_descendants(&full, out);
+        }
+    }
+}
+
+/// Recursive filesystem glob walker. `dir` is the prefix matched
+/// so far (empty = relative cwd, `/` = absolute root); `comps` is
+/// the remaining `/`-split pattern components; `idx` is the next
+/// component. Fully-matched paths are pushed to `out`. `**`
+/// matches zero or more directory levels.
+#[cfg(feature = "std")]
+fn glob_walk(dir: &str, comps: &[&str], idx: usize, out: &mut Vec<String>) {
+    if idx == comps.len() {
+        return;
+    }
+    let comp = comps[idx];
+    let last = idx + 1 == comps.len();
+
+    if comp == "**" {
+        if last {
+            // Trailing `**` matches the base directory itself plus
+            // every non-hidden descendant (files, symlinks, and
+            // directories), recursively — bash's globstar set.
+            // The empty relative base (cwd) isn't a nameable path,
+            // so it's skipped; a named base (`dir/**`, `/abs/**`)
+            // is included.
+            if !dir.is_empty() {
+                out.push(dir.to_string());
+            }
+            glob_collect_descendants(dir, out);
+            return;
+        }
+        // `**` with following components: apply the rest at this
+        // level (zero directories) and at every descendant
+        // directory (one or more). Real-directory gating keeps the
+        // recursion off symlink cycles.
+        glob_walk(dir, comps, idx + 1, out);
+        for name in glob_read_dir(dir) {
+            if name.starts_with('.') {
+                continue;
+            }
+            let full = glob_join(dir, &name);
+            if glob_is_real_dir(&full) {
+                glob_walk(&full, comps, idx, out);
+            }
+        }
+        return;
+    }
+
+    for name in glob_read_dir(dir) {
+        if !glob_component_matches(comp, &name) {
+            continue;
+        }
+        let full = glob_join(dir, &name);
+        if last {
+            out.push(full);
+        } else if glob_is_dir(&full) {
+            glob_walk(&full, comps, idx + 1, out);
+        }
+    }
+}
+
+/// Expand a single field as a filesystem glob pattern. Returns the
+/// sorted matching paths, or an empty vector when nothing matches.
+/// `**` is path-separator-aware (recursive); plain `*` / `?` /
+/// `[…]` match within one component via [`glob_match`].
+#[cfg(feature = "std")]
+fn glob_expand_field(pat: &str) -> Vec<String> {
+    let absolute = pat.starts_with('/');
+    let comps: Vec<&str> = pat.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.is_empty() {
+        return Vec::new();
+    }
+    let start = if absolute { "/" } else { "" };
+    let mut out: Vec<String> = Vec::new();
+    glob_walk(start, &comps, 0, &mut out);
+    out.sort();
+    out
+}
+
 /// Expand brace groups in a `use` path. Supports the comma form
 /// (`a,b,c`) and the cross-product of multiple groups
 /// (`.{x,y}.{a,b}` → 4 paths). Returns `vec![raw.to_string()]` when
@@ -11355,6 +11581,31 @@ mod tests {
             crate::mode::Mode::parse("posix-aware-secure").unwrap(),
         );
         assert!(ev.null_glob_should_fail());
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn glob_is_noop_without_std() {
+        // No filesystem in the alloc-only build, so a glob
+        // pattern survives verbatim regardless of mode.
+        let (_, out, _) = run("echo a*b.txt\n");
+        assert_eq!(out, "a*b.txt\n");
+    }
+
+    #[test]
+    fn glob_escaped_metachar_not_globbed() {
+        // A backslash-escaped `*` / `?` is literal — it must not
+        // trigger pathname expansion (which, in default/failglob
+        // mode under `std`, would otherwise raise a spurious
+        // no-match error). The backslash itself is still present
+        // in the output — bare-word backslash quote removal is a
+        // separate, pre-existing gap.
+        let (o, out, _) = run("echo \\*.txt\n");
+        assert_eq!(o.status(), 0);
+        assert_eq!(out, "\\*.txt\n");
+        let (o, out, _) = run("echo q\\?.txt\n");
+        assert_eq!(o.status(), 0);
+        assert_eq!(out, "q\\?.txt\n");
     }
 
     // ===== glob enhancements =====
@@ -13330,7 +13581,7 @@ mod tests {
         // are swept out alongside the bare var — `${b.x}` reads
         // empty.
         let (_, out, _) = run(
-            "typedef T { x=alive; }\ntypedef T b\necho before=${b.x}\nunset b\necho after=[${b.x}]\n",
+            "typedef T { x=alive; }\ntypedef T b\necho before=${b.x}\nunset b\necho \"after=[${b.x}]\"\n",
         );
         assert_eq!(out, "before=alive\nafter=[]\n");
     }
@@ -15082,7 +15333,7 @@ mod tests {
 
     #[test]
     fn indexed_array_sparse_fills_with_empty() {
-        let (_, out, _) = run("arr[3]=x; echo [${arr[0]}][${arr[1]}][${arr[2]}][${arr[3]}]");
+        let (_, out, _) = run("arr[3]=x; echo \"[${arr[0]}][${arr[1]}][${arr[2]}][${arr[3]}]\"");
         assert_eq!(out, "[][][][x]\n");
     }
 
@@ -15132,7 +15383,7 @@ mod tests {
 
     #[test]
     fn typeset_indexed_declaration_then_subscript_assign() {
-        let (_, out, _) = run("typeset -a arr; arr[0]=x; arr[2]=z; echo ${arr[0]}[${arr[2]}]");
+        let (_, out, _) = run("typeset -a arr; arr[0]=x; arr[2]=z; echo \"${arr[0]}[${arr[2]}]\"");
         assert_eq!(out, "x[z]\n");
     }
 
@@ -15273,7 +15524,7 @@ mod tests {
 
     #[test]
     fn substitution_strips_trailing_newlines() {
-        let (_, out, _) = run("X=$(echo hi); echo [$X]");
+        let (_, out, _) = run("X=$(echo hi); echo \"[$X]\"");
         assert_eq!(out, "[hi]\n");
     }
 
@@ -15685,6 +15936,228 @@ mod tests {
             let err = ev.eval_program(&prog).unwrap_err();
             let msg = alloc::format!("{err}");
             assert!(msg.contains("not yet supported"), "got: {msg}");
+        }
+    }
+
+    // ===== filesystem globbing (std) =====
+
+    #[cfg(feature = "std")]
+    mod glob_tests {
+        use super::*;
+
+        /// Make a unique empty temp directory for one test. Unique
+        /// across processes (pid) and within a process (atomic
+        /// counter) so tests run in parallel without colliding.
+        /// Returns the absolute path as a `String`.
+        fn temp_dir(tag: &str) -> String {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let mut p = std::env::temp_dir();
+            p.push(alloc::format!("kash-glob-{tag}-{pid}-{n}"));
+            std::fs::create_dir_all(&p).unwrap();
+            p.to_string_lossy().into_owned()
+        }
+
+        fn touch(dir: &str, name: &str) {
+            std::fs::write(alloc::format!("{dir}/{name}"), b"").unwrap();
+        }
+
+        fn mkdir(dir: &str, name: &str) {
+            std::fs::create_dir_all(alloc::format!("{dir}/{name}")).unwrap();
+        }
+
+        /// Run `src` under an explicit mode and return stdout.
+        fn run_mode(src: &str, mode: &str) -> String {
+            let prog = parse(src).unwrap();
+            let mut ev = Evaluator::with_mode(
+                crate::mode::Mode::parse(mode).unwrap(),
+            );
+            ev.eval_program(&prog).unwrap();
+            ev.take_output()
+        }
+
+        #[test]
+        fn star_matches_extension_sorted() {
+            let d = temp_dir("star");
+            touch(&d, "b.txt");
+            touch(&d, "a.txt");
+            touch(&d, "c.log");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*.txt"));
+            assert_eq!(out, alloc::format!("{d}/a.txt {d}/b.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn question_matches_single_char() {
+            let d = temp_dir("q");
+            touch(&d, "a.log");
+            touch(&d, "ab.log");
+            let (_, out, _) = run(&alloc::format!("echo {d}/?.log"));
+            assert_eq!(out, alloc::format!("{d}/a.log\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn character_class_matches() {
+            let d = temp_dir("class");
+            touch(&d, "a.txt");
+            touch(&d, "b.txt");
+            touch(&d, "c.txt");
+            let (_, out, _) = run(&alloc::format!("echo {d}/[ac].txt"));
+            assert_eq!(out, alloc::format!("{d}/a.txt {d}/c.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn double_star_matches_recursively() {
+            let d = temp_dir("globstar");
+            touch(&d, "top.txt");
+            mkdir(&d, "sub/deep");
+            touch(&d, "sub/mid.txt");
+            touch(&d, "sub/deep/low.txt");
+            let (_, out, _) = run(&alloc::format!("echo {d}/**/*.txt"));
+            assert_eq!(
+                out,
+                alloc::format!(
+                    "{d}/sub/deep/low.txt {d}/sub/mid.txt {d}/top.txt\n"
+                ),
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn trailing_double_star_matches_all_descendants() {
+            // Trailing `**` yields the base directory plus every
+            // non-hidden descendant — files and directories,
+            // recursively (bash globstar set, modulo the base
+            // trailing-slash cosmetic difference).
+            let d = temp_dir("trailing");
+            touch(&d, "file.txt");
+            mkdir(&d, "sub/deep");
+            touch(&d, "sub/mid.txt");
+            touch(&d, "sub/deep/leaf.txt");
+            let out =
+                run_mode(&alloc::format!("echo {d}/**"), "posix-aware");
+            assert_eq!(
+                out,
+                alloc::format!(
+                    "{d} {d}/file.txt {d}/sub {d}/sub/deep \
+                     {d}/sub/deep/leaf.txt {d}/sub/mid.txt\n"
+                ),
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn trailing_double_star_does_not_recurse_symlinked_dirs() {
+            // A symlink-to-directory is listed as a leaf but not
+            // descended into, so a cycle can't loop.
+            let d = temp_dir("symloop");
+            mkdir(&d, "real");
+            touch(&d, "real/x.txt");
+            std::os::unix::fs::symlink(
+                alloc::format!("{d}/real"),
+                alloc::format!("{d}/link"),
+            )
+            .unwrap();
+            let out =
+                run_mode(&alloc::format!("echo {d}/**"), "posix-aware");
+            // `link` appears once (as a leaf), never recursed.
+            assert!(out.contains(&alloc::format!("{d}/link ")) || out.ends_with(&alloc::format!("{d}/link\n")) || out.contains(&alloc::format!("{d}/link {d}")), "got: {out}");
+            assert!(!out.contains(&alloc::format!("{d}/link/x.txt")), "should not recurse symlink: {out}");
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn star_skips_hidden_files() {
+            let d = temp_dir("hidden");
+            touch(&d, "visible.txt");
+            touch(&d, ".hidden.txt");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*.txt"));
+            assert_eq!(out, alloc::format!("{d}/visible.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn dot_pattern_matches_hidden() {
+            let d = temp_dir("dot");
+            touch(&d, ".bashrc");
+            touch(&d, "normal");
+            let (_, out, _) = run(&alloc::format!("echo {d}/.*"));
+            assert_eq!(out, alloc::format!("{d}/.bashrc\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn no_match_fails_in_default_mode() {
+            let d = temp_dir("nomatch");
+            let prog =
+                parse(&alloc::format!("echo {d}/*.none")).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert!(alloc::format!("{err}").contains("no matches"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn no_match_survives_literal_in_posix_aware() {
+            let d = temp_dir("survive");
+            let out = run_mode(
+                &alloc::format!("echo {d}/*.none"),
+                "posix-aware",
+            );
+            assert_eq!(out, alloc::format!("{d}/*.none\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn no_match_fails_under_secure() {
+            let d = temp_dir("secure");
+            let prog =
+                parse(&alloc::format!("echo {d}/*.none")).unwrap();
+            let mut ev = Evaluator::with_mode(
+                crate::mode::Mode::parse("posix-aware-secure").unwrap(),
+            );
+            assert!(ev.eval_program(&prog).is_err());
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn quoted_pattern_stays_literal() {
+            let d = temp_dir("quoted");
+            touch(&d, "a.txt");
+            // Single-quoted → no glob even though `a.txt` exists.
+            let (_, out, _) =
+                run(&alloc::format!("echo '{d}/*.txt'"));
+            assert_eq!(out, alloc::format!("{d}/*.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn non_glob_field_passes_through() {
+            // A field with no metacharacter is returned as-is even
+            // when it names a missing path.
+            let d = temp_dir("plain");
+            let (_, out, _) =
+                run(&alloc::format!("echo {d}/literal.txt"));
+            assert_eq!(out, alloc::format!("{d}/literal.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn star_matches_all_in_dir_sorted() {
+            let d = temp_dir("all");
+            touch(&d, "3");
+            touch(&d, "1");
+            touch(&d, "2");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*"));
+            assert_eq!(
+                out,
+                alloc::format!("{d}/1 {d}/2 {d}/3\n"),
+            );
+            std::fs::remove_dir_all(&d).ok();
         }
     }
 }
