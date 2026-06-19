@@ -4025,14 +4025,43 @@ impl<B: MapBackend> Evaluator<B> {
         }
         #[cfg(feature = "std")]
         {
+            // `(#q…)` qualifiers are a zsh extension, unavailable
+            // in the strict modes; there a trailing `(#q…)` stays
+            // a literal part of the pattern.
+            let strict = matches!(
+                self.mode.base,
+                crate::mode::BaseMode::PosixStrict
+                    | crate::mode::BaseMode::Ksh93uStrict
+            );
             let mut out: Vec<String> = Vec::new();
             for f in fields {
-                if !field_has_glob_meta(&f) {
+                let (pattern, quals) = if strict {
+                    (f.clone(), None)
+                } else {
+                    match split_glob_qualifier(&f) {
+                        Some((p, body)) => {
+                            (p.to_string(), Some(parse_glob_qualifiers(body)?))
+                        }
+                        None => (f.clone(), None),
+                    }
+                };
+                // No qualifier and no metacharacter → pass through.
+                if quals.is_none() && !field_has_glob_meta(&pattern) {
                     out.push(f);
                     continue;
                 }
-                let matches = glob_expand_field(&f);
+                let dotglob =
+                    quals.as_ref().map(|q| q.dotglob).unwrap_or(false);
+                let mut matches = glob_expand_field(&pattern, dotglob);
+                if let Some(q) = &quals {
+                    matches = apply_glob_qualifiers(matches, q);
+                }
                 if matches.is_empty() {
+                    // The `(#qN)` modifier opts into null glob: an
+                    // empty result is fine (no error, no literal).
+                    if quals.as_ref().map(|q| q.nullglob).unwrap_or(false) {
+                        continue;
+                    }
                     if self.null_glob_should_fail() {
                         return Err(KashError::Runtime(alloc::format!(
                             "no matches for glob pattern `{f}`"
@@ -9762,10 +9791,12 @@ fn field_has_glob_meta(field: &str) -> bool {
 }
 
 /// Match a single path component `name` against the glob pattern
-/// `pat`, applying the POSIX hidden-file rule: a leading `.` in
-/// `name` only matches when `pat` also starts with a literal `.`.
-fn glob_component_matches(pat: &str, name: &str) -> bool {
-    if name.starts_with('.') && !pat.starts_with('.') {
+/// `pat`, applying the POSIX hidden-file rule unless `dotglob` is
+/// set: a leading `.` in `name` only matches when `pat` also
+/// starts with a literal `.` (the `(#qD)` qualifier turns this
+/// off so `*` sees dotfiles).
+fn glob_component_matches(pat: &str, name: &str, dotglob: bool) -> bool {
+    if !dotglob && name.starts_with('.') && !pat.starts_with('.') {
         return false;
     }
     glob_match(pat, name)
@@ -9820,20 +9851,21 @@ fn glob_is_real_dir(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Collect every non-hidden descendant of `dir` (files, symlinks,
-/// and directories) recursively, pushing each path to `out`. Used
-/// by a trailing `**`. Recursion descends only into *real*
+/// Collect every descendant of `dir` (files, symlinks, and
+/// directories) recursively, pushing each path to `out`. Used by
+/// a trailing `**`. Hidden entries are included only when
+/// `dotglob` is set. Recursion descends only into *real*
 /// directories (never symlinks), so symlink cycles can't loop.
 #[cfg(feature = "std")]
-fn glob_collect_descendants(dir: &str, out: &mut Vec<String>) {
+fn glob_collect_descendants(dir: &str, dotglob: bool, out: &mut Vec<String>) {
     for name in glob_read_dir(dir) {
-        if name.starts_with('.') {
+        if !dotglob && name.starts_with('.') {
             continue;
         }
         let full = glob_join(dir, &name);
         out.push(full.clone());
         if glob_is_real_dir(&full) {
-            glob_collect_descendants(&full, out);
+            glob_collect_descendants(&full, dotglob, out);
         }
     }
 }
@@ -9842,9 +9874,16 @@ fn glob_collect_descendants(dir: &str, out: &mut Vec<String>) {
 /// so far (empty = relative cwd, `/` = absolute root); `comps` is
 /// the remaining `/`-split pattern components; `idx` is the next
 /// component. Fully-matched paths are pushed to `out`. `**`
-/// matches zero or more directory levels.
+/// matches zero or more directory levels. `dotglob` includes
+/// hidden entries (the `(#qD)` qualifier).
 #[cfg(feature = "std")]
-fn glob_walk(dir: &str, comps: &[&str], idx: usize, out: &mut Vec<String>) {
+fn glob_walk(
+    dir: &str,
+    comps: &[&str],
+    idx: usize,
+    dotglob: bool,
+    out: &mut Vec<String>,
+) {
     if idx == comps.len() {
         return;
     }
@@ -9854,43 +9893,43 @@ fn glob_walk(dir: &str, comps: &[&str], idx: usize, out: &mut Vec<String>) {
     if comp == "**" {
         if last {
             // Trailing `**` matches the base directory itself plus
-            // every non-hidden descendant (files, symlinks, and
-            // directories), recursively — bash's globstar set.
-            // The empty relative base (cwd) isn't a nameable path,
-            // so it's skipped; a named base (`dir/**`, `/abs/**`)
-            // is included.
+            // every descendant (files, symlinks, and directories),
+            // recursively — bash's globstar set. The empty
+            // relative base (cwd) isn't a nameable path, so it's
+            // skipped; a named base (`dir/**`, `/abs/**`) is
+            // included.
             if !dir.is_empty() {
                 out.push(dir.to_string());
             }
-            glob_collect_descendants(dir, out);
+            glob_collect_descendants(dir, dotglob, out);
             return;
         }
         // `**` with following components: apply the rest at this
         // level (zero directories) and at every descendant
         // directory (one or more). Real-directory gating keeps the
         // recursion off symlink cycles.
-        glob_walk(dir, comps, idx + 1, out);
+        glob_walk(dir, comps, idx + 1, dotglob, out);
         for name in glob_read_dir(dir) {
-            if name.starts_with('.') {
+            if !dotglob && name.starts_with('.') {
                 continue;
             }
             let full = glob_join(dir, &name);
             if glob_is_real_dir(&full) {
-                glob_walk(&full, comps, idx, out);
+                glob_walk(&full, comps, idx, dotglob, out);
             }
         }
         return;
     }
 
     for name in glob_read_dir(dir) {
-        if !glob_component_matches(comp, &name) {
+        if !glob_component_matches(comp, &name, dotglob) {
             continue;
         }
         let full = glob_join(dir, &name);
         if last {
             out.push(full);
         } else if glob_is_dir(&full) {
-            glob_walk(&full, comps, idx + 1, out);
+            glob_walk(&full, comps, idx + 1, dotglob, out);
         }
     }
 }
@@ -9898,9 +9937,10 @@ fn glob_walk(dir: &str, comps: &[&str], idx: usize, out: &mut Vec<String>) {
 /// Expand a single field as a filesystem glob pattern. Returns the
 /// sorted matching paths, or an empty vector when nothing matches.
 /// `**` is path-separator-aware (recursive); plain `*` / `?` /
-/// `[…]` match within one component via [`glob_match`].
+/// `[…]` match within one component via [`glob_match`]. `dotglob`
+/// includes hidden entries (the `(#qD)` qualifier).
 #[cfg(feature = "std")]
-fn glob_expand_field(pat: &str) -> Vec<String> {
+fn glob_expand_field(pat: &str, dotglob: bool) -> Vec<String> {
     let absolute = pat.starts_with('/');
     let comps: Vec<&str> = pat.split('/').filter(|c| !c.is_empty()).collect();
     if comps.is_empty() {
@@ -9908,8 +9948,287 @@ fn glob_expand_field(pat: &str) -> Vec<String> {
     }
     let start = if absolute { "/" } else { "" };
     let mut out: Vec<String> = Vec::new();
-    glob_walk(start, &comps, 0, &mut out);
+    glob_walk(start, &comps, 0, dotglob, &mut out);
     out.sort();
+    out
+}
+
+/// Parsed `(#q…)` glob qualifier. File-type and permission
+/// filters are AND-combined; modifiers, sort, and slice apply to
+/// the surviving, sorted result.
+#[derive(Default, Clone)]
+struct GlobQualifiers {
+    /// File-type filters: `.` regular, `/` dir, `@` symlink, `=`
+    /// socket, `p` pipe, `*` executable-regular. All must hold.
+    type_filters: Vec<char>,
+    /// Permission filters: `r`/`w`/`x` (owner bits), `R`/`W`/`X`
+    /// (other bits), `s` (setuid). All must hold.
+    perm_filters: Vec<char>,
+    /// `D` — include dotfiles in the glob (threaded into the walk).
+    dotglob: bool,
+    /// `N` — opt-in null glob: an empty result is allowed (no
+    /// error, no literal) regardless of mode.
+    nullglob: bool,
+    /// `Y<n>` — stop after `n` matches.
+    count_cap: Option<usize>,
+    /// `o<key>` / `O<key>` — sort `(descending, key)`. `key` is
+    /// one of `n` name, `m` mtime, `a` atime, `c` ctime, `L` size.
+    sort: Option<(bool, char)>,
+    /// `[N]` / `[N,M]` — 1-based slice of the sorted result.
+    slice: Option<(usize, Option<usize>)>,
+}
+
+/// Split a trailing `(#q…)` qualifier off a glob field. Returns
+/// `(pattern, qualifier_body)` when the field ends in `)` and
+/// contains the mandatory `(#q` marker; otherwise `None` (the
+/// field has no qualifier). The `(#q` marker is required — a bare
+/// `(…)` is extglob / a subshell, never a qualifier.
+fn split_glob_qualifier(field: &str) -> Option<(&str, &str)> {
+    if !field.ends_with(')') {
+        return None;
+    }
+    let marker = field.rfind("(#q")?;
+    let body = &field[marker + 3..field.len() - 1];
+    let pattern = &field[..marker];
+    Some((pattern, body))
+}
+
+/// Parse a `(#q…)` qualifier body. Errors on an unknown qualifier
+/// character (so nothing is silently ignored) and on the
+/// dependency-needing ownership forms (`u:`/`g:`), which are
+/// explicitly not yet supported.
+fn parse_glob_qualifiers(body: &str) -> Result<GlobQualifiers> {
+    let mut q = GlobQualifiers::default();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match c {
+            '.' | '/' | '@' | '=' | 'p' | '*' => {
+                q.type_filters.push(c);
+                i += 1;
+            }
+            'r' | 'w' | 'x' | 'R' | 'W' | 'X' | 's' => {
+                q.perm_filters.push(c);
+                i += 1;
+            }
+            'D' => {
+                q.dotglob = true;
+                i += 1;
+            }
+            'N' => {
+                q.nullglob = true;
+                i += 1;
+            }
+            'Y' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == start {
+                    return Err(KashError::Parse(
+                        "glob qualifier `Y` needs a count, e.g. `(#qY3)`".into(),
+                    ));
+                }
+                q.count_cap = Some(body[start..i].parse().unwrap_or(usize::MAX));
+            }
+            'o' | 'O' => {
+                let descending = c == 'O';
+                i += 1;
+                let Some(&key) = bytes.get(i) else {
+                    return Err(KashError::Parse(
+                        "glob sort qualifier needs a key (n/m/a/c/L)".into(),
+                    ));
+                };
+                let key = key as char;
+                if !matches!(key, 'n' | 'm' | 'a' | 'c' | 'L') {
+                    return Err(KashError::Parse(alloc::format!(
+                        "unknown glob sort key `{key}` (expected n/m/a/c/L)"
+                    )));
+                }
+                q.sort = Some((descending, key));
+                i += 1;
+            }
+            '[' => {
+                let Some(close) = body[i..].find(']') else {
+                    return Err(KashError::Parse(
+                        "unterminated `[` in glob qualifier".into(),
+                    ));
+                };
+                let inner = &body[i + 1..i + close];
+                q.slice = Some(parse_qualifier_slice(inner)?);
+                i += close + 1;
+            }
+            'u' | 'g' => {
+                return Err(KashError::Runtime(alloc::format!(
+                    "glob ownership qualifier `{c}:…:` is not yet supported"
+                )));
+            }
+            _ => {
+                return Err(KashError::Parse(alloc::format!(
+                    "unknown glob qualifier `{c}`"
+                )));
+            }
+        }
+    }
+    Ok(q)
+}
+
+/// Parse the `N` or `N,M` body of a `[…]` slice qualifier into a
+/// 1-based `(start, Option<end>)` pair.
+fn parse_qualifier_slice(inner: &str) -> Result<(usize, Option<usize>)> {
+    let parse_idx = |s: &str| -> Result<usize> {
+        s.trim().parse::<usize>().map_err(|_| {
+            KashError::Parse(alloc::format!(
+                "glob slice index `{s}` is not a positive integer"
+            ))
+        })
+    };
+    match inner.split_once(',') {
+        Some((a, b)) => Ok((parse_idx(a)?, Some(parse_idx(b)?))),
+        None => {
+            let n = parse_idx(inner)?;
+            Ok((n, Some(n)))
+        }
+    }
+}
+
+/// Whether the filesystem entry at `path` satisfies a qualifier's
+/// file-type and permission filters (all AND-combined). Type tests
+/// use `lstat` (no symlink follow) so `@` catches symlinks and `.`
+/// catches real regular files. On non-unix only the cross-platform
+/// type filters apply; permission filters are treated as satisfied.
+#[cfg(all(feature = "std", unix))]
+fn glob_entry_matches_filters(path: &str, q: &GlobQualifiers) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let ft = md.file_type();
+    let mode = md.mode();
+    for &t in &q.type_filters {
+        let ok = match t {
+            '.' => ft.is_file(),
+            '/' => ft.is_dir(),
+            '@' => ft.is_symlink(),
+            '=' => ft.is_socket(),
+            'p' => ft.is_fifo(),
+            '*' => ft.is_file() && (mode & 0o111 != 0),
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    for &perm in &q.perm_filters {
+        let bit = match perm {
+            'r' => 0o400,
+            'w' => 0o200,
+            'x' => 0o100,
+            'R' => 0o004,
+            'W' => 0o002,
+            'X' => 0o001,
+            's' => 0o4000,
+            _ => 0,
+        };
+        if mode & bit == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(all(feature = "std", not(unix)))]
+fn glob_entry_matches_filters(path: &str, q: &GlobQualifiers) -> bool {
+    if q.type_filters.is_empty() {
+        return true;
+    }
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let ft = md.file_type();
+    for &t in &q.type_filters {
+        let ok = match t {
+            '.' => ft.is_file(),
+            '/' => ft.is_dir(),
+            '@' => ft.is_symlink(),
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sort `paths` in place by a qualifier sort key — `m` mtime, `a`
+/// atime, `c` ctime, `L` size — ascending, with a name tiebreak.
+/// `n` (and the non-unix fallback) sorts by name.
+#[cfg(all(feature = "std", unix))]
+fn glob_sort(paths: &mut [String], key: char) {
+    use std::os::unix::fs::MetadataExt;
+    if key == 'n' {
+        paths.sort();
+        return;
+    }
+    let metric = |p: &str| -> i64 {
+        std::fs::symlink_metadata(p)
+            .map(|m| match key {
+                'm' => m.mtime(),
+                'a' => m.atime(),
+                'c' => m.ctime(),
+                'L' => m.size() as i64,
+                _ => 0,
+            })
+            .unwrap_or(0)
+    };
+    paths.sort_by(|a, b| metric(a).cmp(&metric(b)).then_with(|| a.cmp(b)));
+}
+
+#[cfg(all(feature = "std", not(unix)))]
+fn glob_sort(paths: &mut [String], _key: char) {
+    paths.sort();
+}
+
+/// Apply a parsed `(#q…)` qualifier to a glob's match list:
+/// filter by type / permission, sort, slice `[N,M]`, then cap to
+/// `Y<n>`. The input is already name-sorted from
+/// [`glob_expand_field`].
+#[cfg(feature = "std")]
+fn apply_glob_qualifiers(
+    matches: Vec<String>,
+    q: &GlobQualifiers,
+) -> Vec<String> {
+    let mut out: Vec<String> = matches
+        .into_iter()
+        .filter(|p| glob_entry_matches_filters(p, q))
+        .collect();
+    if let Some((descending, key)) = q.sort {
+        glob_sort(&mut out, key);
+        if descending {
+            out.reverse();
+        }
+    }
+    // `Y<n>` caps the match *count* ("stop after n matches"), so it
+    // runs before the slice — `Y2[4,8]` yields nothing because the
+    // glob already stopped at 2. `Y0` is "no cap" (zsh), not
+    // truncate-to-zero.
+    if let Some(n) = q.count_cap
+        && n > 0
+    {
+        out.truncate(n);
+    }
+    if let Some((start, end)) = q.slice {
+        // 1-based, inclusive.
+        let s = start.saturating_sub(1);
+        let e = end.map(|e| e.min(out.len())).unwrap_or(out.len());
+        out = if s < out.len() && s < e {
+            out[s..e].to_vec()
+        } else {
+            Vec::new()
+        };
+    }
     out
 }
 
@@ -16157,6 +16476,216 @@ mod tests {
                 out,
                 alloc::format!("{d}/1 {d}/2 {d}/3\n"),
             );
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        // --- (#q…) glob qualifiers ---
+
+        #[test]
+        fn qualifier_regular_files_only() {
+            let d = temp_dir("q-reg");
+            touch(&d, "a.txt");
+            touch(&d, "b.txt");
+            mkdir(&d, "adir");
+            std::os::unix::fs::symlink(
+                alloc::format!("{d}/a.txt"),
+                alloc::format!("{d}/link"),
+            )
+            .unwrap();
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#q.)"));
+            assert_eq!(out, alloc::format!("{d}/a.txt {d}/b.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_directories_only() {
+            let d = temp_dir("q-dir");
+            touch(&d, "file");
+            mkdir(&d, "d1");
+            mkdir(&d, "d2");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#q/)"));
+            assert_eq!(out, alloc::format!("{d}/d1 {d}/d2\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_symlinks_only() {
+            let d = temp_dir("q-sym");
+            touch(&d, "real");
+            std::os::unix::fs::symlink(
+                alloc::format!("{d}/real"),
+                alloc::format!("{d}/link"),
+            )
+            .unwrap();
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#q@)"));
+            assert_eq!(out, alloc::format!("{d}/link\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_executable() {
+            let d = temp_dir("q-exec");
+            touch(&d, "plain");
+            touch(&d, "prog");
+            let mut perm = std::fs::metadata(alloc::format!("{d}/prog"))
+                .unwrap()
+                .permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(alloc::format!("{d}/prog"), perm).unwrap();
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#q*)"));
+            assert_eq!(out, alloc::format!("{d}/prog\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_null_optin_allows_empty() {
+            // `(#qN)` opts into null glob even in default (failglob)
+            // mode — an empty result is fine, no error. The whole
+            // field drops, so `echo` runs with no arguments.
+            let d = temp_dir("q-null");
+            let (o, out, _) =
+                run(&alloc::format!("echo {d}/*.none(#qN)"));
+            assert_eq!(o.status(), 0);
+            assert_eq!(out, "\n");
+            // A `for` loop over the same pattern runs zero times.
+            let (_, out, _) = run(&alloc::format!(
+                "for f in {d}/*.none(#qN); do echo iter; done"
+            ));
+            assert_eq!(out, "");
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_dotfiles_included() {
+            let d = temp_dir("q-dot");
+            touch(&d, "visible");
+            touch(&d, ".hidden");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#qD)"));
+            assert_eq!(out, alloc::format!("{d}/.hidden {d}/visible\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_slice_range() {
+            let d = temp_dir("q-slice");
+            touch(&d, "1");
+            touch(&d, "2");
+            touch(&d, "3");
+            touch(&d, "4");
+            // Name sort, take elements 2..3 (1-based inclusive).
+            let (_, out, _) =
+                run(&alloc::format!("echo {d}/*(#qon[2,3])"));
+            assert_eq!(out, alloc::format!("{d}/2 {d}/3\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_count_cap() {
+            let d = temp_dir("q-count");
+            touch(&d, "a");
+            touch(&d, "b");
+            touch(&d, "c");
+            let (_, out, _) = run(&alloc::format!("echo {d}/*(#qY2)"));
+            assert_eq!(out, alloc::format!("{d}/a {d}/b\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_y0_keeps_all() {
+            // `Y0` is "no cap" (zsh), not truncate-to-zero.
+            let d = temp_dir("q-y0");
+            touch(&d, "a");
+            touch(&d, "b");
+            touch(&d, "c");
+            let (o, out, _) =
+                run(&alloc::format!("echo {d}/*(#qonY0)"));
+            assert_eq!(o.status(), 0);
+            assert_eq!(out, alloc::format!("{d}/a {d}/b {d}/c\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_count_caps_before_slice() {
+            // `Y<n>` stops the glob at n matches, *then* the slice
+            // applies — so a slice past the cap is empty.
+            let d = temp_dir("q-capslice");
+            for n in 1..=6 {
+                touch(&d, &alloc::format!("f{n}"));
+            }
+            // Cap 2, slice [1,2] → the first two.
+            let (_, out, _) =
+                run(&alloc::format!("echo {d}/*(#qonY2[1,2])"));
+            assert_eq!(out, alloc::format!("{d}/f1 {d}/f2\n"));
+            // Cap 2, slice [4,6] → out of range → empty; `N`
+            // allows the empty result without a failglob error.
+            let (o, out, _) =
+                run(&alloc::format!("echo {d}/*(#qonY2N[4,6])"));
+            assert_eq!(o.status(), 0);
+            assert_eq!(out, "\n");
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_sort_by_size_descending() {
+            let d = temp_dir("q-size");
+            std::fs::write(alloc::format!("{d}/small"), b"x").unwrap();
+            std::fs::write(alloc::format!("{d}/big"), b"xxxxxxxxxx").unwrap();
+            std::fs::write(alloc::format!("{d}/mid"), b"xxxxx").unwrap();
+            // OL = size descending; take the largest.
+            let (_, out, _) =
+                run(&alloc::format!("echo {d}/*(#qOL[1])"));
+            assert_eq!(out, alloc::format!("{d}/big\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_literal_pattern_existence_check() {
+            let d = temp_dir("q-lit");
+            touch(&d, "here.txt");
+            // A literal pattern + type qualifier acts as an
+            // existence-and-type check.
+            let (_, out, _) =
+                run(&alloc::format!("echo {d}/here.txt(#q.)"));
+            assert_eq!(out, alloc::format!("{d}/here.txt\n"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_unknown_letter_errors() {
+            let d = temp_dir("q-unknown");
+            touch(&d, "a");
+            let prog =
+                parse(&alloc::format!("echo {d}/*(#qZ)")).unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert!(alloc::format!("{err}").contains("qualifier"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_ownership_not_yet_supported() {
+            let d = temp_dir("q-own");
+            touch(&d, "a");
+            let prog = parse(&alloc::format!("echo {d}/*(#qu:me:)"))
+                .unwrap();
+            let mut ev = Evaluator::new();
+            let err = ev.eval_program(&prog).unwrap_err();
+            assert!(alloc::format!("{err}").contains("ownership"));
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        #[test]
+        fn qualifier_is_literal_in_strict_mode() {
+            // In a strict mode `(#q…)` is not a qualifier; the
+            // pattern (which here matches nothing real) survives
+            // literally per the strict null-glob policy.
+            let d = temp_dir("q-strict");
+            touch(&d, "a.txt");
+            let out = run_mode(
+                &alloc::format!("echo {d}/a.txt(#q.)"),
+                "posix-strict",
+            );
+            assert_eq!(out, alloc::format!("{d}/a.txt(#q.)\n"));
             std::fs::remove_dir_all(&d).ok();
         }
     }

@@ -693,6 +693,33 @@ impl<'src> Lexer<'src> {
                     Some(close) => self.pos = close + 1,
                     None => self.pos += 1,
                 }
+            } else if b == b'('
+                && self.peek_at(1) == Some(b'#')
+                && self.peek_at(2) == Some(b'q')
+            {
+                // zsh glob qualifier `(#q…)` trailing a glob
+                // pattern (`*.log(#q.)`). The `(#q` marker absorbs
+                // the balanced parens into the word so the
+                // qualifier rides along with its pattern; it also
+                // disambiguates from a subshell / extglob.
+                self.pos += 1; // `(`
+                let mut depth = 1usize;
+                while let Some(c) = self.peek() {
+                    self.pos += 1;
+                    if c == b'(' {
+                        depth += 1;
+                    } else if c == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                if depth != 0 {
+                    return Err(KashError::Parse(alloc::format!(
+                        "unterminated glob qualifier `(#q…)` at offset {start}"
+                    )));
+                }
             } else {
                 break;
             }
