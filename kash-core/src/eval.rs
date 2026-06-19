@@ -8776,6 +8776,44 @@ fn bool_num(b: bool) -> Num {
     Num::Int(b as i64)
 }
 
+/// Error for a math function called with the wrong argument count.
+fn math_arity_err(name: &str, want: usize, got: usize) -> KashError {
+    KashError::Runtime(alloc::format!(
+        "arithmetic: `{name}()` takes {want} argument(s), got {got}"
+    ))
+}
+
+/// Error for a math function applied to a tier it doesn't yet
+/// support (float128 / complex).
+fn math_tier_err(name: &str) -> KashError {
+    KashError::Runtime(alloc::format!(
+        "arithmetic: `{name}()` on float128 / complex is not yet supported"
+    ))
+}
+
+/// The ksh93 math constants (`M_*`), all `float64`. Returns the
+/// `f64` value for a recognised name. A user variable of the same
+/// name shadows these (the lookup tries the binding first).
+fn math_constant(name: &str) -> Option<f64> {
+    use core::f64::consts;
+    Some(match name {
+        "M_E" => consts::E,
+        "M_PI" => consts::PI,
+        "M_PI_2" => consts::FRAC_PI_2,
+        "M_PI_4" => consts::FRAC_PI_4,
+        "M_1_PI" => consts::FRAC_1_PI,
+        "M_2_PI" => consts::FRAC_2_PI,
+        "M_2_SQRTPI" => consts::FRAC_2_SQRT_PI,
+        "M_SQRT2" => consts::SQRT_2,
+        "M_SQRT1_2" => consts::FRAC_1_SQRT_2,
+        "M_LN2" => consts::LN_2,
+        "M_LN10" => consts::LN_10,
+        "M_LOG2E" => consts::LOG2_E,
+        "M_LOG10E" => consts::LOG10_E,
+        _ => return None,
+    })
+}
+
 /// Equality of two numbers, promoting across both axes. Complex
 /// values compare component-wise.
 fn arith_eq(a: &Num, b: &Num) -> bool {
@@ -9134,6 +9172,15 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
                 let name = self
                     .try_read_identifier()
                     .expect("just peeked an identifier start");
+                // A `(` immediately following an identifier is a
+                // math function call — `sin(x)`, `atan2(y, x)`.
+                // (Checked before whitespace-skipping so `sin (x)`
+                // isn't a call, matching ksh93.)
+                if self.peek() == Some('(') {
+                    self.advance(); // `(`
+                    let args = self.parse_call_args()?;
+                    return self.call_math_func(&name, &args);
+                }
                 self.skip_ws();
                 if self.try_consume_exact("++") {
                     // Post-increment: yield the old value, store the new.
@@ -9157,6 +9204,124 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
             "arithmetic: unexpected character at position {}",
             self.pos
         )))
+    }
+
+    /// Parse a comma-separated argument list for a math function
+    /// call, the opening `(` already consumed, stopping at the
+    /// matching `)`.
+    fn parse_call_args(&mut self) -> Result<Vec<Num>> {
+        let mut args = Vec::new();
+        self.skip_ws();
+        if self.try_consume_exact(")") {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_assign()?);
+            self.skip_ws();
+            if self.try_consume_exact(",") {
+                continue;
+            }
+            if self.try_consume_exact(")") {
+                break;
+            }
+            return Err(KashError::Parse(
+                "arithmetic: expected `,` or `)` in function call".into(),
+            ));
+        }
+        Ok(args)
+    }
+
+    /// Dispatch a math-library function call. The f64 (real)
+    /// surface lands here; `float128` / complex arguments are
+    /// rejected with a clear message until the extended-tier
+    /// math commit wires them in.
+    fn call_math_func(&mut self, name: &str, args: &[Num]) -> Result<Num> {
+        match name {
+            "sin" => self.math_unary(name, args, libm::sin),
+            "cos" => self.math_unary(name, args, libm::cos),
+            "tan" => self.math_unary(name, args, libm::tan),
+            "asin" => self.math_unary(name, args, libm::asin),
+            "acos" => self.math_unary(name, args, libm::acos),
+            "atan" => self.math_unary(name, args, libm::atan),
+            "sinh" => self.math_unary(name, args, libm::sinh),
+            "cosh" => self.math_unary(name, args, libm::cosh),
+            "tanh" => self.math_unary(name, args, libm::tanh),
+            "asinh" => self.math_unary(name, args, libm::asinh),
+            "acosh" => self.math_unary(name, args, libm::acosh),
+            "atanh" => self.math_unary(name, args, libm::atanh),
+            "exp" => self.math_unary(name, args, libm::exp),
+            "exp2" => self.math_unary(name, args, libm::exp2),
+            // C / ksh93 `log` is the natural logarithm; `ln` is a
+            // kash-friendly alias.
+            "log" | "ln" => self.math_unary(name, args, libm::log),
+            "log2" => self.math_unary(name, args, libm::log2),
+            "log10" => self.math_unary(name, args, libm::log10),
+            "sqrt" => self.math_unary(name, args, libm::sqrt),
+            "cbrt" => self.math_unary(name, args, libm::cbrt),
+            "floor" => self.math_unary(name, args, libm::floor),
+            "ceil" => self.math_unary(name, args, libm::ceil),
+            "round" => self.math_unary(name, args, libm::round),
+            "trunc" => self.math_unary(name, args, libm::trunc),
+            "fabs" => self.math_unary(name, args, libm::fabs),
+            "abs" => self.math_abs(args),
+            "atan2" => self.math_binary(name, args, libm::atan2),
+            "hypot" => self.math_binary(name, args, libm::hypot),
+            "pow" => self.math_binary(name, args, libm::pow),
+            "fmod" => self.math_binary(name, args, libm::fmod),
+            _ => Err(KashError::Runtime(alloc::format!(
+                "arithmetic: unknown function `{name}`"
+            ))),
+        }
+    }
+
+    /// One-argument real (`f64`) math function. A `float128` /
+    /// complex argument errors (extended-tier math is a follow-up).
+    fn math_unary(
+        &self,
+        name: &str,
+        args: &[Num],
+        f: fn(f64) -> f64,
+    ) -> Result<Num> {
+        let [a] = args else {
+            return Err(math_arity_err(name, 1, args.len()));
+        };
+        match a {
+            Num::Int(_) | Num::Float(_) => Ok(Num::Float(f(a.as_f64()))),
+            _ => Err(math_tier_err(name)),
+        }
+    }
+
+    /// Two-argument real (`f64`) math function.
+    fn math_binary(
+        &self,
+        name: &str,
+        args: &[Num],
+        f: fn(f64, f64) -> f64,
+    ) -> Result<Num> {
+        let [a, b] = args else {
+            return Err(math_arity_err(name, 2, args.len()));
+        };
+        if a.rank() == 2 || b.rank() == 2 || a.is_complex() || b.is_complex() {
+            return Err(math_tier_err(name));
+        }
+        Ok(Num::Float(f(a.as_f64(), b.as_f64())))
+    }
+
+    /// `abs(x)` — magnitude, preserving the integer tier (so
+    /// `abs(-3)` is `3`, not `3.0`). Complex magnitude (`cabs`)
+    /// and float128 land with the extended-tier math.
+    fn math_abs(&self, args: &[Num]) -> Result<Num> {
+        let [a] = args else {
+            return Err(math_arity_err("abs", 1, args.len()));
+        };
+        match a {
+            Num::Int(n) => n
+                .checked_abs()
+                .map(Num::Int)
+                .ok_or_else(|| KashError::Runtime("arithmetic overflow".into())),
+            Num::Float(f) => Ok(Num::Float(libm::fabs(*f))),
+            _ => Err(math_tier_err("abs")),
+        }
     }
 
     fn parse_number(&mut self) -> Result<Num> {
@@ -9313,6 +9478,12 @@ impl<'a, 'e, B: MapBackend> ArithParser<'a, 'e, B> {
             None => (String::new(), None),
         };
         if value.trim().is_empty() {
+            // An unset name that matches a math constant (`M_PI`,
+            // `M_E`, …) yields the constant; a real variable of
+            // the same name would have shadowed it above.
+            if let Some(c) = math_constant(name) {
+                return Ok(Num::Float(c));
+            }
             return Ok(Num::Int(0));
         }
         let trimmed = value.trim();
@@ -16761,6 +16932,90 @@ mod tests {
         let (_, out, _) =
             run("float128 x=-1e-300\necho $(( x < 0 )) $(( x > 0 ))\n");
         assert_eq!(out, "1 0\n");
+    }
+
+    // ===== arithmetic: math library (real f64 tier) =====
+
+    #[test]
+    fn math_sqrt() {
+        let (_, out, _) = run("echo $(( sqrt(2) ))");
+        assert_eq!(out, "1.4142135623730951\n");
+    }
+
+    #[test]
+    fn math_trig_at_zero() {
+        let (_, out, _) = run("echo $(( sin(0) )) $(( cos(0) )) $(( tan(0) ))");
+        assert_eq!(out, "0.0 1.0 0.0\n");
+    }
+
+    #[test]
+    fn math_pi_reconstructed_via_atan2() {
+        let (_, out, _) = run("echo $(( atan2(1, 1) * 4 ))");
+        assert_eq!(out, "3.141592653589793\n");
+    }
+
+    #[test]
+    fn math_constant_pi_and_e() {
+        let (_, out, _) = run("echo $(( M_PI )) $(( M_E ))");
+        assert_eq!(out, "3.141592653589793 2.718281828459045\n");
+    }
+
+    #[test]
+    fn math_natural_log_of_e_is_one() {
+        let (_, out, _) = run("echo $(( log(M_E) )) $(( ln(M_E) ))");
+        assert_eq!(out, "1.0 1.0\n");
+    }
+
+    #[test]
+    fn math_pow_and_hypot() {
+        let (_, out, _) = run("echo $(( pow(2, 10) )) $(( hypot(3, 4) ))");
+        assert_eq!(out, "1024.0 5.0\n");
+    }
+
+    #[test]
+    fn math_abs_preserves_integer_tier() {
+        let (_, out, _) = run("echo $(( abs(-5) )) $(( abs(-2.5) ))");
+        assert_eq!(out, "5 2.5\n");
+    }
+
+    #[test]
+    fn math_rounding_family() {
+        let (_, out, _) = run(
+            "echo $(( floor(3.7) )) $(( ceil(3.2) )) $(( round(2.5) )) $(( trunc(3.9) ))",
+        );
+        assert_eq!(out, "3.0 4.0 3.0 3.0\n");
+    }
+
+    #[test]
+    fn math_function_name_does_not_shadow_variable() {
+        // A variable named like a function is fine — only `name(`
+        // is a call.
+        let (_, out, _) = run("sqrt=9\necho $(( sqrt + sqrt(sqrt) ))");
+        assert_eq!(out, "12.0\n");
+    }
+
+    #[test]
+    fn math_unknown_function_errors() {
+        let prog = parse("echo $(( nope(1) ))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("unknown function"));
+    }
+
+    #[test]
+    fn math_wrong_arity_errors() {
+        let prog = parse("echo $(( sin(1, 2) ))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("argument"));
+    }
+
+    #[test]
+    fn math_float128_arg_not_yet_supported() {
+        let prog = parse("float128 x=2\necho $(( sqrt(x) ))").unwrap();
+        let mut ev = Evaluator::new();
+        let err = ev.eval_program(&prog).unwrap_err();
+        assert!(alloc::format!("{err}").contains("not yet supported"));
     }
 
     // ===== arithmetic extensions =====
